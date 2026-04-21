@@ -40,3 +40,5 @@ class RuntimeState(TypedDict, total=False):
     operations: list[ToolInvocationRecord]
     decision: Decision
     max_task_loops: int
+    max_execute_acts: int
+    max_evaluator_checkpoints: int

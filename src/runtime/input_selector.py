@@ -23,6 +23,14 @@ def prepare_task_inputs(state: RuntimeState, task_id: str) -> TaskInputSelection
     """Run the full pre-execution input preparation pipeline."""
 
     task_state = state["session"].task_states[task_id]
+    if task_state.retry_input_artifact_ids:
+        task_state.resolved_input_artifact_ids = list(task_state.retry_input_artifact_ids)
+        task_state.input_selection_reasoning = "resolved from evaluator retry context"
+        task_state.input_validation_summary = "using compressed retry context from evaluator"
+        return TaskInputSelectionOutput(
+            selected_artifact_ids=list(task_state.retry_input_artifact_ids)
+        )
+
     if task_state.resolved_input_artifact_ids:
         return TaskInputSelectionOutput(
             selected_artifact_ids=list(task_state.resolved_input_artifact_ids)

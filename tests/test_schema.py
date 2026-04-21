@@ -121,6 +121,8 @@ def test_runtime_models_construct() -> None:
         task_id="task_001",
         status=TaskStatus.RUNNING,
         latest_execution_outcome=ExecutionOutcome.SUCCESS,
+        latest_execute_checkpoint="passed",
+        latest_evaluate_checkpoint="passed",
         loop_count=1,
     )
     session = SessionState(
@@ -1017,6 +1019,7 @@ def test_local_edit_flow_materializes_task_inputs_and_intermediate_task_artifact
         ["segment", "crop", "understand", "edit"],
     ]
     assert result["session"].phase == SessionPhase.EVALUATING
+    assert result["session"].task_states["task_001"].latest_execute_checkpoint == "passed"
     assert len(result["task_act_records"]) == 4
 
 
@@ -1037,6 +1040,7 @@ def test_evaluator_agent_uses_llm_decision_when_enabled(mocker) -> None:
     state["session"].current_task_id = "task_001"
     state["session"].final_result_id = None
     state["session"].task_states["task_001"].latest_artifact_ids = ["art_image_candidate_001"]
+    state["session"].task_states["task_001"].latest_execute_checkpoint = "passed"
     state["input"]["use_llm"] = True
 
     mocker.patch("agents.evaluator_agent.load_llm_config", return_value=mocker.Mock(api_key="k", base_url="u", model_name="m"))
@@ -1054,3 +1058,313 @@ def test_evaluator_agent_uses_llm_decision_when_enabled(mocker) -> None:
     assert result["decision"].route == DecisionRoute.PASS
     assert result["session"].phase == SessionPhase.EXECUTING
     assert result["session"].current_task_id == "task_002"
+
+
+def test_execute_agent_exhausted_budget_goes_directly_to_replan() -> None:
+    state = {
+        "input": {
+            "instruction_text": "先处理局部，再编辑",
+            "use_llm": False,
+        },
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="local_edit",
+                instruction="只修改上衣",
+                input_artifact_ids=["art_img_input_001"],
+                target_artifact_ids=["art_img_input_001"],
+            )
+        },
+        "session": SessionState(
+            session_id="sess_execute_fail",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.RUNNING,
+                    resolved_input_artifact_ids=["art_img_input_001"],
+                    task_artifact_ids=[],
+                )
+            },
+            artifact_index=ArtifactIndex(by_type={ArtifactKind.IMAGE: ["art_img_input_001"]}),
+        ),
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri="store://images/input.png",
+                payload={"role": "input"},
+                scope="session",
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+        "task_loops": [],
+        "max_execute_acts": 2,
+    }
+
+    result = ExecuteAgent().run(state)
+
+    assert result["session"].phase == SessionPhase.PLANNING
+    assert result["session"].current_task_id is None
+    assert result["session"].task_states["task_001"].latest_execute_checkpoint == "failed"
+    assert result["decision"].route == DecisionRoute.REPLAN
+    assert result["decision"].replan is not None
+
+
+def test_evaluator_agent_failed_candidate_can_continue_same_task() -> None:
+    state = {
+        "input": {
+            "instruction_text": "把人物放到背景里",
+            "desired_decision_route": "continue_execute",
+            "use_llm": False,
+        },
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="reference_edit",
+                instruction="把人物放到背景里",
+                acceptance_criteria=["subject appears in background"],
+            )
+        },
+        "session": SessionState(
+            session_id="sess_eval_continue",
+            phase=SessionPhase.EVALUATING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.WAITING_EVALUATION,
+                    latest_artifact_ids=["art_image_candidate_001"],
+                    latest_execution_outcome=ExecutionOutcome.SUCCESS,
+                    latest_execute_checkpoint="passed",
+                    evaluator_checkpoint_count=0,
+                    task_artifact_ids=["art_inst_001", "art_image_candidate_001"],
+                )
+            },
+            artifact_index=ArtifactIndex(by_type={ArtifactKind.IMAGE: ["art_img_input_001", "art_image_candidate_001"]}),
+        ),
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri="store://images/original.png",
+                payload={"role": "input"},
+                scope="session",
+            ),
+            "art_inst_001": InstructionArtifact(
+                id="art_inst_001",
+                payload={"instruction_text": "把人物放到背景里"},
+            ),
+            "art_image_candidate_001": ImageArtifact(
+                id="art_image_candidate_001",
+                uri="store://generated/task_001/candidate.png",
+                payload={"role": "candidate_image"},
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+        "max_evaluator_checkpoints": 3,
+    }
+
+    result = EvaluatorAgent().run(state)
+
+    assert result["decision"].route == DecisionRoute.CONTINUE_EXECUTE
+    assert result["decision"].task_retry is not None
+    assert result["session"].phase == SessionPhase.EXECUTING
+    assert result["session"].current_task_id == "task_001"
+    assert result["session"].task_states["task_001"].latest_evaluate_checkpoint == "failed"
+    assert "art_img_input_001" in result["session"].task_states["task_001"].retry_input_artifact_ids
+    assert "art_image_candidate_001" in result["session"].task_states["task_001"].retry_input_artifact_ids
+    assert "art_inst_001" in result["session"].task_states["task_001"].retry_input_artifact_ids
+    assert result["session"].task_states["task_001"].retry_context_text is not None
+    assert result["session"].task_states["task_001"].resolved_input_artifact_ids == []
+
+
+def test_evaluator_agent_budget_exhausted_upgrades_to_replan() -> None:
+    state = {
+        "input": {
+            "instruction_text": "把人物放到背景里",
+            "desired_decision_route": "continue_execute",
+            "use_llm": False,
+        },
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="reference_edit",
+                instruction="把人物放到背景里",
+                acceptance_criteria=["subject appears in background"],
+            )
+        },
+        "session": SessionState(
+            session_id="sess_eval_budget",
+            phase=SessionPhase.EVALUATING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.WAITING_EVALUATION,
+                    latest_artifact_ids=["art_image_candidate_001"],
+                    latest_execution_outcome=ExecutionOutcome.SUCCESS,
+                    latest_execute_checkpoint="passed",
+                    evaluator_checkpoint_count=2,
+                    task_artifact_ids=["art_image_candidate_001"],
+                )
+            },
+            artifact_index=ArtifactIndex(by_type={ArtifactKind.IMAGE: ["art_image_candidate_001"]}),
+        ),
+        "artifacts": {
+            "art_image_candidate_001": ImageArtifact(
+                id="art_image_candidate_001",
+                uri="store://generated/task_001/candidate.png",
+                payload={"role": "candidate_image"},
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+        "max_evaluator_checkpoints": 3,
+    }
+
+    result = EvaluatorAgent().run(state)
+
+    assert result["decision"].route == DecisionRoute.REPLAN
+    assert result["decision"].replan is not None
+    assert result["session"].phase == SessionPhase.PLANNING
+    assert result["session"].current_task_id is None
+
+
+def test_prepare_task_inputs_prefers_retry_input_artifact_ids() -> None:
+    state = {
+        "input": {"use_llm": False},
+        "session": SessionState(
+            session_id="sess_retry_inputs",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.RUNNING,
+                    retry_input_artifact_ids=["art_img_input_001", "art_image_candidate_001", "art_inst_001"],
+                )
+            },
+            artifact_index=ArtifactIndex(by_type={ArtifactKind.IMAGE: ["art_img_input_001", "art_image_candidate_001"]}),
+        ),
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="reference_edit",
+                instruction="继续修正",
+            )
+        },
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri="store://images/original.png",
+                payload={"role": "input"},
+            ),
+            "art_image_candidate_001": ImageArtifact(
+                id="art_image_candidate_001",
+                uri="store://images/candidate.png",
+                payload={"role": "candidate_image"},
+            ),
+            "art_inst_001": InstructionArtifact(
+                id="art_inst_001",
+                payload={"instruction_text": "继续修正当前结果"},
+            ),
+        },
+        "operations": [],
+    }
+
+    selection = TaskInputSelectionOutput.model_validate(
+        {"selected_artifact_ids": ["placeholder"]}
+    )
+    from runtime.input_selector import prepare_task_inputs
+
+    result = prepare_task_inputs(state, "task_001")
+
+    assert result.selected_artifact_ids == ["art_img_input_001", "art_image_candidate_001", "art_inst_001"]
+    assert state["session"].task_states["task_001"].resolved_input_artifact_ids == [
+        "art_img_input_001",
+        "art_image_candidate_001",
+        "art_inst_001",
+    ]
+    assert state["session"].task_states["task_001"].input_selection_reasoning == "resolved from evaluator retry context"
+
+
+def test_execute_agent_llm_prompt_includes_retry_context(mocker) -> None:
+    state = {
+        "input": {
+            "instruction_text": "继续修图",
+            "use_llm": True,
+        },
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="reference_edit",
+                instruction="继续修正",
+                input_artifact_ids=["art_img_input_001"],
+            )
+        },
+        "session": SessionState(
+            session_id="sess_retry_prompt",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.RUNNING,
+                    retry_input_artifact_ids=["art_img_input_001", "art_image_candidate_001"],
+                    retry_context_text="Evaluator feedback:\n- Reason: 边界不干净\n- Fix focuses:\n  1. 修边界",
+                    task_artifact_ids=[],
+                )
+            },
+            artifact_index=ArtifactIndex(by_type={ArtifactKind.IMAGE: ["art_img_input_001", "art_image_candidate_001"]}),
+        ),
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri="store://images/original.png",
+                payload={"role": "input"},
+                scope="session",
+            ),
+            "art_image_candidate_001": ImageArtifact(
+                id="art_image_candidate_001",
+                uri="store://images/candidate.png",
+                payload={"role": "candidate_image"},
+                scope="task",
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+        "task_loops": [],
+    }
+
+    mocker.patch("agents.execute_agent.load_llm_config", return_value=mocker.Mock(api_key="k", base_url="u", model_name="m"))
+    captured = {}
+
+    def fake_structured(*, user_prompt, system_prompt, output_schema):
+        captured["user_prompt"] = user_prompt
+        return ExecuteLLMOutput(
+            reasoning="retry with edit",
+            selected_tools=["edit"],
+        )
+
+    mocker.patch("agents.execute_agent.invoke_structured_llm", side_effect=fake_structured)
+
+    result = ExecuteAgent().run(state)
+
+    assert "Retry context:" in captured["user_prompt"]
+    assert "边界不干净" in captured["user_prompt"]
+    assert result["session"].task_states["task_001"].resolved_input_artifact_ids == [
+        "art_img_input_001",
+        "art_image_candidate_001",
+    ]

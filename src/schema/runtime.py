@@ -92,10 +92,14 @@ class TaskState(StrictModel):
     task_artifact_ids: list[str] = Field(default_factory=list)
     final_artifact_id: str | None = None
     resolved_input_artifact_ids: list[str] = Field(default_factory=list)
+    retry_input_artifact_ids: list[str] = Field(default_factory=list)
+    retry_context_text: str | None = None
     input_selection_reasoning: str | None = None
     input_validation_summary: str | None = None
     latest_artifact_ids: list[str] = Field(default_factory=list)
     latest_execution_outcome: ExecutionOutcome | None = None
+    latest_execute_checkpoint: str | None = None
+    latest_evaluate_checkpoint: str | None = None
     loop_count: int = 0
     evaluator_checkpoint_count: int = 0
 

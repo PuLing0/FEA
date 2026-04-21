@@ -43,6 +43,8 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
         "task_loops": [],
         "operations": [],
         "max_task_loops": 2,
+        "max_execute_acts": 30,
+        "max_evaluator_checkpoints": 3,
     }
     for index, image_uri in enumerate(runtime_input["image_uris"], start=1):
         image = ImageArtifact(
@@ -97,19 +99,45 @@ def build_runtime_graph(*, stop_after_plan: bool = False):
         return graph.compile()
 
     graph.add_edge("plan", "execute")
-    graph.add_edge("execute", "evaluate")
+    graph.add_conditional_edges(
+        "execute",
+        _route_after_execute,
+        {
+            "evaluate": "evaluate",
+            "plan": "plan",
+            "end": END,
+        },
+    )
     graph.add_conditional_edges(
         "evaluate",
         _route_after_evaluate,
         {
             "execute": "execute",
+            "plan": "plan",
             "end": END,
         },
     )
     return graph.compile()
 
 
+def _route_after_execute(state: RuntimeState) -> str:
+    current_task_id = state["session"].current_task_id
+    if current_task_id is None:
+        if state["session"].phase == SessionPhase.PLANNING:
+            return "plan"
+        return "end"
+
+    task_state = state["session"].task_states[current_task_id]
+    if task_state.latest_execute_checkpoint == "passed":
+        return "evaluate"
+    if task_state.latest_execute_checkpoint == "failed":
+        return "plan"
+    return "end"
+
+
 def _route_after_evaluate(state: RuntimeState) -> str:
     if state["session"].phase == SessionPhase.EXECUTING:
         return "execute"
+    if state["session"].phase == SessionPhase.PLANNING:
+        return "plan"
     return "end"

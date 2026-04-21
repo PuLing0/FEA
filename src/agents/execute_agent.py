@@ -10,6 +10,8 @@ from runtime.state import RuntimeState
 from schema import (
     CollageArgs,
     CropArgs,
+    Decision,
+    DecisionRoute,
     EditMode,
     ExecuteLLMOutput,
     ExecutionOutcome,
@@ -19,6 +21,8 @@ from schema import (
     LocalEditArgs,
     PromptReconstructArgs,
     ReferenceEditArgs,
+    ReplanMode,
+    ReplanRequest,
     SegmentArgs,
     SessionPhase,
     TaskActRecord,
@@ -49,7 +53,7 @@ class ExecuteAgent:
         task_state = session.task_states[current_task_id]
         act_records: list[tuple[str, str]] = []
         latest_refs: list[str] = []
-        max_acts = 30
+        max_acts = state.get("max_execute_acts", 30)
 
         for act_index in range(1, max_acts + 1):
             strategy = (
@@ -106,15 +110,26 @@ class ExecuteAgent:
                 latest_refs = [artifact.id for artifact in execution.artifacts]
                 break
 
-        task_state.latest_execution_outcome = ExecutionOutcome.SUCCESS
         task_state.loop_count += 1
         task_state.latest_artifact_ids = latest_refs
         if latest_refs:
+            task_state.latest_execution_outcome = ExecutionOutcome.SUCCESS
+            task_state.latest_execute_checkpoint = "passed"
             task_state.status = TaskStatus.WAITING_EVALUATION
             session.phase = SessionPhase.EVALUATING
         else:
-            task_state.status = TaskStatus.RUNNING
-            session.phase = SessionPhase.EXECUTING
+            task_state.latest_execution_outcome = ExecutionOutcome.FAILURE
+            task_state.latest_execute_checkpoint = "failed"
+            self._clear_retry_context(task_state)
+            task_state.status = TaskStatus.REPLANNED
+            session.current_task_id = None
+            session.phase = SessionPhase.PLANNING
+            decision = self._build_execute_failure_replan_decision(
+                state=state,
+                task_id=current_task_id,
+            )
+            state["decision"] = decision
+            session.latest_decision_id = decision.id
 
         state["task_loops"].append(
             TaskLoop(
@@ -137,6 +152,41 @@ class ExecuteAgent:
         )
         state["session"] = session
         return state
+
+    def _build_execute_failure_replan_decision(
+        self,
+        *,
+        state: RuntimeState,
+        task_id: str,
+    ) -> Decision:
+        task = state["tasks"][task_id]
+        task_state = state["session"].task_states[task_id]
+        return Decision(
+            id=f"dec_exec_fail_{task_id}_{task_state.loop_count + 1:03d}",
+            route=DecisionRoute.REPLAN,
+            task_id=task_id,
+            plan_id=state["session"].current_plan_id,
+            source_execution_outcome=ExecutionOutcome.FAILURE,
+            candidate_artifact_ids=[],
+            summary="execute checkpoint reached the max loop budget before a successful output was produced",
+            issues=[
+                "execute_loop_budget_exceeded",
+                "current_task_did_not_reach_success_state",
+            ],
+            replan=ReplanRequest(
+                mode=self._fallback_replan_mode(task.type),
+                reason=(
+                    "the current task kept requesting another loop until the execute budget was "
+                    "exhausted"
+                ),
+                preserve_artifact_ids=list(task_state.task_artifact_ids[-6:]),
+            ),
+        )
+
+    def _fallback_replan_mode(self, task_type: str) -> ReplanMode:
+        if task_type in {"local_edit", "compose_subject", "reference_edit"}:
+            return ReplanMode.SPLIT_TASK
+        return ReplanMode.REROUTE_PLAN
 
     def _select_and_run_tool(
         self,
@@ -300,6 +350,12 @@ class ExecuteAgent:
         task_id: str,
         act_index: int,
     ) -> str:
+        retry_context = state["session"].task_states[task_id].retry_context_text
+        if retry_context:
+            return (
+                "This is an evaluator-guided retry for the same task. "
+                f"Use the retry context below to decide the next single tool.\n{retry_context}"
+            )
         if task.type == "local_edit":
             return (
                 "This task may benefit from a weak chained template: "
@@ -502,6 +558,7 @@ class ExecuteAgent:
                 f"Task instruction: {task.instruction}\n"
                 f"User instruction: {state['input']['instruction_text']}\n"
                 f"Resolved input artifact ids: {state['session'].task_states[task.id].resolved_input_artifact_ids}\n"
+                f"Retry context: {state['session'].task_states[task.id].retry_context_text}\n"
                 f"Current active instruction: {self._resolve_active_instruction_text_from_artifacts(state, task.id)}\n"
                 f"Task artifact summary:\n{self._build_task_artifact_context(state, task.id)}\n"
                 f"Latest candidate refs: {state['session'].task_states[task.id].latest_artifact_ids}\n"
@@ -561,6 +618,10 @@ class ExecuteAgent:
         if latest_collage and latest_collage not in block_ids:
             block_ids.append(latest_collage)
         return block_ids
+
+    def _clear_retry_context(self, task_state) -> None:
+        task_state.retry_input_artifact_ids = []
+        task_state.retry_context_text = None
 
     def _has_reconstructed_instruction(self, state: RuntimeState, task_id: str) -> bool:
         for artifact_id in reversed(state["session"].task_states[task_id].task_artifact_ids):
