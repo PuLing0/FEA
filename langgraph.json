@@ -1,0 +1,6 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "fig_edit_agent": "./src/agent.py:agent"
+  }
+}

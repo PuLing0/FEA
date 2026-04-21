@@ -1,0 +1,114 @@
+"""Thin LLM wrapper: LangChain for text, PydanticAI for structured output."""
+
+from __future__ import annotations
+
+import os
+from typing import Any
+
+from dotenv import load_dotenv
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+from pydantic_ai import Agent
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.profiles.openai import OpenAIModelProfile
+from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic import Field
+
+from schema import StrictModel
+
+
+class LLMConfig(StrictModel):
+    """Environment-driven LLM configuration."""
+
+    api_key: str = Field(alias="LLM_API_KEY")
+    base_url: str = Field(alias="LLM_BASE_URL")
+    model_name: str = Field(alias="LLM_MODEL_NAME")
+    temperature: float = Field(default=0.0, alias="LLM_TEMPERATURE")
+
+
+def load_llm_config() -> LLMConfig:
+    """Load LLM configuration from `.env` and the current environment."""
+
+    load_dotenv()
+    raw = {
+        "LLM_API_KEY": os.getenv("LLM_API_KEY", ""),
+        "LLM_BASE_URL": os.getenv("LLM_BASE_URL", ""),
+        "LLM_MODEL_NAME": os.getenv("LLM_MODEL_NAME", ""),
+        "LLM_TEMPERATURE": os.getenv("LLM_TEMPERATURE", "0.0"),
+    }
+    return LLMConfig.model_validate(raw)
+
+
+def make_chat_model(config: LLMConfig | None = None) -> ChatOpenAI:
+    """Create a LangChain chat model from config."""
+
+    resolved = config or load_llm_config()
+    return ChatOpenAI(
+        api_key=resolved.api_key,
+        base_url=resolved.base_url,
+        model=resolved.model_name,
+        temperature=resolved.temperature,
+    )
+
+
+def make_pydantic_ai_model(config: LLMConfig | None = None) -> OpenAIChatModel:
+    """Create a PydanticAI OpenAI-compatible model from config."""
+
+    resolved = config or load_llm_config()
+    return OpenAIChatModel(
+        resolved.model_name,
+        provider=OpenAIProvider(
+            base_url=resolved.base_url,
+            api_key=resolved.api_key,
+        ),
+        profile=OpenAIModelProfile(
+            openai_supports_strict_tool_definition=False,
+        ),
+    )
+
+
+def _build_messages(system_prompt: str | None, user_prompt: str) -> list[BaseMessage]:
+    messages: list[BaseMessage] = []
+    if system_prompt:
+        messages.append(SystemMessage(content=system_prompt))
+    messages.append(HumanMessage(content=user_prompt))
+    return messages
+
+
+def invoke_llm(
+    *,
+    user_prompt: str,
+    system_prompt: str | None = None,
+    model: ChatOpenAI | None = None,
+    config: LLMConfig | None = None,
+) -> AIMessage:
+    """Send a standard chat request and return the raw AI message."""
+
+    chat_model = model or make_chat_model(config)
+    response = chat_model.invoke(_build_messages(system_prompt, user_prompt))
+    if not isinstance(response, AIMessage) and not hasattr(response, "content"):
+        raise TypeError("Expected AIMessage response from chat model")
+    return response
+
+
+def invoke_structured_llm(
+    *,
+    user_prompt: str,
+    output_schema: type,
+    system_prompt: str | None = None,
+    model: Any | None = None,
+    config: LLMConfig | None = None,
+) -> Any:
+    """Send a chat request and parse the response as structured output.
+
+    Uses PydanticAI because the current OpenAI-compatible provider does not
+    reliably support LangChain's native structured output adapters.
+    """
+
+    pydantic_ai_model = model or make_pydantic_ai_model(config)
+    agent = Agent(
+        pydantic_ai_model,
+        instructions=system_prompt or "",
+        output_type=output_schema,
+    )
+    return agent.run_sync(user_prompt).output

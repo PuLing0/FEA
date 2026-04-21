@@ -1,0 +1,115 @@
+"""Minimal LangGraph runtime skeleton for fig_edit_agent."""
+
+from __future__ import annotations
+
+from langgraph.graph import END, START, StateGraph
+
+from agents import EvaluatorAgent, ExecuteAgent, PlanAgent
+from schema import ArtifactIndex, ArtifactKind, ImageArtifact, SessionPhase, SessionState, ToolName, UnderstandArgs
+
+from .state import RuntimeState
+from tools import build_default_tool_registry
+from tools.utils import register_artifacts
+
+
+PLAN_AGENT = PlanAgent()
+EXECUTE_AGENT = ExecuteAgent()
+EVALUATOR_AGENT = EvaluatorAgent()
+TOOL_REGISTRY = build_default_tool_registry()
+
+
+def _initial_session(session_id: str) -> SessionState:
+    return SessionState(session_id=session_id, phase=SessionPhase.UNDERSTANDING)
+
+
+def register_and_understand(state: RuntimeState) -> RuntimeState:
+    runtime_input = state["input"]
+    runtime_input.setdefault("use_llm", False)
+    if "image_uris" not in runtime_input or not runtime_input["image_uris"]:
+        runtime_input["image_uris"] = [runtime_input["image_uri"]]
+    session = _initial_session(runtime_input["session_id"])
+    session.artifact_index = ArtifactIndex(
+        by_type={
+            ArtifactKind.IMAGE: [],
+        }
+    )
+    state = {
+        "input": runtime_input,
+        "session": session,
+        "artifacts": {},
+        "plans": {},
+        "tasks": {},
+        "task_act_records": [],
+        "task_loops": [],
+        "operations": [],
+        "max_task_loops": 2,
+    }
+    for index, image_uri in enumerate(runtime_input["image_uris"], start=1):
+        image = ImageArtifact(
+            id=f"art_img_input_{index:03d}",
+            uri=image_uri,
+            payload={"role": "input", "slot_index": index},
+            created_by="user",
+            scope="session",
+        )
+        state["artifacts"][image.id] = image
+        state["session"].artifact_index.by_type.setdefault(ArtifactKind.IMAGE, []).append(image.id)
+
+        understand_execution = TOOL_REGISTRY.get(ToolName.UNDERSTAND).run(
+            state,
+            task_id="bootstrap",
+            loop_index=0,
+            args=UnderstandArgs(
+                image_ref=image.id,
+                question=f"understand image slot {index} for the user request",
+            ),
+        )
+        state["operations"].append(understand_execution.invocation)
+        for artifact in understand_execution.artifacts:
+            state["artifacts"][artifact.id] = artifact
+    state["session"].phase = SessionPhase.PLANNING
+    return state
+
+
+def plan(state: RuntimeState) -> RuntimeState:
+    return PLAN_AGENT.run(state)
+
+
+def execute_current_task(state: RuntimeState) -> RuntimeState:
+    return EXECUTE_AGENT.run(state)
+
+
+def evaluate_checkpoint(state: RuntimeState) -> RuntimeState:
+    return EVALUATOR_AGENT.run(state)
+
+
+def build_runtime_graph(*, stop_after_plan: bool = False):
+    graph = StateGraph(RuntimeState)
+    graph.add_node("register_and_understand", register_and_understand)
+    graph.add_node("plan", plan)
+    graph.add_node("execute", execute_current_task)
+    graph.add_node("evaluate", evaluate_checkpoint)
+
+    graph.add_edge(START, "register_and_understand")
+    graph.add_edge("register_and_understand", "plan")
+    if stop_after_plan:
+        graph.add_edge("plan", END)
+        return graph.compile()
+
+    graph.add_edge("plan", "execute")
+    graph.add_edge("execute", "evaluate")
+    graph.add_conditional_edges(
+        "evaluate",
+        _route_after_evaluate,
+        {
+            "execute": "execute",
+            "end": END,
+        },
+    )
+    return graph.compile()
+
+
+def _route_after_evaluate(state: RuntimeState) -> str:
+    if state["session"].phase == SessionPhase.EXECUTING:
+        return "execute"
+    return "end"
