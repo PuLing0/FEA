@@ -9,7 +9,11 @@ from agent import agent, create_agent
 from agents import EvaluatorAgent, ExecuteAgent, PlanAgent
 from llm import invoke_llm, invoke_structured_llm, load_llm_config
 from runtime import build_runtime_graph
-from runtime.input_selector import TaskInputSelectionOutput, build_candidate_images_text
+from runtime.input_selector import (
+    TaskInputSelectionOutput,
+    build_candidate_image_pool,
+    build_candidate_images_text,
+)
 from runtime.scheduler import select_next_runnable_task
 from schema import (
     ArtifactIndex,
@@ -31,8 +35,11 @@ from schema import (
     InstructionArtifact,
     LocalEditArgs,
     MaskArtifact,
+    ObserveArtifactSummary,
+    ObserveLLMOutput,
     Plan,
     PlanLLMOutput,
+    PlanTaskSpec,
     ReplanMode,
     ReplanRequest,
     SegmentArgs,
@@ -57,6 +64,7 @@ def test_public_imports_construct_minimal_objects() -> None:
         id="art_img_001",
         uri="store://images/input.png",
         payload={"role": "input"},
+        summary="原始输入图",
         stage=ArtifactStage.COMMITTED,
     )
     mask = MaskArtifact(
@@ -90,6 +98,7 @@ def test_public_imports_construct_minimal_objects() -> None:
     assert instruction.kind == ArtifactKind.INSTRUCTION
     assert understanding.kind == ArtifactKind.UNDERSTANDING
     assert evaluation.kind == ArtifactKind.EVALUATION
+    assert image.summary == "原始输入图"
 
 
 def test_instruction_artifact_returns_instruction_text() -> None:
@@ -167,6 +176,21 @@ def test_task_act_record_construct() -> None:
     assert record.tool_name == "prompt_reconstruct"
 
 
+def test_observe_llm_output_construct() -> None:
+    out = ObserveLLMOutput(
+        outcome="continue",
+        observation="This crop preview is useful but not final yet.",
+        artifact_summaries=[
+            ObserveArtifactSummary(
+                artifact_id="art_image_001",
+                summary="局部裁剪预览图，用于下一步判断编辑区域。",
+            )
+        ],
+    )
+    assert out.outcome == "continue"
+    assert out.artifact_summaries[0].artifact_id == "art_image_001"
+
+
 def test_tool_registry_contains_prompt_reconstruct() -> None:
     registry = build_default_tool_registry()
     assert registry.get(ToolName.PROMPT_RECONSTRUCT) is not None
@@ -179,32 +203,14 @@ def test_build_candidate_images_text_uses_compact_scheme_b() -> None:
                 id="art_img_input_001",
                 uri="examples/fig1.jpg",
                 payload={"role": "input"},
+                summary="上衣单品图",
                 scope="session",
             ),
             "art_image_001": ImageArtifact(
                 id="art_image_001",
                 uri="store://generated/task_001.png",
                 payload={"role": "candidate_image"},
-                scope="task",
-            ),
-            "art_under_001": UnderstandingArtifact(
-                id="art_under_001",
-                payload={
-                    "image_ref": "art_img_input_001",
-                    "task_instruction": "理解输入图",
-                    "summary": "上衣单品图",
-                },
-                source_ids=["art_img_input_001"],
-                scope="session",
-            ),
-            "art_under_002": UnderstandingArtifact(
-                id="art_under_002",
-                payload={
-                    "image_ref": "art_image_001",
-                    "task_instruction": "理解候选图",
-                    "summary": "已合成的人物主体图",
-                },
-                source_ids=["art_image_001"],
+                summary="已合成的人物主体图",
                 scope="task",
             ),
         },
@@ -214,6 +220,63 @@ def test_build_candidate_images_text_uses_compact_scheme_b() -> None:
     assert "[art_img_input_001] 上衣单品图 | 原始输入图片" in text
     assert "[art_image_001] 已合成的人物主体图 | source=generated_result" in text
     assert "uri:" not in text
+
+
+def test_build_candidate_image_pool_includes_current_plan_inputs() -> None:
+    state = {
+        "session": SessionState(
+            session_id="sess_plan_candidates",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            artifact_index=ArtifactIndex(by_type={ArtifactKind.IMAGE: ["art_img_input_001"]}),
+            task_states={"task_001": TaskState(task_id="task_001", status=TaskStatus.RUNNING)},
+        ),
+        "plans": {
+            "plan_001": Plan(
+                id="plan_001",
+                instruction="测试 plan 输入池",
+                task_ids=["task_001"],
+                input_artifact_ids=[
+                    "art_plan_visible_001",
+                    "art_not_image_001",
+                    "art_img_input_001",
+                ],
+            )
+        },
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="edit",
+                instruction="执行当前任务",
+            )
+        },
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri="store://images/input.png",
+                payload={"role": "input"},
+                scope="session",
+            ),
+            "art_plan_visible_001": ImageArtifact(
+                id="art_plan_visible_001",
+                uri="store://images/retained.png",
+                payload={"role": "candidate_image"},
+                scope="task",
+            ),
+            "art_not_image_001": InstructionArtifact(
+                id="art_not_image_001",
+                payload={"instruction_text": "not an image"},
+                scope="task",
+            ),
+        },
+    }
+
+    assert build_candidate_image_pool(state) == [
+        "art_img_input_001",
+        "art_plan_visible_001",
+    ]
 
 
 def test_select_next_runnable_task_respects_dependencies() -> None:
@@ -657,13 +720,14 @@ def test_plan_agent_uses_llm_when_enabled(mocker) -> None:
         return_value=PlanLLMOutput(
             plan_instruction="llm plan",
             tasks=[
-                {
-                    "type": "global_edit",
-                    "instruction": "run one global edit",
-                    "input_artifact_ids": ["art_img_input_001"],
-                    "target_artifact_ids": ["art_img_input_001"],
-                    "acceptance_criteria": ["candidate exists"],
-                }
+                PlanTaskSpec(
+                    id="task_002",
+                    type="global_edit",
+                    instruction="run one global edit",
+                    input_artifact_ids=["art_img_input_001"],
+                    depends_on=[],
+                    acceptance_criteria=["candidate exists"],
+                )
             ],
         ),
     )
@@ -671,10 +735,10 @@ def test_plan_agent_uses_llm_when_enabled(mocker) -> None:
     result = PlanAgent().run(state)
 
     assert result["plans"]["plan_001"].instruction == "llm plan"
-    assert result["tasks"]["task_001"].type == "global_edit"
+    assert result["tasks"]["task_002"].type == "global_edit"
     assert any(
         result["artifacts"][artifact_id].kind == ArtifactKind.INSTRUCTION
-        for artifact_id in result["session"].task_states["task_001"].task_artifact_ids
+        for artifact_id in result["session"].task_states["task_002"].task_artifact_ids
     )
 
 
@@ -708,6 +772,15 @@ def test_execute_agent_uses_llm_strategy_when_enabled(mocker) -> None:
             reasoning="global edit is enough",
             selected_tools=["edit"],
             edit_mode="global_edit",
+        ),
+    )
+    mocker.patch.object(
+        ExecuteAgent,
+        "_observe_with_llm",
+        return_value=ObserveLLMOutput(
+            outcome="success",
+            observation="ready for evaluator",
+            artifact_summaries=[],
         ),
     )
     mocker.patch(
@@ -918,6 +991,15 @@ def test_execute_agent_accepts_grounding_and_collage_strategy(mocker) -> None:
             ExecuteLLMOutput(reasoning="Now edit with the prepared references.", selected_tools=["edit"]),
         ],
     )
+    mocker.patch.object(
+        ExecuteAgent,
+        "_observe_with_llm",
+        side_effect=[
+            ObserveLLMOutput(outcome="continue", observation="grounding is useful", artifact_summaries=[]),
+            ObserveLLMOutput(outcome="continue", observation="collage is useful", artifact_summaries=[]),
+            ObserveLLMOutput(outcome="success", observation="candidate is ready", artifact_summaries=[]),
+        ],
+    )
 
     result = ExecuteAgent().run(state)
 
@@ -996,7 +1078,6 @@ def test_local_edit_flow_materializes_task_inputs_and_intermediate_task_artifact
     )
     state["tasks"]["task_001"].type = "local_edit"
     state["tasks"]["task_001"].input_artifact_ids = ["art_img_input_001"]
-    state["tasks"]["task_001"].target_artifact_ids = ["art_img_input_001"]
     state["session"].current_task_id = "task_001"
     state["session"].task_states["task_001"].status = TaskStatus.RUNNING
 
@@ -1073,7 +1154,6 @@ def test_execute_agent_exhausted_budget_goes_directly_to_replan() -> None:
                 type="local_edit",
                 instruction="只修改上衣",
                 input_artifact_ids=["art_img_input_001"],
-                target_artifact_ids=["art_img_input_001"],
             )
         },
         "session": SessionState(
@@ -1359,6 +1439,15 @@ def test_execute_agent_llm_prompt_includes_retry_context(mocker) -> None:
         )
 
     mocker.patch("agents.execute_agent.invoke_structured_llm", side_effect=fake_structured)
+    mocker.patch.object(
+        ExecuteAgent,
+        "_observe_with_llm",
+        return_value=ObserveLLMOutput(
+            outcome="success",
+            observation="ready for evaluator",
+            artifact_summaries=[],
+        ),
+    )
 
     result = ExecuteAgent().run(state)
 
@@ -1368,3 +1457,713 @@ def test_execute_agent_llm_prompt_includes_retry_context(mocker) -> None:
         "art_img_input_001",
         "art_image_candidate_001",
     ]
+
+
+def test_execute_agent_observe_injects_artifact_summary(mocker) -> None:
+    state = {
+        "input": {
+            "instruction_text": "把人物放到背景里",
+            "use_llm": False,
+        },
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="reference_edit",
+                instruction="将人物主体放到背景图里",
+                input_artifact_ids=["art_img_input_001", "art_img_input_002"],
+            )
+        },
+        "session": SessionState(
+            session_id="sess_observe_summary",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.RUNNING,
+                    resolved_input_artifact_ids=["art_img_input_001", "art_img_input_002"],
+                    task_artifact_ids=[],
+                )
+            },
+            artifact_index=ArtifactIndex(by_type={ArtifactKind.IMAGE: ["art_img_input_001", "art_img_input_002"]}),
+        ),
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri="store://images/person.png",
+                payload={"role": "input"},
+                scope="session",
+            ),
+            "art_img_input_002": ImageArtifact(
+                id="art_img_input_002",
+                uri="store://images/background.png",
+                payload={"role": "input"},
+                scope="session",
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+        "task_loops": [],
+    }
+
+    fake_execution = mocker.Mock()
+    fake_execution.invocation = mocker.Mock()
+    fake_execution.invocation.tool_name = ToolName.EDIT
+    fake_execution.invocation.args = {"mode": "reference_edit"}
+    fake_execution.invocation.output_refs = ["art_image_candidate_001"]
+    fake_execution.artifacts = [
+        ImageArtifact(
+            id="art_image_candidate_001",
+            uri="store://generated/task_001/candidate.png",
+            payload={"role": "candidate_image"},
+            scope="task",
+        )
+    ]
+
+    mocker.patch.object(ExecuteAgent, "_select_and_run_tool", return_value=fake_execution)
+    mocker.patch.object(
+        ExecuteAgent,
+        "_observe_with_llm",
+        return_value=ObserveLLMOutput(
+            outcome="success",
+            observation="This candidate is ready for evaluator checkpoint.",
+            artifact_summaries=[
+                ObserveArtifactSummary(
+                    artifact_id="art_image_candidate_001",
+                    summary="人物已放入背景的候选图，可交给 evaluator 评估。",
+                )
+            ],
+        ),
+    )
+
+    result = ExecuteAgent().run(state)
+
+    artifact = result["artifacts"]["art_image_candidate_001"]
+    assert artifact.summary == "人物已放入背景的候选图，可交给 evaluator 评估。"
+    assert result["task_act_records"][-1].observation_text == "This candidate is ready for evaluator checkpoint."
+
+
+def test_execute_agent_uses_llm_selected_base_image_artifact_id(mocker) -> None:
+    state = {
+        "input": {
+            "instruction_text": "把人物放到背景里",
+            "use_llm": True,
+        },
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="reference_edit",
+                instruction="将人物主体放到背景图里",
+                input_artifact_ids=["art_img_input_001", "art_img_input_002"],
+            )
+        },
+        "session": SessionState(
+            session_id="sess_base_select",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.RUNNING,
+                    resolved_input_artifact_ids=["art_img_input_001", "art_img_input_002"],
+                    task_artifact_ids=["art_under_001", "art_under_002"],
+                )
+            },
+            artifact_index=ArtifactIndex(by_type={ArtifactKind.IMAGE: ["art_img_input_001", "art_img_input_002"]}),
+        ),
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri="store://images/person.png",
+                payload={"role": "input"},
+                scope="session",
+            ),
+            "art_img_input_002": ImageArtifact(
+                id="art_img_input_002",
+                uri="store://images/background.png",
+                payload={"role": "input"},
+                scope="session",
+            ),
+            "art_under_001": UnderstandingArtifact(
+                id="art_under_001",
+                payload={"image_ref": "art_img_input_001", "summary": "人物主体图"},
+                scope="task",
+            ),
+            "art_under_002": UnderstandingArtifact(
+                id="art_under_002",
+                payload={"image_ref": "art_img_input_002", "summary": "拍照背景图"},
+                scope="task",
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+        "task_loops": [],
+    }
+
+    mocker.patch("agents.execute_agent.load_llm_config", return_value=mocker.Mock(api_key="k", base_url="u", model_name="m"))
+    mocker.patch(
+        "agents.execute_agent.invoke_structured_llm",
+        return_value=ExecuteLLMOutput(
+            reasoning="use the background as base and the person as reference",
+            selected_tools=["edit"],
+            base_image_artifact_id="art_img_input_002",
+        ),
+    )
+    mocker.patch.object(
+        ExecuteAgent,
+        "_observe_with_llm",
+        return_value=ObserveLLMOutput(
+            outcome="success",
+            observation="ready for evaluator",
+            artifact_summaries=[],
+        ),
+    )
+
+    captured = {}
+
+    def fake_select_and_run_tool(self, *, state, task, task_id, loop_index, selected_tool, resolved_inputs, base_image_ref):
+        captured["base_image_ref"] = base_image_ref
+        fake = mocker.Mock()
+        fake.invocation = mocker.Mock()
+        fake.invocation.tool_name = ToolName.EDIT
+        fake.invocation.args = {"mode": "reference_edit"}
+        fake.invocation.output_refs = ["art_image_candidate_001"]
+        fake.artifacts = [
+            ImageArtifact(
+                id="art_image_candidate_001",
+                uri="store://generated/task_001/candidate.png",
+                payload={"role": "candidate_image"},
+                scope="task",
+            )
+        ]
+        return fake
+
+    mocker.patch.object(ExecuteAgent, "_select_and_run_tool", fake_select_and_run_tool)
+
+    ExecuteAgent().run(state)
+
+    assert captured["base_image_ref"] == "art_img_input_002"
+
+
+def test_execute_agent_retry_candidate_has_priority_as_base_image(mocker) -> None:
+    state = {
+        "input": {
+            "instruction_text": "继续修正失败结果",
+            "use_llm": True,
+        },
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="reference_edit",
+                instruction="继续修正当前结果",
+            )
+        },
+        "session": SessionState(
+            session_id="sess_retry_base",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.RUNNING,
+                    resolved_input_artifact_ids=["art_img_input_001", "art_image_candidate_001"],
+                    task_artifact_ids=[],
+                )
+            },
+            artifact_index=ArtifactIndex(by_type={ArtifactKind.IMAGE: ["art_img_input_001", "art_image_candidate_001"]}),
+        ),
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri="store://images/original.png",
+                payload={"role": "input"},
+                scope="session",
+            ),
+            "art_image_candidate_001": ImageArtifact(
+                id="art_image_candidate_001",
+                uri="store://generated/task_001/candidate.png",
+                payload={"role": "candidate_image"},
+                scope="task",
+            ),
+        },
+        "decision": Decision(
+            id="dec_001",
+            route=DecisionRoute.CONTINUE_EXECUTE,
+            task_id="task_001",
+            summary="继续修正",
+            task_retry=TaskRetryAdvice(
+                reason="继续沿失败结果修正",
+                base_candidate_artifact_id="art_image_candidate_001",
+                fix_focuses=["修边界"],
+            ),
+        ),
+        "operations": [],
+        "task_act_records": [],
+        "task_loops": [],
+    }
+
+    mocker.patch("agents.execute_agent.load_llm_config", return_value=mocker.Mock(api_key="k", base_url="u", model_name="m"))
+    mocker.patch(
+        "agents.execute_agent.invoke_structured_llm",
+        return_value=ExecuteLLMOutput(
+            reasoning="even if another image exists, continue from failed candidate",
+            selected_tools=["edit"],
+            base_image_artifact_id="art_img_input_001",
+        ),
+    )
+    mocker.patch.object(
+        ExecuteAgent,
+        "_observe_with_llm",
+        return_value=ObserveLLMOutput(
+            outcome="success",
+            observation="ready for evaluator",
+            artifact_summaries=[],
+        ),
+    )
+
+    captured = {}
+
+    def fake_select_and_run_tool(self, *, state, task, task_id, loop_index, selected_tool, resolved_inputs, base_image_ref):
+        captured["base_image_ref"] = base_image_ref
+        fake = mocker.Mock()
+        fake.invocation = mocker.Mock()
+        fake.invocation.tool_name = ToolName.EDIT
+        fake.invocation.args = {"mode": "reference_edit"}
+        fake.invocation.output_refs = ["art_image_candidate_002"]
+        fake.artifacts = [
+            ImageArtifact(
+                id="art_image_candidate_002",
+                uri="store://generated/task_001/candidate_retry.png",
+                payload={"role": "candidate_image"},
+                scope="task",
+            )
+        ]
+        return fake
+
+    mocker.patch.object(ExecuteAgent, "_select_and_run_tool", fake_select_and_run_tool)
+
+    ExecuteAgent().run(state)
+
+    assert captured["base_image_ref"] == "art_image_candidate_001"
+
+
+def test_plan_agent_replan_creates_new_plan_version_and_marks_old_tasks() -> None:
+    state = {
+        "input": {
+            "instruction_text": "重新规划当前路线",
+            "use_llm": False,
+        },
+        "session": SessionState(
+            session_id="sess_replan",
+            phase=SessionPhase.PLANNING,
+            current_plan_id="plan_001",
+            current_task_id=None,
+            latest_decision_id="dec_001",
+            artifact_index=ArtifactIndex(by_type={ArtifactKind.IMAGE: ["art_img_input_001", "art_keep_001"]}),
+            task_states={
+                "task_001": TaskState(task_id="task_001", status=TaskStatus.PASSED),
+                "task_002": TaskState(task_id="task_002", status=TaskStatus.RUNNING),
+                "task_003": TaskState(task_id="task_003", status=TaskStatus.PENDING),
+            },
+        ),
+        "plans": {
+            "plan_001": Plan(
+                id="plan_001",
+                instruction="旧计划",
+                task_ids=["task_001", "task_002", "task_003"],
+                input_artifact_ids=["art_img_input_001"],
+            )
+        },
+        "tasks": {
+            "task_001": Task(id="task_001", plan_id="plan_001", type="keep", instruction="保留 task"),
+            "task_002": Task(id="task_002", plan_id="plan_001", type="failed", instruction="失败 task"),
+            "task_003": Task(id="task_003", plan_id="plan_001", type="future", instruction="未来 task"),
+        },
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri="store://images/input.png",
+                summary="原始输入人物图",
+                payload={"role": "input"},
+                scope="session",
+            ),
+            "art_keep_001": ImageArtifact(
+                id="art_keep_001",
+                uri="store://images/keep.png",
+                summary="已保留的人物主体候选图",
+                payload={"role": "candidate_image"},
+                scope="task",
+            ),
+        },
+        "decision": Decision(
+            id="dec_001",
+            route=DecisionRoute.REPLAN,
+            task_id="task_002",
+            plan_id="plan_001",
+            summary="需要拆分 task",
+            replan=ReplanRequest(
+                mode=ReplanMode.SPLIT_TASK,
+                reason="当前 task 太粗",
+                preserve_task_ids=["task_001"],
+                preserve_artifact_ids=["art_keep_001"],
+            ),
+        ),
+    }
+
+    result = PlanAgent().run(state)
+
+    assert result["session"].current_plan_id == "plan_002"
+    assert result["plans"]["plan_001"].task_ids == ["task_001", "task_002", "task_003"]
+    assert result["session"].task_states["task_001"].status == TaskStatus.PASSED
+    assert result["session"].task_states["task_002"].status == TaskStatus.REPLANNED
+    assert result["session"].task_states["task_003"].status == TaskStatus.ABANDONED
+    assert "task_001" in result["plans"]["plan_002"].task_ids
+    assert any(task_id.startswith("task_00") and task_id not in {"task_001", "task_002", "task_003"} for task_id in result["plans"]["plan_002"].task_ids)
+    assert "art_keep_001" in result["plans"]["plan_002"].input_artifact_ids
+    new_task_ids = [
+        task_id
+        for task_id in result["plans"]["plan_002"].task_ids
+        if task_id != "task_001"
+    ]
+    assert all(result["tasks"][task_id].input_artifact_ids == [] for task_id in new_task_ids)
+
+
+def test_plan_agent_replan_selects_first_runnable_new_task() -> None:
+    state = {
+        "input": {
+            "instruction_text": "重排路线",
+            "use_llm": False,
+        },
+        "session": SessionState(
+            session_id="sess_replan_runnable",
+            phase=SessionPhase.PLANNING,
+            current_plan_id="plan_001",
+            current_task_id=None,
+            artifact_index=ArtifactIndex(by_type={ArtifactKind.IMAGE: ["art_img_input_001"]}),
+            task_states={
+                "task_001": TaskState(task_id="task_001", status=TaskStatus.PASSED),
+                "task_002": TaskState(task_id="task_002", status=TaskStatus.RUNNING),
+            },
+        ),
+        "plans": {
+            "plan_001": Plan(
+                id="plan_001",
+                instruction="旧计划",
+                task_ids=["task_001", "task_002"],
+            )
+        },
+        "tasks": {
+            "task_001": Task(id="task_001", plan_id="plan_001", type="done", instruction="旧已完成"),
+            "task_002": Task(id="task_002", plan_id="plan_001", type="failed", instruction="旧失败"),
+        },
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri="store://images/input.png",
+                payload={"role": "input"},
+                scope="session",
+            ),
+        },
+        "decision": Decision(
+            id="dec_002",
+            route=DecisionRoute.REPLAN,
+            task_id="task_002",
+            plan_id="plan_001",
+            summary="重排顺序",
+            replan=ReplanRequest(
+                mode=ReplanMode.REROUTE_PLAN,
+                reason="后续路线需要重排",
+                preserve_task_ids=["task_001"],
+                preserve_artifact_ids=[],
+            ),
+        ),
+    }
+
+    result = PlanAgent().run(state)
+
+    assert result["session"].current_plan_id == "plan_002"
+    assert result["session"].current_task_id is not None
+    assert result["session"].task_states[result["session"].current_task_id].status == TaskStatus.RUNNING
+
+
+def test_plan_agent_initial_planning_uses_incrementing_plan_id() -> None:
+    state = {
+        "input": {
+            "instruction_text": "新建计划",
+            "use_llm": False,
+        },
+        "session": SessionState(
+            session_id="sess_initial_increment",
+            phase=SessionPhase.PLANNING,
+            artifact_index=ArtifactIndex(by_type={ArtifactKind.IMAGE: ["art_img_input_001"]}),
+        ),
+        "plans": {
+            "plan_001": Plan(id="plan_001", instruction="旧计划", task_ids=["task_001"]),
+        },
+        "tasks": {
+            "task_001": Task(id="task_001", plan_id="plan_001", type="old", instruction="旧 task"),
+        },
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri="store://images/input.png",
+                payload={"role": "input"},
+                scope="session",
+            ),
+        },
+        "task_act_records": [],
+        "task_loops": [],
+        "operations": [],
+    }
+
+    result = PlanAgent().run(state)
+
+    assert result["session"].current_plan_id == "plan_002"
+
+
+def test_plan_agent_invalid_llm_output_falls_back_to_replan_template(mocker) -> None:
+    state = {
+        "input": {
+            "instruction_text": "重新规划当前路线",
+            "use_llm": True,
+        },
+        "session": SessionState(
+            session_id="sess_invalid_replan_llm",
+            phase=SessionPhase.PLANNING,
+            current_plan_id="plan_001",
+            current_task_id=None,
+            artifact_index=ArtifactIndex(by_type={ArtifactKind.IMAGE: ["art_img_input_001", "art_keep_001"]}),
+            task_states={
+                "task_001": TaskState(task_id="task_001", status=TaskStatus.PASSED),
+                "task_002": TaskState(task_id="task_002", status=TaskStatus.RUNNING),
+            },
+        ),
+        "plans": {
+            "plan_001": Plan(
+                id="plan_001",
+                instruction="旧计划",
+                task_ids=["task_001", "task_002"],
+            )
+        },
+        "tasks": {
+            "task_001": Task(id="task_001", plan_id="plan_001", type="keep", instruction="保留 task"),
+            "task_002": Task(id="task_002", plan_id="plan_001", type="failed", instruction="失败 task"),
+        },
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri="store://images/input.png",
+                payload={"role": "input"},
+                scope="session",
+            ),
+            "art_keep_001": ImageArtifact(
+                id="art_keep_001",
+                uri="store://images/keep.png",
+                payload={"role": "candidate_image"},
+                scope="task",
+            ),
+        },
+        "decision": Decision(
+            id="dec_003",
+            route=DecisionRoute.REPLAN,
+            task_id="task_002",
+            plan_id="plan_001",
+            summary="需要拆分 task",
+            replan=ReplanRequest(
+                mode=ReplanMode.SPLIT_TASK,
+                reason="当前 task 太粗",
+                preserve_task_ids=["task_001"],
+                preserve_artifact_ids=["art_keep_001"],
+            ),
+        ),
+    }
+
+    mocker.patch("agents.plan_agent.load_llm_config", return_value=mocker.Mock(api_key="k", base_url="u", model_name="m"))
+    mocker.patch(
+        "agents.plan_agent.invoke_structured_llm",
+        return_value=PlanLLMOutput(
+            plan_instruction='[{"id":"task_999","type":"bad"}]',
+            tasks=[
+                PlanTaskSpec(
+                    id="task_001",
+                    type="bad",
+                    instruction="bad",
+                    input_artifact_ids=[],
+                    depends_on=[],
+                    acceptance_criteria=["bad"],
+                )
+            ],
+        ),
+    )
+
+    result = PlanAgent().run(state)
+
+    assert result["session"].current_plan_id == "plan_002"
+    assert result["plans"]["plan_002"].instruction.startswith("Replan mode:")
+    new_task_ids = [task_id for task_id in result["plans"]["plan_002"].task_ids if task_id != "task_001"]
+    assert len(new_task_ids) == 2
+    assert all(result["tasks"][task_id].input_artifact_ids == [] for task_id in new_task_ids)
+
+
+def test_plan_agent_replan_rejects_illegal_llm_input_artifact_id(mocker) -> None:
+    state = {
+        "input": {
+            "instruction_text": "重新规划当前路线",
+            "use_llm": True,
+        },
+        "session": SessionState(
+            session_id="sess_replan_illegal_input",
+            phase=SessionPhase.PLANNING,
+            current_plan_id="plan_001",
+            current_task_id=None,
+            artifact_index=ArtifactIndex(by_type={ArtifactKind.IMAGE: ["art_img_input_001"]}),
+            task_states={
+                "task_001": TaskState(task_id="task_001", status=TaskStatus.PASSED),
+                "task_002": TaskState(task_id="task_002", status=TaskStatus.RUNNING),
+            },
+        ),
+        "plans": {
+            "plan_001": Plan(id="plan_001", instruction="旧计划", task_ids=["task_001", "task_002"])
+        },
+        "tasks": {
+            "task_001": Task(id="task_001", plan_id="plan_001", type="keep", instruction="保留 task"),
+            "task_002": Task(id="task_002", plan_id="plan_001", type="failed", instruction="失败 task"),
+        },
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri="store://images/input.png",
+                payload={"role": "input"},
+                scope="session",
+            ),
+        },
+        "decision": Decision(
+            id="dec_illegal_input",
+            route=DecisionRoute.REPLAN,
+            task_id="task_002",
+            plan_id="plan_001",
+            summary="需要重做",
+            replan=ReplanRequest(
+                mode=ReplanMode.REROUTE_PLAN,
+                reason="输入绑定不应由 planner 决定",
+                preserve_task_ids=["task_001"],
+                preserve_artifact_ids=[],
+            ),
+        ),
+    }
+
+    mocker.patch("agents.plan_agent.load_llm_config", return_value=mocker.Mock(api_key="k", base_url="u", model_name="m"))
+    mocker.patch(
+        "agents.plan_agent.invoke_structured_llm",
+        return_value=PlanLLMOutput(
+            plan_instruction="补全后续任务",
+            tasks=[
+                PlanTaskSpec(
+                    id="task_003",
+                    type="bad_input_binding",
+                    instruction="错误绑定不存在的输入",
+                    input_artifact_ids=["art_future_999"],
+                    depends_on=["task_001"],
+                    acceptance_criteria=["完成"],
+                )
+            ],
+        ),
+    )
+
+    result = PlanAgent().run(state)
+
+    assert result["plans"]["plan_002"].instruction.startswith("Replan mode:")
+    new_task_ids = [task_id for task_id in result["plans"]["plan_002"].task_ids if task_id != "task_001"]
+    assert len(new_task_ids) == 2
+    assert all(result["tasks"][task_id].input_artifact_ids == [] for task_id in new_task_ids)
+
+
+def test_plan_agent_replan_prompt_includes_available_artifact_summaries(mocker) -> None:
+    state = {
+        "input": {
+            "instruction_text": "重新规划当前路线",
+            "use_llm": True,
+        },
+        "session": SessionState(
+            session_id="sess_replan_artifact_catalog",
+            phase=SessionPhase.PLANNING,
+            current_plan_id="plan_001",
+            current_task_id=None,
+            artifact_index=ArtifactIndex(by_type={ArtifactKind.IMAGE: ["art_img_input_001", "art_keep_001"]}),
+            task_states={
+                "task_001": TaskState(task_id="task_001", status=TaskStatus.PASSED),
+                "task_002": TaskState(task_id="task_002", status=TaskStatus.RUNNING),
+            },
+        ),
+        "plans": {
+            "plan_001": Plan(id="plan_001", instruction="旧计划", task_ids=["task_001", "task_002"])
+        },
+        "tasks": {
+            "task_001": Task(id="task_001", plan_id="plan_001", type="keep", instruction="保留 task"),
+            "task_002": Task(id="task_002", plan_id="plan_001", type="failed", instruction="失败 task"),
+        },
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri="store://images/input.png",
+                summary="原始输入人物图",
+                payload={"role": "input"},
+                scope="session",
+            ),
+            "art_keep_001": ImageArtifact(
+                id="art_keep_001",
+                uri="store://images/keep.png",
+                summary="已保留的人物主体候选图",
+                payload={"role": "candidate_image"},
+                scope="task",
+            ),
+        },
+        "decision": Decision(
+            id="dec_004",
+            route=DecisionRoute.REPLAN,
+            task_id="task_002",
+            plan_id="plan_001",
+            summary="需要拆分 task",
+            replan=ReplanRequest(
+                mode=ReplanMode.SPLIT_TASK,
+                reason="当前 task 太粗",
+                preserve_task_ids=["task_001"],
+                preserve_artifact_ids=["art_keep_001"],
+            ),
+        ),
+    }
+
+    captured = {}
+
+    def fake_structured(*, user_prompt, system_prompt, output_schema):
+        captured["user_prompt"] = user_prompt
+        return PlanLLMOutput(
+            plan_instruction="补全后续任务",
+            tasks=[
+                PlanTaskSpec(
+                    id="task_003",
+                    type="prepare_refined_inputs",
+                    instruction="准备后续输入",
+                    input_artifact_ids=[],
+                    depends_on=["task_001"],
+                    acceptance_criteria=["输入准备完成"],
+                )
+            ],
+        )
+
+    mocker.patch("agents.plan_agent.load_llm_config", return_value=mocker.Mock(api_key="k", base_url="u", model_name="m"))
+    mocker.patch("agents.plan_agent.invoke_structured_llm", side_effect=fake_structured)
+
+    result = PlanAgent().run(state)
+
+    assert "Available artifacts for planning:" in captured["user_prompt"]
+    assert "art_keep_001" in captured["user_prompt"]
+    assert "已保留的人物主体候选图" in captured["user_prompt"]
+    assert result["plans"]["plan_002"].task_ids == ["task_001", "task_003"]
+    assert result["tasks"]["task_003"].input_artifact_ids == []
