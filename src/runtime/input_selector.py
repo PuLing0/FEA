@@ -53,13 +53,24 @@ def build_candidate_image_pool(state: RuntimeState) -> list[str]:
 
     Visible candidates come from:
     - session-level retained image pool
+    - current plan-level visible image pool
     - final outputs from dependency tasks
     - current task-local image artifacts (for later loop iterations)
     """
 
     session = state["session"]
     current_task_id = session.current_task_id
-    candidates: list[str] = list(session.artifact_index.by_type.get("image", []))
+    candidates: list[str] = []
+
+    if session.artifact_index is not None:
+        for artifact_id in session.artifact_index.by_type.get("image", []):
+            _append_image_candidate(state, candidates, artifact_id)
+
+    plans = state.get("plans", {})
+    if session.current_plan_id is not None and session.current_plan_id in plans:
+        current_plan = plans[session.current_plan_id]
+        for artifact_id in current_plan.input_artifact_ids:
+            _append_image_candidate(state, candidates, artifact_id)
 
     if current_task_id is None:
         return candidates
@@ -67,20 +78,28 @@ def build_candidate_image_pool(state: RuntimeState) -> list[str]:
     task = state["tasks"][current_task_id]
     for dep_id in task.depends_on:
         dep_final = session.task_states[dep_id].final_artifact_id
-        if dep_final and dep_final not in candidates:
-            candidates.append(dep_final)
+        if dep_final:
+            _append_image_candidate(state, candidates, dep_final)
 
     for artifact_id in session.task_states[current_task_id].task_artifact_ids:
-        artifact = state["artifacts"].get(artifact_id)
-        if (
-            artifact_id in state["artifacts"]
-            and artifact is not None
-            and artifact.kind == ArtifactKind.IMAGE
-            and artifact_id not in candidates
-        ):
-            candidates.append(artifact_id)
+        _append_image_candidate(state, candidates, artifact_id)
 
     return candidates
+
+
+def _append_image_candidate(
+    state: RuntimeState,
+    candidates: list[str],
+    artifact_id: str,
+) -> None:
+    artifact = state["artifacts"].get(artifact_id)
+    if artifact is None:
+        return
+    if artifact.kind != ArtifactKind.IMAGE:
+        return
+    if artifact_id in candidates:
+        return
+    candidates.append(artifact_id)
 
 
 def ensure_understanding_for_images(state: RuntimeState, image_ids: list[str], *, task_id: str) -> None:
@@ -114,20 +133,15 @@ def build_candidate_images_text(state: RuntimeState, image_ids: list[str]) -> st
 
     Each line keeps only:
     - artifact_id
-    - understanding summary
+    - artifact summary
     - source
     """
-
-    understanding_by_image = {}
-    for artifact in state["artifacts"].values():
-        if artifact.kind == ArtifactKind.UNDERSTANDING and artifact.payload.get("image_ref"):
-            understanding_by_image[artifact.payload["image_ref"]] = artifact.payload.get("summary", "")
 
     lines: list[str] = []
     for image_id in image_ids:
         artifact = state["artifacts"][image_id]
         source_label = _resolve_source_label(image_id, artifact.payload)
-        summary = understanding_by_image.get(image_id, "")
+        summary = artifact.summary or ""
         if source_label is None:
             lines.append(f"[{image_id}] {summary} | 原始输入图片")
         else:
