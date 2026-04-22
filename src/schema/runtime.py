@@ -23,7 +23,6 @@ class Task(StrictModel):
     type: str
     instruction: str
     input_artifact_ids: list[str] = Field(default_factory=list)
-    target_artifact_ids: list[str] = Field(default_factory=list)
     depends_on: list[str] = Field(default_factory=list)
     acceptance_criteria: list[str] = Field(default_factory=list)
     meta: dict[str, Any] | None = None
@@ -42,7 +41,18 @@ class PlanLLMOutput(StrictModel):
     """Minimal structured output for the planning step."""
 
     plan_instruction: str
-    tasks: list[dict[str, Any]] = Field(default_factory=list)
+    tasks: list["PlanTaskSpec"] = Field(default_factory=list, min_length=1)
+
+
+class PlanTaskSpec(StrictModel):
+    """Structured planner output for a single task spec."""
+
+    id: str
+    type: str
+    instruction: str
+    input_artifact_ids: list[str] = Field(default_factory=list)
+    depends_on: list[str] = Field(default_factory=list)
+    acceptance_criteria: list[str] = Field(default_factory=list, min_length=1)
 
 
 class ExecuteLLMOutput(StrictModel):
@@ -51,6 +61,18 @@ class ExecuteLLMOutput(StrictModel):
     reasoning: str
     selected_tools: list[str] = Field(default_factory=list)
     edit_mode: str | None = None
+    base_image_artifact_id: str | None = None
+
+
+class ObserveArtifactSummary(StrictModel):
+    artifact_id: str
+    summary: str
+
+
+class ObserveLLMOutput(StrictModel):
+    outcome: str
+    observation: str
+    artifact_summaries: list[ObserveArtifactSummary] = Field(default_factory=list)
 
 
 class TaskActRecord(StrictModel):

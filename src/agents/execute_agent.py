@@ -19,6 +19,7 @@ from schema import (
     GroundingArgs,
     InstructionArtifact,
     LocalEditArgs,
+    ObserveLLMOutput,
     PromptReconstructArgs,
     ReferenceEditArgs,
     ReplanMode,
@@ -73,6 +74,13 @@ class ExecuteAgent:
                 act_index=act_index,
                 strategy=strategy,
             )
+            base_image_ref = self._resolve_base_image_ref(
+                state=state,
+                task=task,
+                task_id=current_task_id,
+                resolved_inputs=resolved_inputs,
+                strategy=strategy,
+            )
             execution = self._select_and_run_tool(
                 state=state,
                 task=task,
@@ -80,6 +88,7 @@ class ExecuteAgent:
                 loop_index=loop_index,
                 selected_tool=selected_tool,
                 resolved_inputs=resolved_inputs,
+                base_image_ref=base_image_ref,
             )
 
             state["operations"].append(execution.invocation)
@@ -88,10 +97,15 @@ class ExecuteAgent:
                 if artifact.id not in task_state.task_artifact_ids:
                     task_state.task_artifact_ids.append(artifact.id)
 
-            observation = (
-                f"Act {act_index} executed {selected_tool.value} and "
-                f"produced {len(execution.artifacts)} artifact(s)."
+            observe_result = self._observe_with_llm(
+                state=state,
+                task=task,
+                task_id=current_task_id,
+                selected_tool=selected_tool,
+                execution=execution,
             )
+            self._apply_observe_artifact_summaries(execution.artifacts, observe_result)
+            observation = observe_result.observation
             act_records.append((thinking, observation))
             state["task_act_records"].append(
                 TaskActRecord(
@@ -106,7 +120,7 @@ class ExecuteAgent:
                 )
             )
 
-            if execution.invocation.tool_name == ToolName.EDIT:
+            if observe_result.outcome == "success":
                 latest_refs = [artifact.id for artifact in execution.artifacts]
                 break
 
@@ -141,8 +155,9 @@ class ExecuteAgent:
                     for index, (thinking, _) in enumerate(act_records, start=1)
                 ),
                 selected_tools=[
-                    entry.split(" executed ", 1)[1].split(" ", 1)[0]
-                    for _, entry in act_records
+                    record.tool_name
+                    for record in state["task_act_records"]
+                    if record.task_id == current_task_id and record.loop_index == loop_index
                 ],
                 output_artifact_ids=list(latest_refs),
                 observation="\n".join(
@@ -152,6 +167,74 @@ class ExecuteAgent:
         )
         state["session"] = session
         return state
+
+    def _observe_with_llm(
+        self,
+        *,
+        state: RuntimeState,
+        task: Any,
+        task_id: str,
+        selected_tool: ToolName,
+        execution,
+    ) -> ObserveLLMOutput:
+        if not self._use_llm(state):
+            return ObserveLLMOutput(
+                outcome="success" if selected_tool == ToolName.EDIT else "continue",
+                observation=(
+                    f"Act executed {selected_tool.value} and produced "
+                    f"{len(execution.artifacts)} artifact(s)."
+                ),
+                artifact_summaries=[],
+            )
+        source_lines = []
+        for artifact in execution.artifacts:
+            if artifact.source_ids:
+                for source_id in artifact.source_ids:
+                    source_artifact = state["artifacts"].get(source_id)
+                    if source_artifact is None:
+                        continue
+                    source_summary = source_artifact.summary
+                    if source_summary is None and source_artifact.kind == "understanding":
+                        source_summary = source_artifact.payload.get("summary")
+                    source_lines.append(
+                        f"- {source_id} | kind={source_artifact.kind} | summary={source_summary or '(no summary)'}"
+                    )
+        new_artifact_lines = [
+            f"- {artifact.id} | kind={artifact.kind} | payload={artifact.payload} | source_ids={artifact.source_ids}"
+            for artifact in execution.artifacts
+        ]
+        return invoke_structured_llm(
+            system_prompt=(
+                "You are the observe step of an image-editing execute agent. "
+                "Decide whether the current loop should continue or whether the current results are good enough to stop the execute checkpoint with success. "
+                "Also generate one short semantic summary for each newly produced artifact. "
+                "Return only structured output."
+            ),
+            user_prompt=(
+                f"Task type: {task.type}\n"
+                f"Task instruction: {task.instruction}\n"
+                f"Acceptance criteria: {task.acceptance_criteria}\n"
+                f"Current active instruction: {self._resolve_active_instruction_text_from_artifacts(state, task_id)}\n"
+                f"Retry context: {state['session'].task_states[task_id].retry_context_text}\n"
+                f"Tool name: {selected_tool.value}\n"
+                f"Tool args: {execution.invocation.args}\n"
+                f"Source artifacts:\n{chr(10).join(source_lines) or '(none)'}\n"
+                f"New artifacts:\n{chr(10).join(new_artifact_lines) or '(none)'}\n"
+                "Return outcome as either 'continue' or 'success'. "
+                "Choose success only if the current tool result is enough to stop the execute checkpoint and hand off to evaluator. "
+                "For each new artifact, write a concise summary explaining what it is and what role it plays in the current task."
+            ),
+            output_schema=ObserveLLMOutput,
+        )
+
+    def _apply_observe_artifact_summaries(self, artifacts, observe_result: ObserveLLMOutput) -> None:
+        summary_by_id = {
+            item.artifact_id: item.summary
+            for item in observe_result.artifact_summaries
+        }
+        for artifact in artifacts:
+            if artifact.id in summary_by_id:
+                artifact.summary = summary_by_id[artifact.id]
 
     def _build_execute_failure_replan_decision(
         self,
@@ -197,6 +280,7 @@ class ExecuteAgent:
         loop_index: int,
         selected_tool: ToolName,
         resolved_inputs: list[str],
+        base_image_ref: str,
     ):
         if selected_tool == ToolName.PROMPT_RECONSTRUCT:
             state["_prompt_reconstruct_context"] = self._build_prompt_reconstruct_context(
@@ -211,8 +295,7 @@ class ExecuteAgent:
                 ),
             )
 
-        base_image_ref = self._resolve_base_image_ref(state, task, resolved_inputs)
-        reference_refs = self._resolve_reference_refs(state, task, resolved_inputs)
+        reference_refs = self._resolve_reference_refs(state, resolved_inputs, base_image_ref)
         previous_candidate = (
             state["session"].task_states[task_id].latest_artifact_ids[-1]
             if state["session"].task_states[task_id].latest_artifact_ids
@@ -237,10 +320,16 @@ class ExecuteAgent:
         self,
         state: RuntimeState,
         task: Any,
+        task_id: str,
         resolved_inputs: list[str],
+        strategy: ExecuteLLMOutput | None,
     ) -> str:
-        if task.target_artifact_ids:
-            return task.target_artifact_ids[0]
+        retry_candidate = self._resolve_retry_base_candidate_ref(state, task_id)
+        if retry_candidate is not None:
+            return retry_candidate
+        if strategy and strategy.base_image_artifact_id and self._is_image_artifact(state, strategy.base_image_artifact_id):
+            if strategy.base_image_artifact_id in resolved_inputs:
+                return strategy.base_image_artifact_id
         for artifact_id in resolved_inputs:
             artifact = self._get_artifact(state, artifact_id)
             if artifact is not None and artifact.kind == "image":
@@ -250,25 +339,27 @@ class ExecuteAgent:
     def _resolve_reference_refs(
         self,
         state: RuntimeState,
-        task: Any,
         resolved_inputs: list[str],
+        base_image_ref: str,
     ) -> list[str]:
-        target_ids = set(task.target_artifact_ids)
-        generated_refs = [
-            artifact_id
-            for artifact_id in resolved_inputs
-            if self._is_image_artifact(state, artifact_id)
-            and artifact_id not in target_ids
-            and artifact_id not in task.input_artifact_ids
-        ]
-        if generated_refs:
-            return generated_refs
         return [
             artifact_id
             for artifact_id in resolved_inputs
             if self._is_image_artifact(state, artifact_id)
-            and artifact_id not in target_ids
+            and artifact_id != base_image_ref
         ]
+
+    def _resolve_retry_base_candidate_ref(self, state: RuntimeState, task_id: str) -> str | None:
+        decision = state.get("decision")
+        if (
+            decision is not None
+            and decision.route == DecisionRoute.CONTINUE_EXECUTE
+            and decision.task_id == task_id
+            and decision.task_retry is not None
+            and decision.task_retry.base_candidate_artifact_id in state["artifacts"]
+        ):
+            return decision.task_retry.base_candidate_artifact_id
+        return None
 
     def _get_artifact(self, state: RuntimeState, artifact_id: str):
         return state["artifacts"].get(artifact_id)
@@ -537,6 +628,7 @@ class ExecuteAgent:
         state: RuntimeState,
         task: Any,
     ) -> ExecuteLLMOutput:
+        resolved_ids = state["session"].task_states[task.id].resolved_input_artifact_ids
         return invoke_structured_llm(
             system_prompt=(
                 "You are an execution planner for an image-editing agent. "
@@ -551,18 +643,20 @@ class ExecuteAgent:
                 "especially before an edit if a stronger prompt would help; "
                 "use edit when you are ready to apply the actual image transformation. "
                 "These are options, not a fixed workflow. Do not follow a rigid path if the current state suggests otherwise. "
-                "Do not schedule multiple tools."
+                "Do not schedule multiple tools. "
+                "If there are multiple image candidates, choose the most appropriate base_image_artifact_id from the resolved input artifact ids."
             ),
             user_prompt=(
                 f"Task type: {task.type}\n"
                 f"Task instruction: {task.instruction}\n"
                 f"User instruction: {state['input']['instruction_text']}\n"
-                f"Resolved input artifact ids: {state['session'].task_states[task.id].resolved_input_artifact_ids}\n"
+                f"Resolved input artifact ids: {resolved_ids}\n"
+                f"Resolved image candidates:\n{self._build_resolved_image_summaries(state, task.id, resolved_ids)}\n"
                 f"Retry context: {state['session'].task_states[task.id].retry_context_text}\n"
                 f"Current active instruction: {self._resolve_active_instruction_text_from_artifacts(state, task.id)}\n"
                 f"Task artifact summary:\n{self._build_task_artifact_context(state, task.id)}\n"
                 f"Latest candidate refs: {state['session'].task_states[task.id].latest_artifact_ids}\n"
-                "Return reasoning and selected_tools. selected_tools should contain exactly one next tool name."
+                "Return reasoning, selected_tools, and base_image_artifact_id. selected_tools should contain exactly one next tool name."
             ),
             output_schema=ExecuteLLMOutput,
         )
@@ -577,29 +671,67 @@ class ExecuteAgent:
                 role = artifact.payload.get("role", "image")
                 if role == "collage_reference":
                     block_ids = artifact.payload.get("block_artifact_ids", [])
-                    lines.append(f"[{artifact_id}] image role={role} blocks={block_ids}")
+                    lines.append(f"[{artifact_id}] image role={role} summary={artifact.summary or ''} blocks={block_ids}")
                 else:
-                    lines.append(f"[{artifact_id}] image role={role}")
+                    lines.append(f"[{artifact_id}] image role={role} summary={artifact.summary or ''}")
             elif artifact.kind == "geometry":
                 target = artifact.payload.get("target_description")
                 candidates = artifact.payload.get("candidates", [])
-                lines.append(f"[{artifact_id}] geometry target={target} candidates={candidates}")
+                lines.append(f"[{artifact_id}] geometry summary={artifact.summary or ''} target={target} candidates={candidates}")
             elif artifact.kind == "mask":
                 score = artifact.payload.get("mask_score")
                 target = artifact.payload.get("target")
-                lines.append(f"[{artifact_id}] mask target={target} score={score}")
+                lines.append(f"[{artifact_id}] mask summary={artifact.summary or ''} target={target} score={score}")
             elif artifact.kind == "understanding":
                 summary = artifact.payload.get("summary", "")
                 image_ref = artifact.payload.get("image_ref", "")
                 lines.append(f"[{artifact_id}] understanding image_ref={image_ref} summary={summary}")
             elif artifact.kind == "evaluation":
                 verdict = artifact.payload.get("verdict", "")
-                summary = artifact.payload.get("summary", "")
+                summary = artifact.summary or artifact.payload.get("summary", "")
                 lines.append(f"[{artifact_id}] evaluation verdict={verdict} summary={summary}")
             elif artifact.kind == "instruction":
-                text = artifact.payload.get("instruction_text", "")
+                text = artifact.summary or artifact.payload.get("instruction_text", "")
                 lines.append(f"[{artifact_id}] instruction text={text}")
         return "\n".join(lines) or "(no task-local artifacts yet)"
+
+    def _build_resolved_image_summaries(
+        self,
+        state: RuntimeState,
+        task_id: str,
+        resolved_ids: list[str],
+    ) -> str:
+        lines: list[str] = []
+        for artifact_id in resolved_ids:
+            artifact = self._get_artifact(state, artifact_id)
+            if artifact is None or artifact.kind != "image":
+                continue
+            summary = artifact.summary or self._find_latest_understanding_summary_for_image(state, task_id, artifact_id)
+            lines.append(f"- {artifact_id}: {summary}")
+        return "\n".join(lines) or "(no image candidates)"
+
+    def _find_latest_understanding_summary_for_image(
+        self,
+        state: RuntimeState,
+        task_id: str,
+        image_ref: str,
+    ) -> str:
+        task_artifact_ids = state["session"].task_states[task_id].task_artifact_ids
+        for artifact_id in reversed(task_artifact_ids):
+            artifact = self._get_artifact(state, artifact_id)
+            if (
+                artifact is not None
+                and artifact.kind == "understanding"
+                and artifact.payload.get("image_ref") == image_ref
+            ):
+                return artifact.payload.get("summary", "")
+        for artifact in reversed(list(state["artifacts"].values())):
+            if (
+                artifact.kind == "understanding"
+                and artifact.payload.get("image_ref") == image_ref
+            ):
+                return artifact.payload.get("summary", "")
+        return "(no understanding summary)"
 
     def _collect_collage_blocks(
         self,

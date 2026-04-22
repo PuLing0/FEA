@@ -15,6 +15,7 @@ class ArtifactBase(StrictModel):
     id: str
     kind: ArtifactKind
     uri: str | None = None
+    summary: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
     source_ids: list[str] = Field(default_factory=list)
     created_by: str | None = None
