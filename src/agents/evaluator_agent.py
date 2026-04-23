@@ -18,7 +18,7 @@ from schema import (
     TaskStatus,
     ToolName,
 )
-from tools import ToolRegistry, build_default_tool_registry
+from tools.registry import ToolRegistry, build_default_tool_registry
 
 
 class EvaluatorAgent:

@@ -7,7 +7,7 @@ from typing import Any
 from llm import invoke_llm, invoke_structured_llm, load_llm_config
 from runtime.state import RuntimeState
 from schema import ArtifactKind, StrictModel, ToolName, UnderstandArgs
-from tools import build_default_tool_registry
+from tools.registry import build_default_tool_registry
 
 
 TOOL_REGISTRY = build_default_tool_registry()

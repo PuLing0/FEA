@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from langgraph.graph import END, START, StateGraph
 
-from agents import EvaluatorAgent, ExecuteAgent, PlanAgent
+from agents.evaluator_agent import EvaluatorAgent
+from agents.execute_agent import ExecuteAgent
+from agents.plan_agent import PlanAgent
 from schema import ArtifactIndex, ArtifactKind, ImageArtifact, SessionPhase, SessionState, ToolName, UnderstandArgs
 
 from .state import RuntimeState
-from tools import build_default_tool_registry
+from tools.registry import build_default_tool_registry
 from tools.utils import register_artifacts
 
 

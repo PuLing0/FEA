@@ -1,8 +1,11 @@
-"""Thin LLM wrapper: LangChain for text, PydanticAI for structured output."""
+"""Thin LLM wrapper for text and multimodal model access."""
 
 from __future__ import annotations
 
+import base64
+import mimetypes
 import os
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -75,6 +78,62 @@ def _build_messages(system_prompt: str | None, user_prompt: str) -> list[BaseMes
     return messages
 
 
+def encode_image_path_to_data_url(image_path: str) -> str:
+    """Read a local image file and return a data URL."""
+
+    path = Path(image_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Image path does not exist: {image_path}")
+
+    mime_type, _ = mimetypes.guess_type(path.name)
+    if mime_type is None or not mime_type.startswith("image/"):
+        raise ValueError(f"Unsupported image file type: {image_path}")
+
+    data = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{data}"
+
+
+def _build_multimodal_user_content(
+    user_prompt: str,
+    image_paths: list[str],
+) -> list[dict[str, Any]]:
+    content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": user_prompt,
+        }
+    ]
+    for image_path in image_paths:
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": encode_image_path_to_data_url(image_path),
+                },
+            }
+        )
+    return content
+
+
+def _build_multimodal_messages(
+    system_prompt: str | None,
+    user_prompt: str,
+    image_paths: list[str],
+) -> list[BaseMessage]:
+    messages: list[BaseMessage] = []
+    if system_prompt:
+        messages.append(SystemMessage(content=system_prompt))
+    messages.append(
+        HumanMessage(
+            content=_build_multimodal_user_content(
+                user_prompt=user_prompt,
+                image_paths=image_paths,
+            )
+        )
+    )
+    return messages
+
+
 def invoke_llm(
     *,
     user_prompt: str,
@@ -86,6 +145,32 @@ def invoke_llm(
 
     chat_model = model or make_chat_model(config)
     response = chat_model.invoke(_build_messages(system_prompt, user_prompt))
+    if not isinstance(response, AIMessage) and not hasattr(response, "content"):
+        raise TypeError("Expected AIMessage response from chat model")
+    return response
+
+
+def invoke_multimodal_llm(
+    *,
+    user_prompt: str,
+    image_paths: list[str],
+    system_prompt: str | None = None,
+    model: ChatOpenAI | None = None,
+    config: LLMConfig | None = None,
+) -> AIMessage:
+    """Send a multimodal chat request with local image paths."""
+
+    if not image_paths:
+        raise ValueError("image_paths must be non-empty for multimodal calls")
+
+    chat_model = model or make_chat_model(config)
+    response = chat_model.invoke(
+        _build_multimodal_messages(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            image_paths=image_paths,
+        )
+    )
     if not isinstance(response, AIMessage) and not hasattr(response, "content"):
         raise TypeError("Expected AIMessage response from chat model")
     return response
@@ -112,3 +197,28 @@ def invoke_structured_llm(
         output_type=output_schema,
     )
     return agent.run_sync(user_prompt).output
+
+
+def invoke_structured_multimodal_llm(
+    *,
+    user_prompt: str,
+    image_paths: list[str],
+    output_schema: type,
+    system_prompt: str | None = None,
+    model: ChatOpenAI | None = None,
+    config: LLMConfig | None = None,
+) -> Any:
+    """Send a multimodal request and parse JSON output with a Pydantic schema."""
+
+    if not image_paths:
+        raise ValueError("image_paths must be non-empty for multimodal calls")
+
+    chat_model = model or make_chat_model(config)
+    structured_model = chat_model.with_structured_output(output_schema)
+    return structured_model.invoke(
+        _build_multimodal_messages(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            image_paths=image_paths,
+        )
+    )
