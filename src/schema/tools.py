@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from .base import EditMode, StrictModel, ToolName
 
@@ -16,19 +16,64 @@ class UnderstandArgs(StrictModel):
 
 class GroundingArgs(StrictModel):
     image_ref: str
-    target_description: str
+    grounding_query: str
     top_k: int | None = Field(default=1, ge=1)
+
+
+class GroundingPoint(StrictModel):
+    x: int
+    y: int
+
+
+BBox = Annotated[list[int], Field(min_length=4, max_length=4)]
+
+
+class GroundingCandidate(StrictModel):
+    label: str
+    bbox: BBox
+    score: float | None = Field(default=None, ge=0.0, le=1.0)
+    positive_points: list[GroundingPoint] = Field(default_factory=list, max_length=3)
+    negative_points: list[GroundingPoint] = Field(default_factory=list, max_length=2)
+
+    @model_validator(mode="after")
+    def validate_bbox_semantics(self) -> "GroundingCandidate":
+        x1, y1, x2, y2 = self.bbox
+        if x1 >= x2:
+            raise ValueError("bbox x1 must be less than x2")
+        if y1 >= y2:
+            raise ValueError("bbox y1 must be less than y2")
+        return self
+
+
+class GroundingLLMOutput(StrictModel):
+    candidates: list[GroundingCandidate] = Field(min_length=1)
 
 
 class SegmentArgs(StrictModel):
     image_ref: str
     target: str
     region_hint: str | None = None
+    grounding_ref: str | None = None
+    backend_name: str | None = None
+
+    @model_validator(mode="after")
+    def validate_grounding_source(self) -> "SegmentArgs":
+        if self.grounding_ref is None:
+            raise ValueError("segment requires grounding_ref")
+        return self
 
 
 class CropArgs(StrictModel):
     image_ref: str
-    mask_ref: str
+    mask_ref: str | None = None
+    grounding_ref: str | None = None
+    padding: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_sources(self) -> "CropArgs":
+        if self.mask_ref is None and self.grounding_ref is None:
+            raise ValueError("crop requires mask_ref or grounding_ref")
+        return self
 
 
 class CollageArgs(StrictModel):

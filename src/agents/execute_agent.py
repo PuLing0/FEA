@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
-from llm import invoke_llm, invoke_structured_llm, load_llm_config
+from llm import (
+    invoke_llm,
+    invoke_structured_llm,
+    invoke_structured_multimodal_llm,
+    load_llm_config,
+)
 from runtime.input_selector import prepare_task_inputs
 from runtime.state import RuntimeState
 from schema import (
@@ -32,7 +38,7 @@ from schema import (
     ToolName,
     UnderstandArgs,
 )
-from tools import ToolRegistry, build_default_tool_registry
+from tools.registry import ToolRegistry, build_default_tool_registry
 
 
 class ExecuteAgent:
@@ -186,6 +192,7 @@ class ExecuteAgent:
                 ),
                 artifact_summaries=[],
             )
+        image_paths = self._resolve_observe_image_paths(execution.artifacts)
         source_lines = []
         for artifact in execution.artifacts:
             if artifact.source_ids:
@@ -203,6 +210,32 @@ class ExecuteAgent:
             f"- {artifact.id} | kind={artifact.kind} | payload={artifact.payload} | source_ids={artifact.source_ids}"
             for artifact in execution.artifacts
         ]
+        prompt = (
+            f"Task type: {task.type}\n"
+            f"Task instruction: {task.instruction}\n"
+            f"Acceptance criteria: {task.acceptance_criteria}\n"
+            f"Current active instruction: {self._resolve_active_instruction_text_from_artifacts(state, task_id)}\n"
+            f"Retry context: {state['session'].task_states[task_id].retry_context_text}\n"
+            f"Tool name: {selected_tool.value}\n"
+            f"Tool args: {execution.invocation.args}\n"
+            f"Source artifacts:\n{chr(10).join(source_lines) or '(none)'}\n"
+            f"New artifacts:\n{chr(10).join(new_artifact_lines) or '(none)'}\n"
+            "Return outcome as either 'continue' or 'success'. "
+            "Choose success only if the current tool result is enough to stop the execute checkpoint and hand off to evaluator. "
+            "For each new artifact, write a concise summary explaining what it is and what role it plays in the current task."
+        )
+        if image_paths:
+            return invoke_structured_multimodal_llm(
+                system_prompt=(
+                    "You are the observe step of an image-editing execute agent. "
+                    "Decide whether the current loop should continue or whether the current results are good enough to stop the execute checkpoint with success. "
+                    "Also generate one short semantic summary for each newly produced artifact. "
+                    "Return only structured output."
+                ),
+                user_prompt=prompt,
+                image_paths=image_paths,
+                output_schema=ObserveLLMOutput,
+            )
         return invoke_structured_llm(
             system_prompt=(
                 "You are the observe step of an image-editing execute agent. "
@@ -210,22 +243,24 @@ class ExecuteAgent:
                 "Also generate one short semantic summary for each newly produced artifact. "
                 "Return only structured output."
             ),
-            user_prompt=(
-                f"Task type: {task.type}\n"
-                f"Task instruction: {task.instruction}\n"
-                f"Acceptance criteria: {task.acceptance_criteria}\n"
-                f"Current active instruction: {self._resolve_active_instruction_text_from_artifacts(state, task_id)}\n"
-                f"Retry context: {state['session'].task_states[task_id].retry_context_text}\n"
-                f"Tool name: {selected_tool.value}\n"
-                f"Tool args: {execution.invocation.args}\n"
-                f"Source artifacts:\n{chr(10).join(source_lines) or '(none)'}\n"
-                f"New artifacts:\n{chr(10).join(new_artifact_lines) or '(none)'}\n"
-                "Return outcome as either 'continue' or 'success'. "
-                "Choose success only if the current tool result is enough to stop the execute checkpoint and hand off to evaluator. "
-                "For each new artifact, write a concise summary explaining what it is and what role it plays in the current task."
-            ),
+            user_prompt=prompt,
             output_schema=ObserveLLMOutput,
         )
+
+    def _resolve_observe_image_paths(self, artifacts) -> list[str]:
+        image_paths: list[str] = []
+        for artifact in artifacts:
+            if artifact.kind != "image" or not artifact.uri:
+                continue
+            if "://" in artifact.uri:
+                raise ValueError(
+                    f"Observe image artifact uri is not a local file path: {artifact.uri}"
+                )
+            path = Path(artifact.uri)
+            if not path.is_file():
+                raise FileNotFoundError(f"Image path does not exist: {artifact.uri}")
+            image_paths.append(str(path))
+        return image_paths
 
     def _apply_observe_artifact_summaries(self, artifacts, observe_result: ObserveLLMOutput) -> None:
         summary_by_id = {
@@ -305,6 +340,7 @@ class ExecuteAgent:
             "base_image_ref": previous_candidate or base_image_ref,
             "initial_base_image_ref": base_image_ref,
             "reference_refs": reference_refs,
+            "grounding_ref": self._find_latest_grounding_ref(state, task_id),
             "mask_ref": self._find_latest_mask_ref(state, task_id),
             "crop_ref": self._find_latest_crop_ref(state, task_id),
         }
@@ -473,7 +509,7 @@ class ExecuteAgent:
                 loop_index=loop_index,
                 args=GroundingArgs(
                     image_ref=runtime_ctx["base_image_ref"],
-                    target_description="primary_edit_region",
+                    grounding_query="Locate the primary edit region relevant to the current task.",
                     top_k=1,
                 ),
             )
@@ -486,13 +522,15 @@ class ExecuteAgent:
                 args=SegmentArgs(
                     image_ref=runtime_ctx["base_image_ref"],
                     target="primary_edit_region",
+                    grounding_ref=runtime_ctx["grounding_ref"],
                 ),
             )
 
         if tool_name == ToolName.CROP:
             mask_ref = runtime_ctx["mask_ref"]
-            if mask_ref is None:
-                raise ValueError("crop requires mask_ref from an earlier task-local segment result")
+            grounding_ref = runtime_ctx["grounding_ref"]
+            if mask_ref is None and grounding_ref is None:
+                raise ValueError("crop requires mask_ref or grounding_ref from earlier task-local results")
             return self._registry.get(ToolName.CROP).run(
                 state,
                 task_id=task_id,
@@ -500,6 +538,7 @@ class ExecuteAgent:
                 args=CropArgs(
                     image_ref=runtime_ctx["initial_base_image_ref"],
                     mask_ref=mask_ref,
+                    grounding_ref=grounding_ref,
                 ),
             )
 
@@ -573,6 +612,13 @@ class ExecuteAgent:
         for artifact_id in reversed(state["session"].task_states[task_id].task_artifact_ids):
             artifact = self._get_artifact(state, artifact_id)
             if artifact is not None and artifact.kind == "mask":
+                return artifact_id
+        return None
+
+    def _find_latest_grounding_ref(self, state: RuntimeState, task_id: str) -> str | None:
+        for artifact_id in reversed(state["session"].task_states[task_id].task_artifact_ids):
+            artifact = self._get_artifact(state, artifact_id)
+            if artifact is not None and artifact.kind == "geometry":
                 return artifact_id
         return None
 
@@ -675,7 +721,7 @@ class ExecuteAgent:
                 else:
                     lines.append(f"[{artifact_id}] image role={role} summary={artifact.summary or ''}")
             elif artifact.kind == "geometry":
-                target = artifact.payload.get("target_description")
+                target = artifact.payload.get("grounding_query")
                 candidates = artifact.payload.get("candidates", [])
                 lines.append(f"[{artifact_id}] geometry summary={artifact.summary or ''} target={target} candidates={candidates}")
             elif artifact.kind == "mask":
