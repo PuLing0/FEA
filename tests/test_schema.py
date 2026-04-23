@@ -1,14 +1,23 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Annotated
 
+import numpy as np
 import pytest
 from pydantic import BaseModel, ValidationError
 
 from agent import agent, create_agent
 from agents import EvaluatorAgent, ExecuteAgent, PlanAgent
-from llm import invoke_llm, invoke_structured_llm, load_llm_config
-from runtime import build_runtime_graph
+from llm import (
+    encode_image_path_to_data_url,
+    invoke_llm,
+    invoke_multimodal_llm,
+    invoke_structured_llm,
+    invoke_structured_multimodal_llm,
+    load_llm_config,
+)
+from runtime.graph import build_runtime_graph
 from runtime.input_selector import (
     TaskInputSelectionOutput,
     build_candidate_image_pool,
@@ -25,12 +34,16 @@ from schema import (
     DecisionLLMOutput,
     DecisionRoute,
     EditArgs,
+    EvaluateArgs,
     EvaluationArtifact,
     ExecuteLLMOutput,
     ExecutionOutcome,
     GeometryArtifact,
     GlobalEditArgs,
     GroundingArgs,
+    GroundingCandidate,
+    GroundingLLMOutput,
+    GroundingPoint,
     ImageArtifact,
     InstructionArtifact,
     LocalEditArgs,
@@ -323,12 +336,13 @@ def test_tool_args_construct() -> None:
     )
     grounding = GroundingArgs(
         image_ref="art_img_001",
-        target_description="shirt area",
+        grounding_query="Locate the shirt area for editing.",
         top_k=2,
     )
     segment = SegmentArgs(
         image_ref="art_img_001",
         target="shirt",
+        grounding_ref="art_geometry_001",
     )
     crop = CropArgs(
         image_ref="art_img_001",
@@ -343,11 +357,75 @@ def test_tool_args_construct() -> None:
     )
 
     assert understand.image_ref == "art_img_001"
-    assert grounding.target_description == "shirt area"
+    assert grounding.grounding_query == "Locate the shirt area for editing."
     assert segment.target == "shirt"
+    assert segment.grounding_ref == "art_geometry_001"
     assert crop.mask_ref == "art_mask_001"
+    assert crop.grounding_ref is None
     assert collage.block_artifact_ids == ["art_img_001", "art_img_002"]
     assert global_edit.mode == "global_edit"
+
+
+def test_segment_args_require_grounding_ref() -> None:
+    with pytest.raises(ValidationError):
+        SegmentArgs(
+            image_ref="art_img_001",
+            target="shirt",
+        )
+
+
+def test_crop_args_accepts_grounding_only() -> None:
+    crop = CropArgs(
+        image_ref="art_img_001",
+        grounding_ref="art_geometry_001",
+        padding=6,
+    )
+
+    assert crop.grounding_ref == "art_geometry_001"
+    assert crop.padding == 6
+
+
+def test_crop_args_requires_mask_or_grounding() -> None:
+    with pytest.raises(ValidationError):
+        CropArgs(
+            image_ref="art_img_001",
+        )
+
+
+def test_grounding_candidate_rejects_invalid_bbox_semantics() -> None:
+    with pytest.raises(ValidationError):
+        GroundingCandidate(
+            label="shirt",
+            bbox=[10, 20, 10, 60],
+        )
+
+
+def test_grounding_candidate_rejects_out_of_range_score() -> None:
+    with pytest.raises(ValidationError):
+        GroundingCandidate(
+            label="shirt",
+            bbox=[10, 20, 40, 60],
+            score=1.2,
+        )
+
+
+def test_grounding_candidate_rejects_too_many_positive_points() -> None:
+    with pytest.raises(ValidationError):
+        GroundingCandidate(
+            label="shirt",
+            bbox=[10, 20, 40, 60],
+            positive_points=[
+                GroundingPoint(x=1, y=1),
+                GroundingPoint(x=2, y=2),
+                GroundingPoint(x=3, y=3),
+                GroundingPoint(x=4, y=4),
+            ],
+        )
+
+
+def test_grounding_llm_output_requires_candidates() -> None:
+    with pytest.raises(ValidationError):
+        GroundingLLMOutput(candidates=[])
 
 
 def test_tool_registry_contains_grounding_and_collage() -> None:
@@ -694,6 +772,87 @@ def test_invoke_structured_llm_uses_structured_output(mocker) -> None:
     fake_agent.run_sync.assert_called_once_with("return structured")
 
 
+def test_encode_image_path_to_data_url_reads_local_file(tmp_path) -> None:
+    image_path = tmp_path / "tiny.png"
+    image_path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR"
+        b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00"
+        b"\x90wS\xde"
+        b"\x00\x00\x00\x0cIDATx\x9cc``\x00\x00\x00\x02\x00\x01"
+        b"\x0b\xe7\x02\x9d"
+        b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+
+    data_url = encode_image_path_to_data_url(str(image_path))
+
+    assert data_url.startswith("data:image/png;base64,")
+
+
+def test_invoke_multimodal_llm_uses_langchain_model_with_image_content(mocker, tmp_path) -> None:
+    image_path = tmp_path / "tiny.png"
+    image_path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR"
+        b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00"
+        b"\x90wS\xde"
+        b"\x00\x00\x00\x0cIDATx\x9cc``\x00\x00\x00\x02\x00\x01"
+        b"\x0b\xe7\x02\x9d"
+        b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    fake_response = mocker.Mock()
+    fake_response.__class__.__name__ = "AIMessage"
+    fake_model = mocker.Mock()
+    fake_model.invoke.return_value = fake_response
+
+    result = invoke_multimodal_llm(
+        user_prompt="describe image",
+        system_prompt="system",
+        image_paths=[str(image_path)],
+        model=fake_model,
+    )
+
+    assert result is fake_response
+    fake_model.invoke.assert_called_once()
+    messages = fake_model.invoke.call_args.args[0]
+    assert messages[-1].content[0]["type"] == "text"
+    assert messages[-1].content[1]["type"] == "image_url"
+    assert messages[-1].content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_invoke_structured_multimodal_llm_uses_structured_output(mocker, tmp_path) -> None:
+    class OutputSchema(BaseModel):
+        answer: str
+
+    image_path = tmp_path / "tiny.png"
+    image_path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR"
+        b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00"
+        b"\x90wS\xde"
+        b"\x00\x00\x00\x0cIDATx\x9cc``\x00\x00\x00\x02\x00\x01"
+        b"\x0b\xe7\x02\x9d"
+        b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    parsed = OutputSchema(answer="done")
+    fake_structured_model = mocker.Mock()
+    fake_structured_model.invoke.return_value = parsed
+    fake_model = mocker.Mock()
+    fake_model.with_structured_output.return_value = fake_structured_model
+
+    result = invoke_structured_multimodal_llm(
+        user_prompt="return structured multimodal",
+        system_prompt="system",
+        image_paths=[str(image_path)],
+        output_schema=OutputSchema,
+        model=fake_model,
+    )
+
+    assert result == parsed
+    fake_model.with_structured_output.assert_called_once_with(OutputSchema)
+    fake_structured_model.invoke.assert_called_once()
+
+
 def test_plan_agent_uses_llm_when_enabled(mocker) -> None:
     state = build_runtime_graph().invoke(
         {
@@ -818,6 +977,88 @@ def test_execute_agent_uses_llm_strategy_when_enabled(mocker) -> None:
 def test_grounding_tool_returns_geometry_artifact() -> None:
     from tools.grounding_tool import GroundingTool
 
+    import tempfile
+    from unittest.mock import patch
+    from PIL import Image
+
+    with tempfile.NamedTemporaryFile(suffix=".png") as image_file:
+        Image.new("RGB", (4, 4), color=(255, 255, 255)).save(image_file.name)
+
+        state = {
+            "tasks": {
+                "task_001": Task(
+                    id="task_001",
+                    plan_id="plan_001",
+                    type="local_edit",
+                    instruction="定位人物区域",
+                )
+            },
+            "session": SessionState(
+                session_id="sess_grounding",
+                phase=SessionPhase.EXECUTING,
+                current_plan_id="plan_001",
+                current_task_id="task_001",
+                task_states={
+                    "task_001": TaskState(
+                        task_id="task_001",
+                        status=TaskStatus.RUNNING,
+                    )
+                },
+                artifact_index=ArtifactIndex(by_type={}),
+            ),
+            "artifacts": {
+                "art_img_001": ImageArtifact(
+                    id="art_img_001",
+                    uri=image_file.name,
+                    payload={"role": "input"},
+                )
+            },
+            "operations": [],
+            "task_act_records": [],
+        }
+
+        def fake_structured_multimodal(**kwargs):
+            return GroundingLLMOutput(
+                candidates=[
+                    GroundingCandidate(
+                        label="torso",
+                        bbox=[-10, -5, 8, 9],
+                        score=0.91,
+                        positive_points=[GroundingPoint(x=5, y=5)],
+                        negative_points=[GroundingPoint(x=99, y=99)],
+                    )
+                ]
+            )
+
+        with patch(
+            "tools.grounding_tool.invoke_structured_multimodal_llm",
+            side_effect=fake_structured_multimodal,
+        ):
+            execution = GroundingTool().run(
+                state,
+                task_id="task_001",
+                loop_index=1,
+                args=GroundingArgs(
+                    image_ref="art_img_001",
+                    grounding_query="Locate the person torso",
+                    top_k=2,
+                ),
+            )
+
+        artifact = execution.artifacts[0]
+        assert artifact.kind == ArtifactKind.GEOMETRY
+        assert artifact.payload["image_artifact_id"] == "art_img_001"
+        assert artifact.payload["grounding_query"] == "Locate the person torso"
+        assert len(artifact.payload["candidates"]) == 1
+        assert artifact.payload["candidates"][0]["bbox"] == [0, 0, 3, 3]
+        assert artifact.payload["candidates"][0]["positive_points"] == [{"x": 3, "y": 3}]
+        assert artifact.payload["candidates"][0]["negative_points"] == [{"x": 3, "y": 3}]
+        assert execution.invocation.result_payload["geometry_artifact_id"] == artifact.id
+
+
+def test_grounding_tool_rejects_non_local_image_uri() -> None:
+    from tools.grounding_tool import GroundingTool
+
     state = {
         "tasks": {
             "task_001": Task(
@@ -828,7 +1069,7 @@ def test_grounding_tool_returns_geometry_artifact() -> None:
             )
         },
         "session": SessionState(
-            session_id="sess_grounding",
+            session_id="sess_grounding_bad_uri",
             phase=SessionPhase.EXECUTING,
             current_plan_id="plan_001",
             current_task_id="task_001",
@@ -851,21 +1092,17 @@ def test_grounding_tool_returns_geometry_artifact() -> None:
         "task_act_records": [],
     }
 
-    execution = GroundingTool().run(
-        state,
-        task_id="task_001",
-        loop_index=1,
-        args=GroundingArgs(
-            image_ref="art_img_001",
-            target_description="person torso",
-            top_k=2,
-        ),
-    )
-
-    artifact = execution.artifacts[0]
-    assert artifact.kind == ArtifactKind.GEOMETRY
-    assert len(artifact.payload["candidates"]) == 2
-    assert execution.invocation.result_payload["geometry_artifact_id"] == artifact.id
+    with pytest.raises(ValueError, match="not a local file path"):
+        GroundingTool().run(
+            state,
+            task_id="task_001",
+            loop_index=1,
+            args=GroundingArgs(
+                image_ref="art_img_001",
+                grounding_query="Locate the person torso",
+                top_k=1,
+            ),
+        )
 
 
 def test_collage_tool_returns_image_artifact() -> None:
@@ -915,7 +1152,352 @@ def test_collage_tool_returns_image_artifact() -> None:
     assert execution.invocation.result_payload["collage_artifact_id"] == artifact.id
 
 
+def test_crop_tool_uses_mask_cutout_branch(tmp_path) -> None:
+    from PIL import Image
+    from tools.crop_tool import CropTool
+
+    image_path = tmp_path / "source.png"
+    mask_path = tmp_path / "mask.png"
+    Image.new("RGBA", (10, 10), color=(255, 0, 0, 255)).save(image_path)
+    mask = Image.new("L", (10, 10), color=0)
+    for x in range(2, 7):
+        for y in range(3, 9):
+            mask.putpixel((x, y), 255)
+    mask.save(mask_path)
+
+    state = {
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="local_edit",
+                instruction="裁剪前景",
+            )
+        },
+        "session": SessionState(
+            session_id="sess_crop_mask",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={"task_001": TaskState(task_id="task_001", status=TaskStatus.RUNNING)},
+            artifact_index=ArtifactIndex(by_type={}),
+        ),
+        "artifacts": {
+            "art_img_001": ImageArtifact(
+                id="art_img_001",
+                uri=str(image_path),
+                payload={"role": "input"},
+            ),
+            "art_mask_001": MaskArtifact(
+                id="art_mask_001",
+                uri=str(mask_path),
+                payload={"image_ref": "art_img_001"},
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+    }
+
+    execution = CropTool().run(
+        state,
+        task_id="task_001",
+        loop_index=1,
+        args=CropArgs(
+            image_ref="art_img_001",
+            mask_ref="art_mask_001",
+            padding=1,
+        ),
+    )
+
+    artifact = execution.artifacts[0]
+    assert artifact.kind == ArtifactKind.IMAGE
+    assert artifact.payload["crop_mode"] == "mask_cutout"
+    assert artifact.payload["bbox"] == [1, 2, 8, 10]
+    assert artifact.uri.endswith(".png")
+    assert Path(artifact.uri).is_file()
+    with Image.open(artifact.uri) as cropped:
+        assert cropped.mode == "RGBA"
+
+
+def test_segment_tool_uses_grounding_and_writes_mask_file(tmp_path, mocker) -> None:
+    from PIL import Image
+    from tools.segment_tool import SegmentTool
+
+    image_path = tmp_path / "source.png"
+    Image.new("RGB", (12, 12), color=(255, 255, 255)).save(image_path)
+
+    state = {
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="local_edit",
+                instruction="分割主体",
+            )
+        },
+        "session": SessionState(
+            session_id="sess_segment",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={"task_001": TaskState(task_id="task_001", status=TaskStatus.RUNNING)},
+            artifact_index=ArtifactIndex(by_type={}),
+        ),
+        "artifacts": {
+            "art_img_001": ImageArtifact(
+                id="art_img_001",
+                uri=str(image_path),
+                payload={"role": "input"},
+            ),
+            "art_geometry_001": GeometryArtifact(
+                id="art_geometry_001",
+                payload={
+                    "image_artifact_id": "art_img_001",
+                    "grounding_query": "Locate subject",
+                    "candidates": [
+                        {
+                            "label": "subject",
+                            "bbox": [2, 2, 10, 10],
+                            "score": 0.9,
+                            "positive_points": [{"x": 4, "y": 4}],
+                            "negative_points": [{"x": 0, "y": 0}],
+                        }
+                    ],
+                },
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+    }
+
+    mocker.patch(
+        "tools.segment_tool.sam31_predict_candidates",
+        return_value=[
+            {
+                "name": "sam31_mask_0",
+                "mask": np.pad(np.ones((8, 8), dtype=bool), 2),
+                "score": 0.9,
+            }
+        ],
+    )
+    mocker.patch(
+        "tools.segment_tool.grabcut_refine_candidates",
+        return_value=[
+            {
+                "name": "grabcut_mask_0",
+                "mask": np.pad(np.ones((8, 8), dtype=bool), 2),
+                "score": 0.95,
+            }
+        ],
+    )
+
+    execution = SegmentTool().run(
+        state,
+        task_id="task_001",
+        loop_index=1,
+        args=SegmentArgs(
+            image_ref="art_img_001",
+            target="subject",
+            grounding_ref="art_geometry_001",
+        ),
+    )
+
+    artifact = execution.artifacts[0]
+    assert artifact.kind == ArtifactKind.MASK
+    assert artifact.payload["image_ref"] == "art_img_001"
+    assert artifact.payload["grounding_ref"] == "art_geometry_001"
+    assert artifact.payload["target"] == "subject"
+    assert "mask_score" in artifact.payload
+    assert Path(artifact.uri).is_file()
+    with Image.open(artifact.uri) as mask_image:
+        assert mask_image.mode == "L"
+
+
+def test_segment_tool_rejects_grounding_image_mismatch(tmp_path) -> None:
+    from PIL import Image
+    from tools.segment_tool import SegmentTool
+
+    image_path = tmp_path / "source.png"
+    Image.new("RGB", (12, 12), color=(255, 255, 255)).save(image_path)
+
+    state = {
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="local_edit",
+                instruction="分割主体",
+            )
+        },
+        "session": SessionState(
+            session_id="sess_segment_bad_grounding",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={"task_001": TaskState(task_id="task_001", status=TaskStatus.RUNNING)},
+            artifact_index=ArtifactIndex(by_type={}),
+        ),
+        "artifacts": {
+            "art_img_001": ImageArtifact(
+                id="art_img_001",
+                uri=str(image_path),
+                payload={"role": "input"},
+            ),
+            "art_geometry_001": GeometryArtifact(
+                id="art_geometry_001",
+                payload={
+                    "image_artifact_id": "art_img_other",
+                    "grounding_query": "Locate subject",
+                    "candidates": [
+                        {
+                            "label": "subject",
+                            "bbox": [2, 2, 10, 10],
+                            "score": 0.9,
+                            "positive_points": [{"x": 4, "y": 4}],
+                            "negative_points": [],
+                        }
+                    ],
+                },
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+    }
+
+    with pytest.raises(ValueError, match="does not belong"):
+        SegmentTool().run(
+            state,
+            task_id="task_001",
+            loop_index=1,
+            args=SegmentArgs(
+                image_ref="art_img_001",
+                target="subject",
+                grounding_ref="art_geometry_001",
+            ),
+        )
+
+
+def test_crop_tool_uses_grounding_preview_branch(tmp_path) -> None:
+    from PIL import Image
+    from tools.crop_tool import CropTool
+
+    image_path = tmp_path / "source.png"
+    Image.new("RGBA", (12, 12), color=(255, 255, 255, 255)).save(image_path)
+
+    state = {
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="reference_edit",
+                instruction="裁剪定位区域",
+            )
+        },
+        "session": SessionState(
+            session_id="sess_crop_grounding",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={"task_001": TaskState(task_id="task_001", status=TaskStatus.RUNNING)},
+            artifact_index=ArtifactIndex(by_type={}),
+        ),
+        "artifacts": {
+            "art_img_001": ImageArtifact(
+                id="art_img_001",
+                uri=str(image_path),
+                payload={"role": "input"},
+            ),
+            "art_geometry_001": GeometryArtifact(
+                id="art_geometry_001",
+                payload={
+                    "image_artifact_id": "art_img_001",
+                    "grounding_query": "Locate subject",
+                    "candidates": [
+                        {
+                            "label": "subject",
+                            "bbox": [2, 3, 8, 9],
+                            "score": 0.9,
+                            "positive_points": [],
+                            "negative_points": [],
+                        }
+                    ],
+                },
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+    }
+
+    execution = CropTool().run(
+        state,
+        task_id="task_001",
+        loop_index=1,
+        args=CropArgs(
+            image_ref="art_img_001",
+            grounding_ref="art_geometry_001",
+            padding=1,
+        ),
+    )
+
+    artifact = execution.artifacts[0]
+    assert artifact.kind == ArtifactKind.IMAGE
+    assert artifact.payload["crop_mode"] == "grounding_preview"
+    assert artifact.payload["bbox"] == [1, 2, 9, 10]
+    assert Path(artifact.uri).is_file()
+
+
+def test_crop_tool_rejects_mismatched_mask_source(tmp_path) -> None:
+    from PIL import Image
+    from tools.crop_tool import CropTool
+
+    image_path = tmp_path / "source.png"
+    mask_path = tmp_path / "mask.png"
+    Image.new("RGBA", (10, 10), color=(255, 255, 255, 255)).save(image_path)
+    Image.new("L", (10, 10), color=255).save(mask_path)
+
+    state = {
+        "tasks": {
+            "task_001": Task(id="task_001", plan_id="plan_001", type="local_edit", instruction="裁剪")
+        },
+        "session": SessionState(
+            session_id="sess_crop_bad_mask",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={"task_001": TaskState(task_id="task_001", status=TaskStatus.RUNNING)},
+            artifact_index=ArtifactIndex(by_type={}),
+        ),
+        "artifacts": {
+            "art_img_001": ImageArtifact(id="art_img_001", uri=str(image_path), payload={"role": "input"}),
+            "art_mask_001": MaskArtifact(id="art_mask_001", uri=str(mask_path), payload={"image_ref": "art_img_other"}),
+        },
+        "operations": [],
+        "task_act_records": [],
+    }
+
+    with pytest.raises(ValueError, match="does not belong"):
+        CropTool().run(
+            state,
+            task_id="task_001",
+            loop_index=1,
+            args=CropArgs(image_ref="art_img_001", mask_ref="art_mask_001"),
+        )
+
+
 def test_execute_agent_accepts_grounding_and_collage_strategy(mocker) -> None:
+    from PIL import Image
+    from tools.grounding_tool import GroundingTool
+
+    import tempfile
+
+    tmpdir = tempfile.TemporaryDirectory()
+    img1 = Path(tmpdir.name) / "1.png"
+    img2 = Path(tmpdir.name) / "2.png"
+    img3 = Path(tmpdir.name) / "3.png"
+    Image.new("RGBA", (8, 8), color=(255, 255, 255, 255)).save(img1)
+    Image.new("RGBA", (8, 8), color=(255, 255, 255, 255)).save(img2)
+    Image.new("RGBA", (8, 8), color=(255, 255, 255, 255)).save(img3)
+
     state = {
         "input": {
             "instruction_text": "先定位人物，再整理参考图，最后编辑",
@@ -948,19 +1530,19 @@ def test_execute_agent_accepts_grounding_and_collage_strategy(mocker) -> None:
         "artifacts": {
             "art_img_input_001": ImageArtifact(
                 id="art_img_input_001",
-                uri="store://images/1.png",
+                uri=str(img1),
                 payload={"role": "input"},
                 scope="session",
             ),
             "art_img_input_002": ImageArtifact(
                 id="art_img_input_002",
-                uri="store://images/2.png",
+                uri=str(img2),
                 payload={"role": "input"},
                 scope="session",
             ),
             "art_img_input_003": ImageArtifact(
                 id="art_img_input_003",
-                uri="store://images/3.png",
+                uri=str(img3),
                 payload={"role": "input"},
                 scope="session",
             ),
@@ -991,6 +1573,34 @@ def test_execute_agent_accepts_grounding_and_collage_strategy(mocker) -> None:
             ExecuteLLMOutput(reasoning="Now edit with the prepared references.", selected_tools=["edit"]),
         ],
     )
+    def fake_grounding_run(state, *, task_id, loop_index, args):
+        fake = mocker.Mock()
+        fake.invocation = mocker.Mock()
+        fake.invocation.tool_name = ToolName.GROUNDING
+        fake.invocation.args = args.model_dump()
+        fake.invocation.output_refs = ["art_geometry_001"]
+        fake.artifacts = [
+            GeometryArtifact(
+                id="art_geometry_001",
+                payload={
+                    "image_artifact_id": "art_img_input_001",
+                    "grounding_query": args.grounding_query,
+                    "candidates": [
+                        {
+                            "label": "subject",
+                            "bbox": [1, 1, 6, 6],
+                            "score": 0.95,
+                            "positive_points": [],
+                            "negative_points": [],
+                        }
+                    ],
+                },
+                scope="task",
+            )
+        ]
+        return fake
+
+    mocker.patch.object(GroundingTool, "run", side_effect=fake_grounding_run)
     mocker.patch.object(
         ExecuteAgent,
         "_observe_with_llm",
@@ -1002,12 +1612,108 @@ def test_execute_agent_accepts_grounding_and_collage_strategy(mocker) -> None:
     )
 
     result = ExecuteAgent().run(state)
+    tmpdir.cleanup()
 
     tool_names = [op.tool_name for op in result["operations"]]
     assert ToolName.GROUNDING in tool_names
     assert ToolName.COLLAGE in tool_names
     assert result["operations"][-1].tool_name == ToolName.EDIT
     assert invoke_structured.call_count == 3
+
+
+def test_execute_agent_crop_accepts_grounding_without_mask(mocker) -> None:
+    state = {
+        "artifacts": {},
+        "session": SessionState(
+            session_id="sess_crop_from_grounding",
+            phase=SessionPhase.EXECUTING,
+            task_states={},
+        ),
+    }
+
+    captured = {}
+
+    def fake_crop_run(state, *, task_id, loop_index, args):
+        captured["args"] = args
+        fake = mocker.Mock()
+        fake.invocation = mocker.Mock()
+        fake.invocation.tool_name = ToolName.CROP
+        fake.invocation.args = args.model_dump()
+        fake.invocation.output_refs = ["art_image_crop_001"]
+        fake.artifacts = [
+            ImageArtifact(
+                id="art_image_crop_001",
+                uri="examples/fig1.jpg",
+                payload={"role": "cropped_preview"},
+                scope="task",
+            )
+        ]
+        return fake
+
+    mocker.patch("tools.registry.CropTool.run", side_effect=fake_crop_run)
+
+    ExecuteAgent()._run_tool_step(
+        state=state,
+        task_id="task_001",
+        loop_index=1,
+        tool_name=ToolName.CROP,
+        runtime_ctx={
+            "initial_base_image_ref": "art_img_input_001",
+            "mask_ref": None,
+            "grounding_ref": "art_geometry_001",
+        },
+    )
+
+    assert captured["args"].mask_ref is None
+    assert captured["args"].grounding_ref == "art_geometry_001"
+
+
+def test_execute_agent_segment_passes_grounding_ref(mocker) -> None:
+    from tools.segment_tool import SegmentTool
+
+    state = {
+        "artifacts": {},
+        "session": SessionState(
+            session_id="sess_segment_from_grounding",
+            phase=SessionPhase.EXECUTING,
+            task_states={},
+        ),
+    }
+
+    captured = {}
+
+    def fake_segment_run(state, *, task_id, loop_index, args):
+        captured["args"] = args
+        fake = mocker.Mock()
+        fake.invocation = mocker.Mock()
+        fake.invocation.tool_name = ToolName.SEGMENT
+        fake.invocation.args = args.model_dump()
+        fake.invocation.output_refs = ["art_mask_001"]
+        fake.artifacts = [
+            MaskArtifact(
+                id="art_mask_001",
+                uri="generated/segment/task_001_001_mask.png",
+                payload={"image_ref": "art_img_input_001", "grounding_ref": "art_geometry_001", "target": "primary_edit_region", "positive_points": [], "negative_points": [], "mask_score": 0.9},
+                scope="task",
+            )
+        ]
+        return fake
+
+    mocker.patch.object(SegmentTool, "run", side_effect=fake_segment_run)
+
+    ExecuteAgent()._run_tool_step(
+        state=state,
+        task_id="task_001",
+        loop_index=1,
+        tool_name=ToolName.SEGMENT,
+        runtime_ctx={
+            "base_image_ref": "art_img_input_001",
+            "grounding_ref": "art_geometry_001",
+        },
+    )
+
+    assert captured["args"].image_ref == "art_img_input_001"
+    assert captured["args"].grounding_ref == "art_geometry_001"
 
 
 def test_edit_tool_prefers_instruction_artifact_human_text() -> None:
@@ -1543,6 +2249,217 @@ def test_execute_agent_observe_injects_artifact_summary(mocker) -> None:
     artifact = result["artifacts"]["art_image_candidate_001"]
     assert artifact.summary == "人物已放入背景的候选图，可交给 evaluator 评估。"
     assert result["task_act_records"][-1].observation_text == "This candidate is ready for evaluator checkpoint."
+
+
+def test_understand_tool_uses_multimodal_llm(mocker, tmp_path) -> None:
+    image_path = tmp_path / "input.png"
+    image_path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR"
+        b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00"
+        b"\x90wS\xde"
+        b"\x00\x00\x00\x0cIDATx\x9cc``\x00\x00\x00\x02\x00\x01"
+        b"\x0b\xe7\x02\x9d"
+        b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    state = {
+        "input": {"instruction_text": "理解图片"},
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri=str(image_path),
+                payload={"role": "input"},
+                scope="session",
+            )
+        },
+        "operations": [],
+        "session": SessionState(
+            session_id="sess_understand",
+            phase=SessionPhase.UNDERSTANDING,
+            task_states={},
+        ),
+    }
+    mocker.patch(
+        "tools.understand_tool.invoke_multimodal_llm",
+        return_value=mocker.Mock(content="图片中是一个站立的人物。"),
+    )
+
+    result = build_default_tool_registry().get(ToolName.UNDERSTAND).run(
+        state,
+        task_id="bootstrap",
+        loop_index=0,
+        args=UnderstandArgs(image_ref="art_img_input_001", question="图里有什么"),
+    )
+
+    assert result.artifacts[0].payload["summary"] == "图片中是一个站立的人物。"
+
+
+def test_evaluate_tool_uses_multimodal_llm(mocker, tmp_path) -> None:
+    image_path = tmp_path / "candidate.png"
+    image_path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR"
+        b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00"
+        b"\x90wS\xde"
+        b"\x00\x00\x00\x0cIDATx\x9cc``\x00\x00\x00\x02\x00\x01"
+        b"\x0b\xe7\x02\x9d"
+        b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    state = {
+        "artifacts": {
+            "art_image_001": ImageArtifact(
+                id="art_image_001",
+                uri=str(image_path),
+                payload={"role": "candidate_image"},
+                scope="task",
+            ),
+            "art_instruction_task_001_001": InstructionArtifact(
+                id="art_instruction_task_001_001",
+                payload={"instruction_text": "检查是否满足要求"},
+                scope="task",
+            ),
+        },
+        "operations": [],
+        "session": SessionState(
+            session_id="sess_evaluate",
+            phase=SessionPhase.EVALUATING,
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.WAITING_EVALUATION,
+                    task_artifact_ids=["art_instruction_task_001_001"],
+                )
+            },
+        ),
+    }
+    mocker.patch(
+        "tools.evaluate_tool.invoke_multimodal_llm",
+        return_value=mocker.Mock(content="候选图满足大部分要求，人物已进入背景。"),
+    )
+
+    result = build_default_tool_registry().get(ToolName.EVALUATE).run(
+        state,
+        task_id="task_001",
+        loop_index=1,
+        args=EvaluateArgs(candidate_refs=["art_image_001"], checks=["人物在背景里"]),
+    )
+
+    assert result.artifacts[0].payload["summary"] == "候选图满足大部分要求，人物已进入背景。"
+
+
+def test_execute_agent_observe_uses_multimodal_when_image_artifact_exists(mocker, tmp_path) -> None:
+    image_path = tmp_path / "candidate.png"
+    image_path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR"
+        b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00"
+        b"\x90wS\xde"
+        b"\x00\x00\x00\x0cIDATx\x9cc``\x00\x00\x00\x02\x00\x01"
+        b"\x0b\xe7\x02\x9d"
+        b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    state = {
+        "input": {"instruction_text": "把人物放到背景里", "use_llm": True},
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="reference_edit",
+                instruction="将人物主体放到背景图里",
+                acceptance_criteria=["人物位于背景中"],
+            )
+        },
+        "session": SessionState(
+            session_id="sess_observe_mm",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={"task_001": TaskState(task_id="task_001", status=TaskStatus.RUNNING)},
+        ),
+        "artifacts": {},
+    }
+    fake_execution = mocker.Mock()
+    fake_execution.invocation = mocker.Mock()
+    fake_execution.invocation.args = {"mode": "reference_edit"}
+    fake_execution.artifacts = [
+        ImageArtifact(
+            id="art_image_001",
+            uri=str(image_path),
+            payload={"role": "candidate_image"},
+            scope="task",
+        )
+    ]
+    mocker.patch(
+        "agents.execute_agent.load_llm_config",
+        return_value=mocker.Mock(api_key="k", base_url="u", model_name="m"),
+    )
+    multimodal_call = mocker.patch(
+        "agents.execute_agent.invoke_structured_multimodal_llm",
+        return_value=ObserveLLMOutput(
+            outcome="success",
+            observation="candidate looks good",
+            artifact_summaries=[],
+        ),
+    )
+
+    result = ExecuteAgent()._observe_with_llm(
+        state=state,
+        task=state["tasks"]["task_001"],
+        task_id="task_001",
+        selected_tool=ToolName.EDIT,
+        execution=fake_execution,
+    )
+
+    assert result.outcome == "success"
+    multimodal_call.assert_called_once()
+
+
+def test_execute_agent_observe_rejects_non_local_image_uri(mocker) -> None:
+    state = {
+        "input": {"instruction_text": "把人物放到背景里", "use_llm": True},
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="reference_edit",
+                instruction="将人物主体放到背景图里",
+                acceptance_criteria=["人物位于背景中"],
+            )
+        },
+        "session": SessionState(
+            session_id="sess_observe_bad_uri",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={"task_001": TaskState(task_id="task_001", status=TaskStatus.RUNNING)},
+        ),
+        "artifacts": {},
+    }
+    fake_execution = mocker.Mock()
+    fake_execution.invocation = mocker.Mock()
+    fake_execution.invocation.args = {"mode": "reference_edit"}
+    fake_execution.artifacts = [
+        ImageArtifact(
+            id="art_image_001",
+            uri="store://generated/task_001/candidate.png",
+            payload={"role": "candidate_image"},
+            scope="task",
+        )
+    ]
+    mocker.patch(
+        "agents.execute_agent.load_llm_config",
+        return_value=mocker.Mock(api_key="k", base_url="u", model_name="m"),
+    )
+
+    with pytest.raises(ValueError, match="not a local file path"):
+        ExecuteAgent()._observe_with_llm(
+            state=state,
+            task=state["tasks"]["task_001"],
+            task_id="task_001",
+            selected_tool=ToolName.EDIT,
+            execution=fake_execution,
+        )
 
 
 def test_execute_agent_uses_llm_selected_base_image_artifact_id(mocker) -> None:

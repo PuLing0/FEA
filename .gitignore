@@ -27,9 +27,11 @@ dist/
 
 # LangGraph local runtime state
 .langgraph_api/
+generated/
+.codex
+.codex/
 
 # OS/editor files
 .DS_Store
 .idea/
 .vscode/
-
