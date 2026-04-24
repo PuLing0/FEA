@@ -90,7 +90,7 @@ def _build_backend_settings() -> dict[str, Any]:
         "true_cfg_scale": _get_float("FIRERED_TRUE_CFG_SCALE", 1.0),
         "guidance_scale": _get_float("FIRERED_GUIDANCE_SCALE", 1.0),
         "negative_prompt": _get_setting("FIRERED_NEGATIVE_PROMPT", " ") or " ",
-        "seed": _get_int("FIRERED_SEED", 49),
+        "seed": _get_int("FIRERED_SEED", 42),
         "height": _get_optional_int("FIRERED_HEIGHT"),
         "width": _get_optional_int("FIRERED_WIDTH"),
     }
