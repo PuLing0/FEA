@@ -341,8 +341,7 @@ def test_tool_args_construct() -> None:
     )
     segment = SegmentArgs(
         image_ref="art_img_001",
-        target="shirt",
-        grounding_ref="art_geometry_001",
+        prompt="segment the shirt",
     )
     crop = CropArgs(
         image_ref="art_img_001",
@@ -358,19 +357,17 @@ def test_tool_args_construct() -> None:
 
     assert understand.image_ref == "art_img_001"
     assert grounding.grounding_query == "Locate the shirt area for editing."
-    assert segment.target == "shirt"
-    assert segment.grounding_ref == "art_geometry_001"
+    assert segment.prompt == "segment the shirt"
     assert crop.mask_ref == "art_mask_001"
     assert crop.grounding_ref is None
     assert collage.block_artifact_ids == ["art_img_001", "art_img_002"]
     assert global_edit.mode == "global_edit"
 
 
-def test_segment_args_require_grounding_ref() -> None:
+def test_segment_args_require_prompt() -> None:
     with pytest.raises(ValidationError):
         SegmentArgs(
             image_ref="art_img_001",
-            target="shirt",
         )
 
 
@@ -1222,9 +1219,11 @@ def test_crop_tool_uses_mask_cutout_branch(tmp_path) -> None:
 def test_segment_tool_uses_grounding_and_writes_mask_file(tmp_path, mocker) -> None:
     from PIL import Image
     from tools.segment_tool import SegmentTool
+    import os
 
     image_path = tmp_path / "source.png"
     Image.new("RGB", (12, 12), color=(255, 255, 255)).save(image_path)
+    mocker.patch.dict(os.environ, {"SAM3_CHECKPOINT_PATH": str(image_path)})
 
     state = {
         "tasks": {
@@ -1249,44 +1248,19 @@ def test_segment_tool_uses_grounding_and_writes_mask_file(tmp_path, mocker) -> N
                 uri=str(image_path),
                 payload={"role": "input"},
             ),
-            "art_geometry_001": GeometryArtifact(
-                id="art_geometry_001",
-                payload={
-                    "image_artifact_id": "art_img_001",
-                    "grounding_query": "Locate subject",
-                    "candidates": [
-                        {
-                            "label": "subject",
-                            "bbox": [2, 2, 10, 10],
-                            "score": 0.9,
-                            "positive_points": [{"x": 4, "y": 4}],
-                            "negative_points": [{"x": 0, "y": 0}],
-                        }
-                    ],
-                },
-            ),
         },
         "operations": [],
         "task_act_records": [],
     }
 
     mocker.patch(
-        "tools.segment_tool.sam31_predict_candidates",
+        "tools.segment_tool.sam31_predict_text_prompt_candidates",
         return_value=[
             {
-                "name": "sam31_mask_0",
+                "name": "sam31_text_0",
                 "mask": np.pad(np.ones((8, 8), dtype=bool), 2),
+                "mask_logits": np.pad(np.ones((8, 8), dtype=np.float32), 2)[None, ...],
                 "score": 0.9,
-            }
-        ],
-    )
-    mocker.patch(
-        "tools.segment_tool.grabcut_refine_candidates",
-        return_value=[
-            {
-                "name": "grabcut_mask_0",
-                "mask": np.pad(np.ones((8, 8), dtype=bool), 2),
-                "score": 0.95,
             }
         ],
     )
@@ -1297,84 +1271,19 @@ def test_segment_tool_uses_grounding_and_writes_mask_file(tmp_path, mocker) -> N
         loop_index=1,
         args=SegmentArgs(
             image_ref="art_img_001",
-            target="subject",
-            grounding_ref="art_geometry_001",
+            prompt="subject",
         ),
     )
 
     artifact = execution.artifacts[0]
     assert artifact.kind == ArtifactKind.MASK
     assert artifact.payload["image_ref"] == "art_img_001"
-    assert artifact.payload["grounding_ref"] == "art_geometry_001"
-    assert artifact.payload["target"] == "subject"
+    assert artifact.payload["prompt"] == "subject"
     assert "mask_score" in artifact.payload
     assert Path(artifact.uri).is_file()
     with Image.open(artifact.uri) as mask_image:
         assert mask_image.mode == "L"
 
-
-def test_segment_tool_rejects_grounding_image_mismatch(tmp_path) -> None:
-    from PIL import Image
-    from tools.segment_tool import SegmentTool
-
-    image_path = tmp_path / "source.png"
-    Image.new("RGB", (12, 12), color=(255, 255, 255)).save(image_path)
-
-    state = {
-        "tasks": {
-            "task_001": Task(
-                id="task_001",
-                plan_id="plan_001",
-                type="local_edit",
-                instruction="分割主体",
-            )
-        },
-        "session": SessionState(
-            session_id="sess_segment_bad_grounding",
-            phase=SessionPhase.EXECUTING,
-            current_plan_id="plan_001",
-            current_task_id="task_001",
-            task_states={"task_001": TaskState(task_id="task_001", status=TaskStatus.RUNNING)},
-            artifact_index=ArtifactIndex(by_type={}),
-        ),
-        "artifacts": {
-            "art_img_001": ImageArtifact(
-                id="art_img_001",
-                uri=str(image_path),
-                payload={"role": "input"},
-            ),
-            "art_geometry_001": GeometryArtifact(
-                id="art_geometry_001",
-                payload={
-                    "image_artifact_id": "art_img_other",
-                    "grounding_query": "Locate subject",
-                    "candidates": [
-                        {
-                            "label": "subject",
-                            "bbox": [2, 2, 10, 10],
-                            "score": 0.9,
-                            "positive_points": [{"x": 4, "y": 4}],
-                            "negative_points": [],
-                        }
-                    ],
-                },
-            ),
-        },
-        "operations": [],
-        "task_act_records": [],
-    }
-
-    with pytest.raises(ValueError, match="does not belong"):
-        SegmentTool().run(
-            state,
-            task_id="task_001",
-            loop_index=1,
-            args=SegmentArgs(
-                image_ref="art_img_001",
-                target="subject",
-                grounding_ref="art_geometry_001",
-            ),
-        )
 
 
 def test_crop_tool_uses_grounding_preview_branch(tmp_path) -> None:
@@ -1672,11 +1581,25 @@ def test_execute_agent_segment_passes_grounding_ref(mocker) -> None:
     from tools.segment_tool import SegmentTool
 
     state = {
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="local_edit",
+                instruction="segment the target object",
+            )
+        },
         "artifacts": {},
         "session": SessionState(
             session_id="sess_segment_from_grounding",
             phase=SessionPhase.EXECUTING,
-            task_states={},
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.RUNNING,
+                    task_artifact_ids=[],
+                )
+            },
         ),
     }
 
@@ -1713,7 +1636,7 @@ def test_execute_agent_segment_passes_grounding_ref(mocker) -> None:
     )
 
     assert captured["args"].image_ref == "art_img_input_001"
-    assert captured["args"].grounding_ref == "art_geometry_001"
+    assert captured["args"].prompt
 
 
 def test_edit_tool_prefers_instruction_artifact_human_text() -> None:

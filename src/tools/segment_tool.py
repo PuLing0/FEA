@@ -1,15 +1,15 @@
-"""Segmentation tool with grounding-guided mask generation."""
+"""Segmentation tool using image plus text prompt."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import os
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
-from schema import GroundingPoint
-from schema import MaskArtifact, SegmentArgs, ToolInvocationRecord, ToolName
+from schema import ArtifactKind, GroundingPoint, MaskArtifact, SegmentArgs, ToolInvocationRecord, ToolName
 from vision_backends.grabcut_refinement import (
     GrabCutRefinementError,
     RefinementSeedCandidate,
@@ -18,11 +18,11 @@ from vision_backends.grabcut_refinement import (
 from vision_backends.sam3_point_backend import (
     Sam3BackendError,
     predict_candidates as sam31_predict_candidates,
+    predict_text_prompt_candidates as sam31_predict_text_prompt_candidates,
 )
 
 from .base import ToolExecutionResult
 from .utils import next_artifact_id, next_operation_id
-from schema import ArtifactKind
 
 
 @dataclass(slots=True)
@@ -30,6 +30,9 @@ class SegmentCandidate:
     name: str
     mask: np.ndarray
     score: float
+    source_stage: str
+    mask_logits: np.ndarray | None = None
+    metrics: dict[str, float] = field(default_factory=dict)
 
 
 class SegmentTool:
@@ -52,143 +55,160 @@ class SegmentTool:
             raise FileNotFoundError(f"Image path does not exist: {artifact.uri}")
         return str(path)
 
-    def _resolve_grounding_payload(self, state, grounding_ref: str, image_ref: str) -> dict:
-        artifact = state["artifacts"].get(grounding_ref)
-        if artifact is None:
-            raise ValueError(f"Unknown grounding artifact ref: {grounding_ref}")
-        if artifact.kind != ArtifactKind.GEOMETRY:
-            raise ValueError(f"Artifact is not geometry: {grounding_ref}")
-        if artifact.payload.get("image_artifact_id") != image_ref:
-            raise ValueError("grounding artifact does not belong to the requested image")
-        candidates = artifact.payload.get("candidates", [])
-        if not candidates:
-            raise ValueError("grounding artifact has no candidates")
-        return artifact.payload
-
-    def _predict_candidates(
+    def _predict_text_only_candidates(
         self,
         *,
         image_array: np.ndarray,
-        positive_points: list[GroundingPoint],
-        negative_points: list[GroundingPoint],
-        bbox: list[int],
-        backend_name: str | None,
+        text_prompt: str,
+        source_stage: str,
     ) -> list[SegmentCandidate]:
-        resolved_backend = (backend_name or "sam31").strip().lower()
-        if resolved_backend != "sam31":
-            raise ValueError(f"Unsupported segment backend: {backend_name}")
-        return self._predict_candidates_via_sam31(
+        if not text_prompt.strip():
+            return []
+        raw_candidates = sam31_predict_text_prompt_candidates(
             image_array=image_array,
-            positive_points=positive_points,
-            negative_points=negative_points,
-            bbox=bbox,
+            text_prompt=text_prompt,
         )
-
-    def _predict_candidates_via_sam31(
-        self,
-        *,
-        image_array: np.ndarray,
-        positive_points: list[GroundingPoint],
-        negative_points: list[GroundingPoint],
-        bbox: list[int],
-    ) -> list[SegmentCandidate]:
-        left, top, right, bottom = bbox
-        height, width = image_array.shape[:2]
-        roi_positive = [
-            point
-            for point in positive_points
-            if left <= point.x < right and top <= point.y < bottom
-        ] or positive_points
-        roi_negative = [
-            point
-            for point in negative_points
-            if left <= point.x < right and top <= point.y < bottom
-        ]
-        try:
-            raw_candidates = sam31_predict_candidates(
-                image_array=image_array,
-                positive_points=roi_positive,
-                negative_points=roi_negative,
-            )
-        except Sam3BackendError:
-            raise
         return [
             SegmentCandidate(
-                name=str(item.get("name", f"sam31_{index}")),
+                name=str(item.get("name", f"{source_stage}_{index}")),
                 mask=np.asarray(item.get("mask"), dtype=bool),
+                mask_logits=(
+                    np.asarray(item["mask_logits"], dtype=np.float32)
+                    if item.get("mask_logits") is not None
+                    else None
+                ),
                 score=float(item.get("score", 0.0)),
+                source_stage=source_stage,
             )
             for index, item in enumerate(raw_candidates)
         ]
 
-    def _refine_candidates_with_grabcut(
-        self,
-        *,
-        image_array: np.ndarray,
-        candidates: list[SegmentCandidate],
-        positive_points: list[GroundingPoint],
-        negative_points: list[GroundingPoint],
-    ) -> list[SegmentCandidate]:
-        try:
-            refined_raw = grabcut_refine_candidates(
-                image_array=image_array,
-                positive_points=positive_points,
-                negative_points=negative_points,
-                seed_candidates=[
-                    RefinementSeedCandidate(
-                        name=item.name,
-                        mask=np.asarray(item.mask, dtype=bool),
-                        score=float(item.score),
-                    )
-                    for item in candidates
-                ],
-            )
-        except GrabCutRefinementError:
-            return candidates
-        if not refined_raw:
-            return candidates
-        refined: list[SegmentCandidate] = []
-        for index, item in enumerate(refined_raw):
-            refined.append(
-                SegmentCandidate(
-                    name=str(item.get("name", f"grabcut_{index}")),
-                    mask=np.asarray(item.get("mask"), dtype=bool),
-                    score=float(item.get("score", 0.0)),
-                )
-            )
-        return refined or candidates
+    def _should_try_text_only_proposal(self, *, backend_name: str | None) -> bool:
+        resolved_backend = (backend_name or "sam31").strip().lower()
+        if resolved_backend != "sam31":
+            return False
+        checkpoint_path = os.getenv("SAM3_CHECKPOINT_PATH")
+        if not checkpoint_path:
+            return False
+        return Path(checkpoint_path).is_file()
 
-    def _select_best_candidate(
+    def _bbox_from_mask(self, mask: np.ndarray) -> list[int] | None:
+        ys, xs = np.where(np.asarray(mask, dtype=bool))
+        if len(xs) == 0 or len(ys) == 0:
+            return None
+        return [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]
+
+    def _largest_component(self, mask: np.ndarray) -> np.ndarray:
+        binary = np.asarray(mask, dtype=bool)
+        if not binary.any():
+            return binary
+        height, width = binary.shape
+        visited = np.zeros_like(binary, dtype=bool)
+        best_coords: list[tuple[int, int]] = []
+
+        for y in range(height):
+            for x in range(width):
+                if not binary[y, x] or visited[y, x]:
+                    continue
+                stack = [(y, x)]
+                coords: list[tuple[int, int]] = []
+                visited[y, x] = True
+                while stack:
+                    cy, cx = stack.pop()
+                    coords.append((cy, cx))
+                    for ny, nx in (
+                        (cy - 1, cx),
+                        (cy + 1, cx),
+                        (cy, cx - 1),
+                        (cy, cx + 1),
+                    ):
+                        if 0 <= ny < height and 0 <= nx < width and binary[ny, nx] and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            stack.append((ny, nx))
+                if len(coords) > len(best_coords):
+                    best_coords = coords
+
+        result = np.zeros_like(binary, dtype=bool)
+        for y, x in best_coords:
+            result[y, x] = True
+        return result
+
+    def _postprocess_mask(
+        self,
+        *,
+        mask: np.ndarray,
+        positive_points: list[GroundingPoint],
+    ) -> np.ndarray:
+        cleaned = self._largest_component(mask)
+        if not cleaned.any():
+            return cleaned
+
+        if positive_points and not any(
+            0 <= point.y < cleaned.shape[0]
+            and 0 <= point.x < cleaned.shape[1]
+            and cleaned[point.y, point.x]
+            for point in positive_points
+        ):
+            return np.asarray(mask, dtype=bool)
+        return cleaned
+
+    def _score_text_candidate(
+        self,
+        *,
+        candidate: SegmentCandidate,
+    ) -> dict[str, float] | None:
+        mask = np.asarray(candidate.mask, dtype=bool)
+        if mask.ndim != 2 or not mask.any():
+            return None
+        mask_area = int(mask.sum())
+        mask_bbox = self._bbox_from_mask(mask)
+        if mask_bbox is None:
+            return None
+        cand_left, cand_top, cand_right, cand_bottom = mask_bbox
+        largest_component_ratio = float(self._largest_component(mask).sum()) / float(mask_area)
+        image_area = float(mask.shape[0] * mask.shape[1])
+        mask_area_ratio_to_image = float(mask_area) / image_area
+        aspect_ratio = float(cand_bottom - cand_top) / float(max(1, cand_right - cand_left))
+        if mask_area_ratio_to_image < 0.01 or mask_area_ratio_to_image > 0.75:
+            return None
+        if largest_component_ratio < 0.7:
+            return None
+        if aspect_ratio < 0.35:
+            return None
+
+        final_score = (
+            0.30 * float(candidate.score)
+            + 0.40 * largest_component_ratio
+            - 0.15 * abs(mask_area_ratio_to_image - 0.22)
+            - 0.05 * abs(aspect_ratio - 1.15)
+        )
+        return {
+            "final_score": final_score,
+            "sam_score": float(candidate.score),
+            "mask_area_ratio_to_image": mask_area_ratio_to_image,
+            "largest_component_ratio": largest_component_ratio,
+            "aspect_ratio": aspect_ratio,
+        }
+
+    def _select_best_text_candidate(
         self,
         *,
         candidates: list[SegmentCandidate],
-        positive_points: list[GroundingPoint],
-        negative_points: list[GroundingPoint],
-    ) -> SegmentCandidate:
-        valid: list[SegmentCandidate] = []
+    ) -> SegmentCandidate | None:
+        ranked: list[SegmentCandidate] = []
         for candidate in candidates:
             mask = np.asarray(candidate.mask, dtype=bool)
             if mask.ndim != 2 or not mask.any():
                 continue
-            if not all(
-                0 <= int(point.x) < mask.shape[1]
-                and 0 <= int(point.y) < mask.shape[0]
-                and mask[int(point.y), int(point.x)]
-                for point in positive_points
-            ):
+            metrics = self._score_text_candidate(candidate=candidate)
+            if metrics is None:
                 continue
-            if any(
-                0 <= int(point.x) < mask.shape[1]
-                and 0 <= int(point.y) < mask.shape[0]
-                and mask[int(point.y), int(point.x)]
-                for point in negative_points
-            ):
-                continue
-            valid.append(candidate)
-        if not valid:
-            raise ValueError("No candidate mask satisfied grounding point constraints")
-        valid.sort(key=lambda item: (-item.score, int(np.asarray(item.mask).sum())))
-        return valid[0]
+            candidate.metrics = metrics
+            ranked.append(candidate)
+        if not ranked:
+            return None
+        ranked.sort(key=lambda item: item.metrics["final_score"], reverse=True)
+        return ranked[0]
 
     def _write_mask(self, *, mask: np.ndarray, task_id: str, loop_index: int) -> str:
         output_dir = Path("generated") / "segment"
@@ -207,43 +227,36 @@ class SegmentTool:
         args: SegmentArgs,
     ) -> ToolExecutionResult:
         image_path = self._resolve_local_image_path(state, args.image_ref)
-        grounding_payload = self._resolve_grounding_payload(
-            state,
-            args.grounding_ref,
-            args.image_ref,
-        )
-        first_candidate = grounding_payload["candidates"][0]
-        bbox = list(first_candidate["bbox"])
-        positive_points = [
-            GroundingPoint.model_validate(item)
-            for item in first_candidate.get("positive_points", [])
-        ]
-        negative_points = [
-            GroundingPoint.model_validate(item)
-            for item in first_candidate.get("negative_points", [])
-        ]
-
         image_array = np.asarray(Image.open(Path(image_path)).convert("RGB"), dtype=np.uint8)
-        candidates = self._predict_candidates(
-            image_array=image_array,
-            positive_points=positive_points,
-            negative_points=negative_points,
-            bbox=bbox,
-            backend_name=args.backend_name,
+        text_prompt = str(args.prompt).strip()
+        if not text_prompt:
+            raise ValueError("segment requires a non-empty prompt")
+
+        text_only_candidates: list[SegmentCandidate] = []
+        if self._should_try_text_only_proposal(backend_name=args.backend_name):
+            try:
+                text_only_candidates = self._predict_text_only_candidates(
+                    image_array=image_array,
+                    text_prompt=text_prompt,
+                    source_stage="sam_text_only",
+                )
+            except Sam3BackendError:
+                text_only_candidates = []
+
+        final_candidate = self._select_best_text_candidate(
+            candidates=text_only_candidates,
         )
-        candidates = self._refine_candidates_with_grabcut(
-            image_array=image_array,
-            candidates=candidates,
-            positive_points=positive_points,
-            negative_points=negative_points,
+        if final_candidate is None:
+            raise ValueError(
+                "segment text-only proposal produced no acceptable candidate; geometric fallback has been disabled in this mode"
+            )
+        final_candidate.mask = self._postprocess_mask(
+            mask=final_candidate.mask,
+            positive_points=[],
         )
-        selected = self._select_best_candidate(
-            candidates=candidates,
-            positive_points=positive_points,
-            negative_points=negative_points,
-        )
+
         mask_path = self._write_mask(
-            mask=selected.mask,
+            mask=final_candidate.mask,
             task_id=task_id,
             loop_index=loop_index,
         )
@@ -253,13 +266,13 @@ class SegmentTool:
             uri=mask_path,
             payload={
                 "image_ref": args.image_ref,
-                "grounding_ref": args.grounding_ref,
-                "target": args.target,
-                "positive_points": [point.model_dump() for point in positive_points],
-                "negative_points": [point.model_dump() for point in negative_points],
-                "mask_score": selected.score,
+                "prompt": text_prompt,
+                "mask_score": final_candidate.score,
+                "selection_metrics": final_candidate.metrics,
+                "source_stage": final_candidate.source_stage,
+                "text_prompt": text_prompt,
             },
-            source_ids=[args.image_ref, args.grounding_ref],
+            source_ids=[args.image_ref],
             created_by=self.name.value,
             scope="task",
         )
@@ -273,9 +286,8 @@ class SegmentTool:
             output_refs=[artifact.id],
             result_payload={
                 "image_ref": args.image_ref,
-                "grounding_ref": args.grounding_ref,
-                "target": args.target,
-                "mask_score": selected.score,
+                "prompt": text_prompt,
+                "mask_score": final_candidate.score,
                 "mask_ref": artifact.id,
             },
             raw_output_uri=f"runs/{task_id}/{self.name.value}.json",

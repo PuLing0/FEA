@@ -521,8 +521,7 @@ class ExecuteAgent:
                 loop_index=loop_index,
                 args=SegmentArgs(
                     image_ref=runtime_ctx["base_image_ref"],
-                    target="primary_edit_region",
-                    grounding_ref=runtime_ctx["grounding_ref"],
+                    prompt=self._resolve_active_instruction_text_from_artifacts(state, task_id),
                 ),
             )
 

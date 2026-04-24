@@ -1,4 +1,4 @@
-"""Lazy SAM 3.1 point-prompt backend for segmentation."""
+"""Official SAM 3.1 backend adapter for prompt-based image segmentation."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from PIL import Image
 
 from schema import GroundingPoint
 
-from .config import PACKAGE_ROOT, settings
+from .config import settings
 
 
 class Sam3BackendError(RuntimeError):
@@ -31,29 +31,49 @@ def _maybe_configure_cuda_visible_devices() -> None:
     os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
 
 
-def _ensure_vendored_sam3_on_syspath() -> None:
-    vendored_root = PACKAGE_ROOT / "vision_backends" / "_vendor"
-    vendored_package_dir = vendored_root / "sam3"
-    vendored_model_builder = vendored_package_dir / "model_builder.py"
-    if not vendored_model_builder.exists():
+def _ensure_official_sam3_on_syspath() -> None:
+    repo_root = Path(
+        os.getenv("SAM3_REPO_ROOT", "/mnt/sda/sijuzheng/project/sam3")
+    ).resolve()
+    package_root = repo_root / "sam3"
+    init_file = package_root / "__init__.py"
+    if not init_file.exists():
         raise Sam3BackendError(
-            "Vendored SAM3 package is missing from this project. "
-            "Expected to find src/vision_backends/_vendor/sam3/model_builder.py."
+            "Official SAM3 repo is missing or invalid. "
+            f"Expected to find {init_file}."
         )
-    vendored_root_str = str(vendored_root)
-    if vendored_root_str not in sys.path:
-        sys.path.insert(0, vendored_root_str)
+    repo_root_str = str(repo_root)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
 
 
 @lru_cache(maxsize=1)
-def _load_model():
+def _load_runtime_modules():
+    try:
+        torch = importlib.import_module("torch")
+    except Exception as exc:
+        raise Sam3BackendError(
+            "SAM3 runtime requires torch to be installed."
+        ) from exc
+    return torch
+
+
+def _sam3_autocast_context(torch_module):
+    device = settings.sam3_device.strip().lower()
+    if not device.startswith("cuda") or not torch_module.cuda.is_available():
+        return nullcontext()
+    return torch_module.autocast(device_type="cuda", dtype=torch_module.bfloat16)
+
+
+@lru_cache(maxsize=1)
+def _load_image_model():
     _maybe_configure_cuda_visible_devices()
-    _ensure_vendored_sam3_on_syspath()
+    _ensure_official_sam3_on_syspath()
     try:
         model_builder = importlib.import_module("sam3.model_builder")
     except Exception as exc:
         raise Sam3BackendError(
-            "Failed to import the vendored SAM3 package. "
+            "Failed to import the official SAM3 package. "
             "Make sure the SAM3 repo dependencies are installed in the active environment."
         ) from exc
 
@@ -72,79 +92,60 @@ def _load_model():
             load_from_HF=load_from_hf,
             device=settings.sam3_device,
             eval_mode=True,
-            enable_inst_interactivity=True,
+            enable_inst_interactivity=False,
             compile=settings.sam3_compile,
         )
     except Exception as exc:
         raise Sam3BackendError(
-            "Failed to initialize the SAM3 image model. "
-            "Check checkpoint settings, device selection, and dependency installation."
+            "Failed to initialize the official SAM3 image model. "
+            "Check checkpoint settings, repo dependencies, and device visibility."
         ) from exc
 
-    if getattr(model, "inst_interactive_predictor", None) is None:
-        raise Sam3BackendError(
-            "SAM3 image model was created without inst_interactive_predictor."
-        )
     return model
 
 
 @lru_cache(maxsize=1)
-def _load_runtime_modules():
+def _load_text_processor():
+    _ensure_official_sam3_on_syspath()
     try:
-        torch = importlib.import_module("torch")
-        transforms_v2 = importlib.import_module("torchvision.transforms.v2")
+        processor_module = importlib.import_module("sam3.model.sam3_image_processor")
     except Exception as exc:
         raise Sam3BackendError(
-            "SAM3 runtime requires torch and torchvision to be installed."
+            "Failed to import the official SAM3 image processor."
         ) from exc
-    return torch, transforms_v2
+    Sam3Processor = getattr(processor_module, "Sam3Processor")
+    model = _load_image_model()
+    return Sam3Processor(model, device=settings.sam3_device)
 
 
-def _sam3_autocast_context(torch_module):
-    device = settings.sam3_device.strip().lower()
-    if not device.startswith("cuda") or not torch_module.cuda.is_available():
-        return nullcontext()
-    return torch_module.autocast(device_type="cuda", dtype=torch_module.bfloat16)
-
-
-def _build_inference_state(*, model, pil_image, torch_module, transforms_v2):
-    width, height = pil_image.size
-    image_tensor = transforms_v2.functional.to_image(pil_image).to(settings.sam3_device)
-    preprocess = transforms_v2.Compose(
-        [
-            transforms_v2.ToDtype(torch_module.uint8, scale=True),
-            transforms_v2.Resize(size=(1008, 1008)),
-            transforms_v2.ToDtype(torch_module.float32, scale=True),
-            transforms_v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ]
+def _prepare_point_arrays(
+    *,
+    positive_points: list[GroundingPoint],
+    negative_points: list[GroundingPoint],
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    all_points = [*positive_points, *negative_points]
+    if not all_points:
+        return None, None
+    point_coords = np.array(
+        [[point.x, point.y] for point in all_points],
+        dtype=np.float32,
     )
-    image_tensor = preprocess(image_tensor).unsqueeze(0)
-
-    state = {
-        "original_height": height,
-        "original_width": width,
-        "backbone_out": model.backbone.forward_image(image_tensor),
-    }
-
-    inst_predictor = model.inst_interactive_predictor
-    if inst_predictor is None:
-        return state
-
-    sam2_backbone_out = state["backbone_out"].get("sam2_backbone_out")
-    if sam2_backbone_out is None:
-        return state
-
-    backbone_fpn = sam2_backbone_out.get("backbone_fpn")
-    if backbone_fpn is None or len(backbone_fpn) < 2:
-        return state
-
-    sam2_backbone_out["backbone_fpn"][0] = (
-        inst_predictor.model.sam_mask_decoder.conv_s0(backbone_fpn[0])
+    point_labels = np.array(
+        [1] * len(positive_points) + [0] * len(negative_points),
+        dtype=np.int32,
     )
-    sam2_backbone_out["backbone_fpn"][1] = (
-        inst_predictor.model.sam_mask_decoder.conv_s1(backbone_fpn[1])
-    )
-    return state
+    return point_coords, point_labels
+
+
+def _prepare_mask_input(mask_input: np.ndarray | None) -> np.ndarray | None:
+    if mask_input is None:
+        return None
+    normalized = np.asarray(mask_input, dtype=np.float32)
+    if normalized.ndim == 2:
+        normalized = normalized[None, ...]
+    if normalized.ndim != 3:
+        raise Sam3BackendError("mask_input must be a 2D or 3D array.")
+    return normalized
 
 
 def predict_candidates(
@@ -152,58 +153,107 @@ def predict_candidates(
     image_array: np.ndarray,
     positive_points: list[GroundingPoint],
     negative_points: list[GroundingPoint],
+    bbox: list[int] | None = None,
+    mask_input: np.ndarray | None = None,
+    multimask_output: bool = True,
 ) -> list[dict[str, object]]:
-    """Run real SAM 3.1 point-prompt segmentation and return raw candidate masks."""
+    """Run official SAM 3.1 prompt-based segmentation and return raw candidate masks."""
 
-    model = _load_model()
-    torch, transforms_v2 = _load_runtime_modules()
+    model = _load_image_model()
+    torch = _load_runtime_modules()
+    point_coords, point_labels = _prepare_point_arrays(
+        positive_points=positive_points,
+        negative_points=negative_points,
+    )
+    prepared_mask_input = _prepare_mask_input(mask_input)
     pil_image = Image.fromarray(np.asarray(image_array, dtype=np.uint8))
+
     try:
-        point_coords = np.array(
-            [[point.x, point.y] for point in [*positive_points, *negative_points]],
-            dtype=np.float32,
-        )
-        point_labels = np.array(
-            [1] * len(positive_points) + [0] * len(negative_points),
-            dtype=np.int32,
-        )
         with torch.inference_mode(), _sam3_autocast_context(torch):
-            inference_state = _build_inference_state(
-                model=model,
-                pil_image=pil_image,
-                torch_module=torch,
-                transforms_v2=transforms_v2,
-            )
-            masks, iou_predictions, _ = model.predict_inst(
-                inference_state,
+            if getattr(model, "inst_interactive_predictor", None) is None:
+                raise Sam3BackendError(
+                    "Official SAM3 image model does not expose inst_interactive_predictor."
+                )
+            model.inst_interactive_predictor.set_image(pil_image)
+            masks, iou_predictions, low_res_masks = model.inst_interactive_predictor.predict(
                 point_coords=point_coords,
                 point_labels=point_labels,
-                multimask_output=True,
-                return_logits=False,
+                box=np.asarray(bbox, dtype=np.float32) if bbox is not None else None,
+                mask_input=prepared_mask_input,
+                multimask_output=multimask_output,
+                return_logits=True,
                 normalize_coords=False,
             )
     except Exception as exc:
         raise Sam3BackendError(
-            "SAM3 point-prompt prediction failed while processing the input image."
+            "Official SAM3 prediction failed while processing the input image."
         ) from exc
 
     masks = np.asarray(masks)
     iou_predictions = np.asarray(iou_predictions)
+    low_res_masks = np.asarray(low_res_masks)
     if masks.ndim == 2:
         masks = masks[None, ...]
     if iou_predictions.ndim == 0:
         iou_predictions = iou_predictions[None]
+    if low_res_masks.ndim == 2:
+        low_res_masks = low_res_masks[None, ...]
 
     candidates: list[dict[str, object]] = []
-    for index in range(min(len(masks), len(iou_predictions))):
+    for index in range(min(len(masks), len(iou_predictions), len(low_res_masks))):
         candidates.append(
             {
                 "name": f"sam31_mask_{index}",
                 "mask": np.asarray(masks[index] > 0, dtype=bool),
+                "mask_logits": np.asarray(low_res_masks[index], dtype=np.float32),
                 "score": float(iou_predictions[index]),
             }
         )
     return candidates
 
 
-__all__ = ["Sam3BackendError", "predict_candidates"]
+def predict_text_prompt_candidates(
+    *,
+    image_array: np.ndarray,
+    text_prompt: str,
+) -> list[dict[str, object]]:
+    """Run official SAM 3.1 text-only image segmentation and return raw candidates."""
+
+    if not text_prompt.strip():
+        raise Sam3BackendError("text_prompt must be non-empty for text-based segmentation.")
+
+    processor = _load_text_processor()
+    torch = _load_runtime_modules()
+    pil_image = Image.fromarray(np.asarray(image_array, dtype=np.uint8))
+    try:
+        with torch.inference_mode(), _sam3_autocast_context(torch):
+            state = processor.set_image(pil_image)
+            state = processor.set_text_prompt(prompt=text_prompt, state=state)
+    except Exception as exc:
+        raise Sam3BackendError(
+            "Official SAM3 text-prompt prediction failed while processing the input image."
+        ) from exc
+
+    masks = state["masks"].detach().float().cpu().numpy()
+    scores = state["scores"].detach().float().cpu().numpy()
+    boxes = state["boxes"].detach().float().cpu().numpy()
+    if masks.ndim == 3:
+        masks = masks[:, None, ...]
+
+    candidates: list[dict[str, object]] = []
+    for index in range(min(len(masks), len(scores), len(boxes))):
+        mask = np.asarray(masks[index, 0], dtype=bool)
+        box = boxes[index].tolist()
+        candidates.append(
+            {
+                "name": f"sam31_text_{index}",
+                "mask": mask,
+                "mask_logits": mask.astype(np.float32)[None, ...],
+                "score": float(scores[index]),
+                "bbox": [int(box[0]), int(box[1]), int(box[2]), int(box[3])],
+            }
+        )
+    return candidates
+
+
+__all__ = ["Sam3BackendError", "predict_candidates", "predict_text_prompt_candidates"]

@@ -35,6 +35,7 @@ def refine_candidates(
     positive_points: list[GroundingPoint],
     negative_points: list[GroundingPoint],
     seed_candidates: list[RefinementSeedCandidate],
+    bbox_hint: list[int] | None = None,
 ) -> list[dict[str, object]]:
     if not positive_points:
         return []
@@ -54,6 +55,7 @@ def refine_candidates(
         negative_points=negative_points,
         seed_candidate=None,
         score_bonus=0.12,
+        bbox_hint=bbox_hint,
     )
     if prompt_only is not None:
         candidates.append(prompt_only)
@@ -66,6 +68,7 @@ def refine_candidates(
             negative_points=negative_points,
             seed_candidate=seed_candidate,
             score_bonus=0.08,
+            bbox_hint=bbox_hint,
         )
         if refined is not None:
             candidates.append(refined)
@@ -90,6 +93,7 @@ def _run_single_refinement(
     negative_points: list[GroundingPoint],
     seed_candidate: RefinementSeedCandidate | None,
     score_bonus: float,
+    bbox_hint: list[int] | None,
 ) -> dict[str, object] | None:
     image_height, image_width = image.shape[:2]
     prompt_roi_bbox = _build_prompt_roi_bbox(
@@ -97,6 +101,7 @@ def _run_single_refinement(
         image_height=image_height,
         positive_points=positive_points,
         negative_points=negative_points,
+        bbox_hint=bbox_hint,
     )
     if prompt_roi_bbox is None:
         return None
@@ -108,12 +113,14 @@ def _run_single_refinement(
     usable_seed_mask = _prepare_seed_mask_for_prompt_roi(
         seed_mask=seed_mask,
         prompt_roi_bbox=prompt_roi_bbox,
+        bbox_hint=bbox_hint,
     )
     roi_bbox = _merge_prompt_and_seed_roi(
         prompt_roi_bbox=prompt_roi_bbox,
         seed_mask=usable_seed_mask,
         image_width=image_width,
         image_height=image_height,
+        bbox_hint=bbox_hint,
     )
 
     crop = image[roi_bbox.top:roi_bbox.bottom, roi_bbox.left:roi_bbox.right]
@@ -164,7 +171,24 @@ def _build_prompt_roi_bbox(
     image_height: int,
     positive_points: list[GroundingPoint],
     negative_points: list[GroundingPoint],
+    bbox_hint: list[int] | None,
 ) -> BoundingBox | None:
+    if bbox_hint is not None:
+        left, top, right, bottom = bbox_hint
+        hint_box = BoundingBox(
+            left=max(0, int(left)),
+            top=max(0, int(top)),
+            right=min(image_width, int(right)),
+            bottom=min(image_height, int(bottom)),
+        )
+        if hint_box.left < hint_box.right and hint_box.top < hint_box.bottom:
+            return _expand_box(
+                hint_box,
+                padding=12,
+                width=image_width,
+                height=image_height,
+            )
+
     boxes: list[BoundingBox] = []
     point_box = _bbox_from_points(positive_points)
     if point_box is not None:
@@ -186,6 +210,7 @@ def _prepare_seed_mask_for_prompt_roi(
     *,
     seed_mask: np.ndarray | None,
     prompt_roi_bbox: BoundingBox,
+    bbox_hint: list[int] | None,
 ) -> np.ndarray | None:
     if seed_mask is None or not seed_mask.any():
         return None
@@ -205,7 +230,9 @@ def _prepare_seed_mask_for_prompt_roi(
         (prompt_roi_bbox.right - prompt_roi_bbox.left)
         * (prompt_roi_bbox.bottom - prompt_roi_bbox.top),
     )
-    if float(clipped_seed_mask.sum()) / float(prompt_area) >= 0.75:
+    fill_ratio = float(clipped_seed_mask.sum()) / float(prompt_area)
+    max_fill_ratio = 0.48 if bbox_hint is not None else 0.75
+    if fill_ratio >= max_fill_ratio:
         return None
     return clipped_seed_mask
 
@@ -216,7 +243,10 @@ def _merge_prompt_and_seed_roi(
     seed_mask: np.ndarray | None,
     image_width: int,
     image_height: int,
+    bbox_hint: list[int] | None,
 ) -> BoundingBox:
+    if bbox_hint is not None:
+        return prompt_roi_bbox
     seed_box = _bbox_from_mask(seed_mask) if seed_mask is not None else None
     if seed_box is None:
         return prompt_roi_bbox

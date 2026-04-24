@@ -51,16 +51,8 @@ class GroundingLLMOutput(StrictModel):
 
 class SegmentArgs(StrictModel):
     image_ref: str
-    target: str
-    region_hint: str | None = None
-    grounding_ref: str | None = None
+    prompt: str
     backend_name: str | None = None
-
-    @model_validator(mode="after")
-    def validate_grounding_source(self) -> "SegmentArgs":
-        if self.grounding_ref is None:
-            raise ValueError("segment requires grounding_ref")
-        return self
 
 
 class CropArgs(StrictModel):
