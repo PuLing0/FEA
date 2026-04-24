@@ -35,6 +35,8 @@ from schema import (
     DecisionRoute,
     EditArgs,
     EvaluateArgs,
+    EvaluateLLMOutput,
+    EvaluationScores,
     EvaluationArtifact,
     ExecuteLLMOutput,
     ExecutionOutcome,
@@ -68,6 +70,302 @@ from schema import (
     UnderstandingArtifact,
 )
 from tools import build_default_tool_registry
+from tools.evaluate_tool import EvaluateTool
+
+
+REAL_TOOL_TESTS = {
+    "test_grounding_tool_returns_geometry_artifact",
+    "test_grounding_tool_rejects_non_local_image_uri",
+    "test_collage_tool_returns_image_artifact",
+    "test_crop_tool_uses_mask_cutout_branch",
+    "test_segment_tool_uses_grounding_and_writes_mask_file",
+    "test_crop_tool_uses_grounding_preview_branch",
+    "test_crop_tool_rejects_mismatched_mask_source",
+    "test_understand_tool_uses_multimodal_llm",
+    "test_evaluate_tool_uses_multimodal_llm",
+    "test_edit_tool_generates_local_candidate_image_with_unified_args",
+}
+
+
+def _evaluation_scores(score: int = 4, **overrides: int) -> EvaluationScores:
+    values = {
+        "instruction_success": score,
+        "reference_consistency": score,
+        "overediting": score,
+        "naturalness": score,
+        "artifacts": score,
+    }
+    values.update(overrides)
+    return EvaluationScores(**values)
+
+
+def test_evaluate_tool_derive_verdict_passes_only_satisfied_high_scores() -> None:
+    scores = _evaluation_scores(4)
+    calculated_scores = EvaluateTool._calculate_scores(scores)
+
+    verdict = EvaluateTool._derive_verdict(
+        is_satisfied=True,
+        scores=scores,
+        calculated_scores=calculated_scores,
+        evaluator_checkpoint_count=1,
+    )
+
+    assert verdict == "pass"
+
+
+def test_evaluate_tool_derive_verdict_unsatisfied_low_risk_needs_revision() -> None:
+    scores = _evaluation_scores(3)
+    calculated_scores = EvaluateTool._calculate_scores(scores)
+
+    verdict = EvaluateTool._derive_verdict(
+        is_satisfied=False,
+        scores=scores,
+        calculated_scores=calculated_scores,
+        evaluator_checkpoint_count=1,
+    )
+
+    assert verdict == "needs_revision"
+
+
+def test_evaluate_tool_derive_verdict_severe_subscore_replans() -> None:
+    scores = _evaluation_scores(4, artifacts=1)
+    calculated_scores = EvaluateTool._calculate_scores(scores)
+
+    verdict = EvaluateTool._derive_verdict(
+        is_satisfied=False,
+        scores=scores,
+        calculated_scores=calculated_scores,
+        evaluator_checkpoint_count=1,
+    )
+
+    assert verdict == "replan"
+
+
+def test_evaluate_tool_derive_verdict_max_revision_count_replans_when_not_passed() -> None:
+    scores = _evaluation_scores(3)
+    calculated_scores = EvaluateTool._calculate_scores(scores)
+
+    verdict = EvaluateTool._derive_verdict(
+        is_satisfied=False,
+        scores=scores,
+        calculated_scores=calculated_scores,
+        evaluator_checkpoint_count=3,
+    )
+
+    assert verdict == "replan"
+
+
+@pytest.fixture(autouse=True)
+def fake_model_tools_for_schema_tests(mocker, request):
+    """Keep schema/runtime regression tests from loading real model backends."""
+
+    if request.node.name in REAL_TOOL_TESTS:
+        return
+
+    from tools.edit_tool import EditTool
+    from tools.evaluate_tool import EvaluateTool
+    from tools.crop_tool import CropTool
+    from tools.segment_tool import SegmentTool
+    from tools.understand_tool import UnderstandTool
+
+    def fake_edit_run(self, state, *, task_id, loop_index, args):
+        invocation_args = args.model_dump()
+        if len(args.image_refs) > 1:
+            invocation_args["reference_refs"] = list(args.image_refs[1:])
+        artifact = ImageArtifact(
+            id=f"art_image_fake_edit_{len(state.get('artifacts', {})) + 1:03d}",
+            uri=f"store://generated/{task_id}/fake_edit_{loop_index:03d}.png",
+            payload={
+                "role": "candidate_image",
+                "source": "fake_edit_output",
+                "task_instruction": state["tasks"][task_id].instruction,
+            },
+            source_ids=list(args.image_refs),
+            created_by=ToolName.EDIT.value,
+            scope="task",
+        )
+        return type(
+            "FakeToolExecutionResult",
+            (),
+            {
+                "invocation": ToolInvocationRecord(
+                    id=f"op_fake_edit_{loop_index:03d}",
+                    task_id=task_id,
+                    loop_index=loop_index,
+                    tool_name=ToolName.EDIT,
+                    args=invocation_args,
+                    status="succeeded",
+                    output_refs=[artifact.id],
+                    result_payload={
+                        "instruction": args.instruction,
+                        "image_refs": list(args.image_refs),
+                        "reference_refs": list(args.image_refs[1:]),
+                        "output_image_ref": artifact.id,
+                    },
+                ),
+                "artifacts": [artifact],
+            },
+        )()
+
+    def fake_crop_run(self, state, *, task_id, loop_index, args):
+        artifact = ImageArtifact(
+            id=f"art_crop_fake_{loop_index:03d}",
+            uri=f"store://generated/{task_id}/fake_crop_{loop_index:03d}.png",
+            payload={
+                "role": "cropped_preview",
+                "image_ref": args.image_ref,
+                "mask_ref": args.mask_ref,
+                "grounding_ref": args.grounding_ref,
+                "source": "fake_crop_output",
+            },
+            source_ids=[
+                args.image_ref,
+                *([args.mask_ref] if args.mask_ref else []),
+                *([args.grounding_ref] if args.grounding_ref else []),
+            ],
+            created_by=ToolName.CROP.value,
+            scope="task",
+        )
+        return type(
+            "FakeToolExecutionResult",
+            (),
+            {
+                "invocation": ToolInvocationRecord(
+                    id=f"op_fake_crop_{loop_index:03d}",
+                    task_id=task_id,
+                    loop_index=loop_index,
+                    tool_name=ToolName.CROP,
+                    args=args.model_dump(),
+                    status="succeeded",
+                    output_refs=[artifact.id],
+                ),
+                "artifacts": [artifact],
+            },
+        )()
+
+    def fake_segment_run(self, state, *, task_id, loop_index, args):
+        artifact = MaskArtifact(
+            id=f"art_mask_fake_{loop_index:03d}",
+            uri=f"store://generated/{task_id}/fake_mask_{loop_index:03d}.png",
+            payload={
+                "image_ref": args.image_ref,
+                "image_artifact_id": args.image_ref,
+                "prompt": args.prompt,
+                "source": "fake_segment_output",
+            },
+            source_ids=[args.image_ref],
+            created_by=ToolName.SEGMENT.value,
+            scope="task",
+        )
+        return type(
+            "FakeToolExecutionResult",
+            (),
+            {
+                "invocation": ToolInvocationRecord(
+                    id=f"op_fake_segment_{loop_index:03d}",
+                    task_id=task_id,
+                    loop_index=loop_index,
+                    tool_name=ToolName.SEGMENT,
+                    args=args.model_dump(),
+                    status="succeeded",
+                    output_refs=[artifact.id],
+                ),
+                "artifacts": [artifact],
+            },
+        )()
+
+    def fake_understand_run(self, state, *, task_id, loop_index, args):
+        artifact = UnderstandingArtifact(
+            id=f"art_understanding_fake_{loop_index:03d}",
+            payload={
+                "image_ref": args.image_ref,
+                "task_instruction": state["tasks"][task_id].instruction if task_id != "bootstrap" else state["input"]["instruction_text"],
+                "summary": f"Fake understanding for {args.image_ref}",
+            },
+            source_ids=[args.image_ref],
+            created_by=ToolName.UNDERSTAND.value,
+            scope="session" if task_id == "bootstrap" else "task",
+        )
+        return type(
+            "FakeToolExecutionResult",
+            (),
+            {
+                "invocation": ToolInvocationRecord(
+                    id=f"op_fake_understand_{loop_index:03d}",
+                    task_id=task_id,
+                    loop_index=loop_index,
+                    tool_name=ToolName.UNDERSTAND,
+                    args=args.model_dump(),
+                    status="succeeded",
+                    output_refs=[artifact.id],
+                ),
+                "artifacts": [artifact],
+            },
+        )()
+
+    def fake_evaluate_run(self, state, *, task_id, loop_index, args):
+        desired_route = state.get("input", {}).get("desired_decision_route", "pass")
+        if desired_route == "continue_execute":
+            verdict = "replan" if state["session"].task_states[task_id].evaluator_checkpoint_count > 3 else "needs_revision"
+            is_satisfied = True
+            base_score = 3
+        elif desired_route in {"replan", "fail"}:
+            verdict = "replan"
+            is_satisfied = False
+            base_score = 2
+        else:
+            verdict = "pass"
+            is_satisfied = True
+            base_score = 4
+        artifact = EvaluationArtifact(
+            id=f"art_eval_fake_{loop_index:03d}",
+            payload={
+                "input_refs": [],
+                "candidate_ref": args.candidate_ref,
+                "candidate_refs": list(args.candidate_refs),
+                "checks": list(args.checks),
+                "is_satisfied": is_satisfied,
+                "verdict": verdict,
+                "reason": "Fake evaluation for schema test.",
+                "issues": [],
+                "scores": {
+                    "instruction_success": base_score,
+                    "reference_consistency": base_score,
+                    "overediting": base_score,
+                    "naturalness": base_score,
+                    "artifacts": base_score,
+                    "semantic_score": base_score,
+                    "quality_score": base_score,
+                    "weighted_score": base_score,
+                    "overall_score": base_score,
+                },
+            },
+            source_ids=list(args.candidate_refs),
+            created_by=ToolName.EVALUATE.value,
+            scope="task",
+        )
+        return type(
+            "FakeToolExecutionResult",
+            (),
+            {
+                "invocation": ToolInvocationRecord(
+                    id=f"op_fake_evaluate_{loop_index:03d}",
+                    task_id=task_id,
+                    loop_index=loop_index,
+                    tool_name=ToolName.EVALUATE,
+                    args=args.model_dump(),
+                    status="succeeded",
+                    output_refs=[artifact.id],
+                ),
+                "artifacts": [artifact],
+            },
+        )()
+
+    mocker.patch.object(EditTool, "run", fake_edit_run)
+    mocker.patch.object(CropTool, "run", fake_crop_run)
+    mocker.patch.object(SegmentTool, "run", fake_segment_run)
+    mocker.patch.object(UnderstandTool, "run", fake_understand_run)
+    mocker.patch.object(EvaluateTool, "run", fake_evaluate_run)
 
 
 def test_public_imports_construct_minimal_objects() -> None:
@@ -361,6 +659,24 @@ def test_tool_args_construct() -> None:
     assert crop.grounding_ref is None
     assert collage.block_artifact_ids == ["art_img_001", "art_img_002"]
     assert edit.image_refs == ["art_img_001", "art_img_002"]
+
+
+def test_collage_args_validate_inputs() -> None:
+    with pytest.raises(ValidationError):
+        CollageArgs(
+            block_artifact_ids=["art_img_001"],
+            layout_goal="identity and clothing are primary",
+        )
+    with pytest.raises(ValidationError):
+        CollageArgs(
+            block_artifact_ids=["art_img_001", "art_img_001"],
+            layout_goal="identity and clothing are primary",
+        )
+    with pytest.raises(ValidationError):
+        CollageArgs(
+            block_artifact_ids=["art_img_001", "art_img_002"],
+            layout_goal="   ",
+        )
 
 
 def test_segment_args_require_prompt() -> None:
@@ -1158,8 +1474,42 @@ def test_grounding_tool_rejects_non_local_image_uri() -> None:
         )
 
 
-def test_collage_tool_returns_image_artifact() -> None:
+def test_collage_tool_returns_image_artifact(mocker, tmp_path) -> None:
+    from PIL import Image
+    from tools.collage_tool import CollageLayoutItem, CollageLayoutResult
     from tools.collage_tool import CollageTool
+
+    image_a = tmp_path / "face.png"
+    image_b = tmp_path / "cloth.png"
+    Image.new("RGBA", (20, 30), color=(255, 0, 0, 255)).save(image_a)
+    Image.new("RGBA", (30, 20), color=(0, 255, 0, 255)).save(image_b)
+
+    mocker.patch(
+        "tools.collage_tool.invoke_structured_multimodal_llm",
+        return_value=CollageLayoutResult(
+            canvas_width=80,
+            canvas_height=40,
+            background="transparent",
+            items=[
+                CollageLayoutItem(
+                    artifact_id="art_face_001",
+                    x=0,
+                    y=0,
+                    width=20,
+                    height=30,
+                    z_index=0,
+                ),
+                CollageLayoutItem(
+                    artifact_id="art_cloth_001",
+                    x=30,
+                    y=10,
+                    width=30,
+                    height=20,
+                    z_index=1,
+                ),
+            ],
+        ),
+    )
 
     state = {
         "tasks": {
@@ -1183,7 +1533,19 @@ def test_collage_tool_returns_image_artifact() -> None:
             },
             artifact_index=ArtifactIndex(by_type={}),
         ),
-        "artifacts": {},
+        "artifacts": {
+            "art_face_001": ImageArtifact(
+                id="art_face_001",
+                uri=str(image_a),
+                summary="face reference",
+                payload={"role": "identity_reference"},
+            ),
+            "art_cloth_001": ImageArtifact(
+                id="art_cloth_001",
+                uri=str(image_b),
+                payload={"role": "clothing_reference", "description": "green garment"},
+            ),
+        },
         "operations": [],
         "task_act_records": [],
     }
@@ -1200,8 +1562,14 @@ def test_collage_tool_returns_image_artifact() -> None:
 
     artifact = execution.artifacts[0]
     assert artifact.kind == ArtifactKind.IMAGE
+    assert Path(artifact.uri).is_file()
+    with Image.open(artifact.uri) as output_image:
+        assert output_image.size == (80, 40)
     assert artifact.payload["role"] == "collage_reference"
     assert len(artifact.payload["layers"]) == 2
+    assert artifact.source_ids == ["art_face_001", "art_cloth_001"]
+    assert artifact.summary is None
+    assert "previous_collage_ref" not in artifact.payload
     assert execution.invocation.result_payload["collage_artifact_id"] == artifact.id
 
 
@@ -1451,6 +1819,7 @@ def test_crop_tool_rejects_mismatched_mask_source(tmp_path) -> None:
 
 def test_execute_agent_accepts_grounding_and_collage_strategy(mocker) -> None:
     from PIL import Image
+    from tools.collage_tool import CollageLayoutItem, CollageLayoutResult
     from tools.grounding_tool import GroundingTool
 
     import tempfile
@@ -1538,6 +1907,41 @@ def test_execute_agent_accepts_grounding_and_collage_strategy(mocker) -> None:
             ExecuteLLMOutput(reasoning="Now edit with the prepared references.", selected_tools=["edit"]),
         ],
     )
+    mocker.patch(
+        "tools.collage_tool.invoke_structured_multimodal_llm",
+        return_value=CollageLayoutResult(
+            canvas_width=32,
+            canvas_height=16,
+            background="transparent",
+            items=[
+                CollageLayoutItem(
+                    artifact_id="art_img_input_002",
+                    x=0,
+                    y=0,
+                    width=8,
+                    height=8,
+                    z_index=0,
+                ),
+                CollageLayoutItem(
+                    artifact_id="art_img_input_003",
+                    x=12,
+                    y=0,
+                    width=8,
+                    height=8,
+                    z_index=1,
+                ),
+                CollageLayoutItem(
+                    artifact_id="art_img_input_001",
+                    x=24,
+                    y=0,
+                    width=8,
+                    height=8,
+                    z_index=2,
+                ),
+            ],
+        ),
+    )
+
     def fake_grounding_run(state, *, task_id, loop_index, args):
         fake = mocker.Mock()
         fake.invocation = mocker.Mock()
@@ -1566,6 +1970,29 @@ def test_execute_agent_accepts_grounding_and_collage_strategy(mocker) -> None:
         return fake
 
     mocker.patch.object(GroundingTool, "run", side_effect=fake_grounding_run)
+
+    def fake_edit_run(state, *, task_id, loop_index, args):
+        fake = mocker.Mock()
+        fake.invocation = ToolInvocationRecord(
+            id="op_edit_001",
+            task_id=task_id,
+            loop_index=loop_index,
+            tool_name=ToolName.EDIT,
+            args=args.model_dump(),
+            status="succeeded",
+            output_refs=["art_image_edit_001"],
+        )
+        fake.artifacts = [
+            ImageArtifact(
+                id="art_image_edit_001",
+                uri=str(img1),
+                payload={"role": "candidate_image"},
+                scope="task",
+            )
+        ]
+        return fake
+
+    mocker.patch("tools.edit_tool.EditTool.run", side_effect=fake_edit_run)
     mocker.patch.object(
         ExecuteAgent,
         "_observe_with_llm",
@@ -1792,7 +2219,7 @@ def test_local_edit_flow_materializes_task_inputs_and_intermediate_task_artifact
     assert len(result["task_act_records"]) == 4
 
 
-def test_evaluator_agent_uses_llm_decision_when_enabled(mocker) -> None:
+def test_evaluator_agent_uses_structured_evaluation_verdict() -> None:
     graph = build_runtime_graph()
     state = graph.invoke(
         {
@@ -1800,7 +2227,7 @@ def test_evaluator_agent_uses_llm_decision_when_enabled(mocker) -> None:
                 "session_id": "eval_llm",
                 "image_uri": "store://images/input.png",
                 "instruction_text": "change the shirt color",
-                "desired_decision_route": "fail",
+                "desired_decision_route": "pass",
                 "use_llm": False,
             }
         }
@@ -1810,23 +2237,11 @@ def test_evaluator_agent_uses_llm_decision_when_enabled(mocker) -> None:
     state["session"].final_result_id = None
     state["session"].task_states["task_001"].latest_artifact_ids = ["art_image_candidate_001"]
     state["session"].task_states["task_001"].latest_execute_checkpoint = "passed"
-    state["input"]["use_llm"] = True
-
-    mocker.patch("agents.evaluator_agent.load_llm_config", return_value=mocker.Mock(api_key="k", base_url="u", model_name="m"))
-    mocker.patch(
-        "agents.evaluator_agent.invoke_structured_llm",
-        return_value=DecisionLLMOutput(
-            route=DecisionRoute.PASS,
-            summary="llm says pass",
-            issues=[],
-        ),
-    )
-
     result = EvaluatorAgent().run(state)
 
     assert result["decision"].route == DecisionRoute.PASS
-    assert result["session"].phase == SessionPhase.EXECUTING
-    assert result["session"].current_task_id == "task_002"
+    assert result["session"].phase == SessionPhase.DONE
+    assert result["session"].current_task_id is None
 
 
 def test_execute_agent_exhausted_budget_goes_directly_to_replan() -> None:
@@ -1880,6 +2295,69 @@ def test_execute_agent_exhausted_budget_goes_directly_to_replan() -> None:
     assert result["session"].task_states["task_001"].latest_execute_checkpoint == "failed"
     assert result["decision"].route == DecisionRoute.REPLAN
     assert result["decision"].replan is not None
+
+
+def test_execute_agent_tool_failure_goes_directly_to_replan(mocker) -> None:
+    image_path = Path("examples/fig1.jpg")
+    state = {
+        "input": {
+            "instruction_text": "保持图片内容不变",
+            "use_llm": False,
+        },
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="global_edit",
+                instruction="保持图片内容不变",
+                input_artifact_ids=["art_img_input_001"],
+            )
+        },
+        "session": SessionState(
+            session_id="sess_execute_tool_failure",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.RUNNING,
+                    resolved_input_artifact_ids=["art_img_input_001"],
+                )
+            },
+            artifact_index=ArtifactIndex(by_type={ArtifactKind.IMAGE: ["art_img_input_001"]}),
+        ),
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri=str(image_path),
+                payload={"role": "input"},
+                scope="session",
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+        "task_loops": [],
+        "max_execute_acts": 3,
+    }
+
+    mocker.patch("tools.edit_tool.EditTool.run", side_effect=RuntimeError("backend unavailable"))
+
+    result = ExecuteAgent().run(state)
+
+    task_state = result["session"].task_states["task_001"]
+    assert result["session"].phase == SessionPhase.PLANNING
+    assert result["session"].current_task_id is None
+    assert task_state.latest_execute_checkpoint == "failed"
+    assert task_state.latest_execution_outcome == ExecutionOutcome.FAILURE
+    assert result["operations"][-1].status == "failed"
+    assert result["operations"][-1].error == {
+        "type": "RuntimeError",
+        "message": "backend unavailable",
+    }
+    assert result["decision"].route == DecisionRoute.REPLAN
+    assert "execute_tool_failed" in result["decision"].issues
+    assert "backend unavailable" in result["decision"].summary
 
 
 def test_evaluator_agent_failed_candidate_can_continue_same_task() -> None:
@@ -1980,7 +2458,7 @@ def test_evaluator_agent_budget_exhausted_upgrades_to_replan() -> None:
                     latest_artifact_ids=["art_image_candidate_001"],
                     latest_execution_outcome=ExecutionOutcome.SUCCESS,
                     latest_execute_checkpoint="passed",
-                    evaluator_checkpoint_count=2,
+                    evaluator_checkpoint_count=3,
                     task_artifact_ids=["art_image_candidate_001"],
                 )
             },
@@ -2319,8 +2797,20 @@ def test_evaluate_tool_uses_multimodal_llm(mocker, tmp_path) -> None:
         ),
     }
     mocker.patch(
-        "tools.evaluate_tool.invoke_multimodal_llm",
-        return_value=mocker.Mock(content="候选图满足大部分要求，人物已进入背景。"),
+        "tools.evaluate_tool.invoke_structured_multimodal_llm",
+        return_value=EvaluateLLMOutput(
+            is_satisfied=True,
+            scores=EvaluationScores(
+                instruction_success=4,
+                reference_consistency=4,
+                overediting=4,
+                naturalness=4,
+                artifacts=4,
+            ),
+            reason="候选图满足大部分要求，人物已进入背景。",
+            issues=[],
+            new_rewritten_prompt=None,
+        ),
     )
 
     result = build_default_tool_registry().get(ToolName.EVALUATE).run(
@@ -2330,7 +2820,9 @@ def test_evaluate_tool_uses_multimodal_llm(mocker, tmp_path) -> None:
         args=EvaluateArgs(candidate_refs=["art_image_001"], checks=["人物在背景里"]),
     )
 
-    assert result.artifacts[0].payload["summary"] == "候选图满足大部分要求，人物已进入背景。"
+    assert result.artifacts[0].payload["reason"] == "候选图满足大部分要求，人物已进入背景。"
+    assert result.artifacts[0].payload["verdict"] == "pass"
+    assert result.artifacts[0].payload["scores"]["weighted_score"] == 4
 
 
 def test_execute_agent_observe_uses_multimodal_when_image_artifact_exists(mocker, tmp_path) -> None:
