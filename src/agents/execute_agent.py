@@ -33,6 +33,7 @@ from schema import (
     TaskLoop,
     TaskStatus,
     ToolName,
+    ToolInvocationRecord,
     UnderstandArgs,
 )
 from tools.registry import ToolRegistry, build_default_tool_registry
@@ -84,15 +85,40 @@ class ExecuteAgent:
                 resolved_inputs=resolved_inputs,
                 strategy=strategy,
             )
-            execution = self._select_and_run_tool(
-                state=state,
-                task=task,
-                task_id=current_task_id,
-                loop_index=loop_index,
-                selected_tool=selected_tool,
-                resolved_inputs=resolved_inputs,
-                base_image_ref=base_image_ref,
-            )
+            try:
+                execution = self._select_and_run_tool(
+                    state=state,
+                    task=task,
+                    task_id=current_task_id,
+                    loop_index=loop_index,
+                    selected_tool=selected_tool,
+                    resolved_inputs=resolved_inputs,
+                    base_image_ref=base_image_ref,
+                )
+            except Exception as exc:
+                failed_invocation = self._build_failed_tool_invocation(
+                    state=state,
+                    task_id=current_task_id,
+                    loop_index=loop_index,
+                    tool_name=selected_tool,
+                    error=exc,
+                )
+                state["operations"].append(failed_invocation)
+                observation = f"Tool {selected_tool.value} failed: {exc}"
+                act_records.append((thinking, observation))
+                state["task_act_records"].append(
+                    TaskActRecord(
+                        task_id=current_task_id,
+                        loop_index=loop_index,
+                        act_index=act_index,
+                        thinking_text=thinking,
+                        tool_name=selected_tool.value,
+                        tool_args={},
+                        output_artifact_ids=[],
+                        observation_text=observation,
+                    )
+                )
+                break
 
             state["operations"].append(execution.invocation)
             for artifact in execution.artifacts:
@@ -147,6 +173,9 @@ class ExecuteAgent:
             )
             state["decision"] = decision
             session.latest_decision_id = decision.id
+            if decision.route == DecisionRoute.FAIL:
+                task_state.status = TaskStatus.FAILED
+                session.phase = SessionPhase.FAILED
 
         state["task_loops"].append(
             TaskLoop(
@@ -276,6 +305,43 @@ class ExecuteAgent:
     ) -> Decision:
         task = state["tasks"][task_id]
         task_state = state["session"].task_states[task_id]
+        failed_operation = self._find_latest_failed_operation(state, task_id)
+        failure_summary = "execute checkpoint reached the max loop budget before a successful output was produced"
+        failure_issues = [
+            "execute_loop_budget_exceeded",
+            "current_task_did_not_reach_success_state",
+        ]
+        failure_reason = (
+            "the current task kept requesting another loop until the execute budget was "
+            "exhausted"
+        )
+        if failed_operation is not None:
+            error = failed_operation.error or {}
+            error_message = error.get("message", "tool execution failed")
+            failure_count = self._count_failed_operations(state)
+            if failure_count >= state.get("max_tool_failures", 3):
+                return Decision(
+                    id=f"dec_exec_fail_{task_id}_{task_state.loop_count + 1:03d}",
+                    route=DecisionRoute.FAIL,
+                    task_id=task_id,
+                    plan_id=state["session"].current_plan_id,
+                    source_execution_outcome=ExecutionOutcome.FAILURE,
+                    candidate_artifact_ids=[],
+                    summary=f"execute tool failures exceeded retry limit: {error_message}",
+                    issues=[
+                        "execute_tool_failed",
+                        "tool_failure_retry_limit_exceeded",
+                        f"tool={failed_operation.tool_name}",
+                        f"error_type={error.get('type', 'unknown')}",
+                    ],
+                )
+            failure_summary = f"execute tool {failed_operation.tool_name} failed: {error_message}"
+            failure_issues = [
+                "execute_tool_failed",
+                f"tool={failed_operation.tool_name}",
+                f"error_type={error.get('type', 'unknown')}",
+            ]
+            failure_reason = failure_summary
         return Decision(
             id=f"dec_exec_fail_{task_id}_{task_state.loop_count + 1:03d}",
             route=DecisionRoute.REPLAN,
@@ -283,19 +349,53 @@ class ExecuteAgent:
             plan_id=state["session"].current_plan_id,
             source_execution_outcome=ExecutionOutcome.FAILURE,
             candidate_artifact_ids=[],
-            summary="execute checkpoint reached the max loop budget before a successful output was produced",
-            issues=[
-                "execute_loop_budget_exceeded",
-                "current_task_did_not_reach_success_state",
-            ],
+            summary=failure_summary,
+            issues=failure_issues,
             replan=ReplanRequest(
                 mode=self._fallback_replan_mode(task.type),
-                reason=(
-                    "the current task kept requesting another loop until the execute budget was "
-                    "exhausted"
-                ),
+                reason=failure_reason,
                 preserve_artifact_ids=list(task_state.task_artifact_ids[-6:]),
             ),
+        )
+
+    def _find_latest_failed_operation(
+        self,
+        state: RuntimeState,
+        task_id: str,
+    ) -> ToolInvocationRecord | None:
+        for operation in reversed(state.get("operations", [])):
+            if operation.task_id == task_id and operation.status == "failed":
+                return operation
+        return None
+
+    def _count_failed_operations(self, state: RuntimeState) -> int:
+        return sum(
+            1
+            for operation in state.get("operations", [])
+            if operation.status == "failed"
+        )
+
+    def _build_failed_tool_invocation(
+        self,
+        *,
+        state: RuntimeState,
+        task_id: str,
+        loop_index: int,
+        tool_name: ToolName,
+        error: Exception,
+    ) -> ToolInvocationRecord:
+        return ToolInvocationRecord(
+            id=f"op_{tool_name.value}_{len(state.get('operations', [])) + 1:03d}",
+            task_id=task_id,
+            loop_index=loop_index,
+            tool_name=tool_name,
+            args={},
+            status="failed",
+            output_refs=[],
+            error={
+                "type": type(error).__name__,
+                "message": str(error),
+            },
         )
 
     def _fallback_replan_mode(self, task_type: str) -> ReplanMode:

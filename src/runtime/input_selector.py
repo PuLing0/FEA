@@ -217,13 +217,20 @@ def select_input_artifacts(
             output_schema=TaskInputSelectionOutput,
         )
 
-    selected = list(task.input_artifact_ids)
+    selected = [
+        artifact_id
+        for artifact_id in task.input_artifact_ids
+        if artifact_id in state["artifacts"]
+        and state["artifacts"][artifact_id].kind == ArtifactKind.IMAGE
+    ]
     if task.depends_on:
         for dep_id in task.depends_on:
             dep_outputs = state["session"].task_states[dep_id].latest_artifact_ids
             for artifact_id in dep_outputs:
                 if artifact_id not in selected:
                     selected.append(artifact_id)
+    if not selected:
+        selected = list(build_candidate_image_pool(state))
     return TaskInputSelectionOutput(
         selected_artifact_ids=selected,
     )
