@@ -565,7 +565,6 @@ class ExecuteAgent:
                 args=CollageArgs(
                     block_artifact_ids=block_artifact_ids,
                     layout_goal="organize multiple references into one clear reference board for the next edit",
-                    previous_collage_ref=self._find_latest_collage_ref(state, task_id),
                 ),
             )
 
@@ -803,9 +802,6 @@ class ExecuteAgent:
         for artifact_id in state["session"].task_states[task_id].resolved_input_artifact_ids:
             if self._is_image_artifact(state, artifact_id) and artifact_id not in block_ids:
                 block_ids.append(artifact_id)
-        latest_collage = self._find_latest_collage_ref(state, task_id)
-        if latest_collage and latest_collage not in block_ids:
-            block_ids.append(latest_collage)
         return block_ids
 
     def _clear_retry_context(self, task_state) -> None:
