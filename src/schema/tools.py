@@ -6,7 +6,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field, model_validator
 
-from .base import EditMode, StrictModel, ToolName
+from .base import StrictModel, ToolName
 
 
 class UnderstandArgs(StrictModel):
@@ -78,30 +78,19 @@ class PromptReconstructArgs(StrictModel):
     input_artifact_ids: list[str] = Field(default_factory=list)
 
 
-class LocalEditArgs(StrictModel):
-    mode: Literal[EditMode.LOCAL_EDIT] = EditMode.LOCAL_EDIT
-    image_ref: str
-    mask_ref: str
-    preserve: list[str] = Field(default_factory=list)
+class EditArgs(StrictModel):
+    instruction: str = Field(min_length=1)
+    image_refs: list[str] = Field(min_length=1, max_length=3)
 
-
-class GlobalEditArgs(StrictModel):
-    mode: Literal[EditMode.GLOBAL_EDIT] = EditMode.GLOBAL_EDIT
-    image_ref: str
-    preserve: list[str] = Field(default_factory=list)
-
-
-class ReferenceEditArgs(StrictModel):
-    mode: Literal[EditMode.REFERENCE_EDIT] = EditMode.REFERENCE_EDIT
-    image_ref: str
-    reference_refs: list[str] = Field(min_length=1)
-    preserve: list[str] = Field(default_factory=list)
-
-
-EditArgs = Annotated[
-    LocalEditArgs | GlobalEditArgs | ReferenceEditArgs,
-    Field(discriminator="mode"),
-]
+    @model_validator(mode="after")
+    def validate_image_refs(self) -> "EditArgs":
+        normalized_instruction = self.instruction.strip()
+        if not normalized_instruction:
+            raise ValueError("instruction must be non-empty")
+        self.instruction = normalized_instruction
+        if len(set(self.image_refs)) != len(self.image_refs):
+            raise ValueError("image_refs must not contain duplicates")
+        return self
 
 
 class EvaluateArgs(StrictModel):

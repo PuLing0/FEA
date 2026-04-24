@@ -18,16 +18,13 @@ from schema import (
     CropArgs,
     Decision,
     DecisionRoute,
-    EditMode,
+    EditArgs,
     ExecuteLLMOutput,
     ExecutionOutcome,
-    GlobalEditArgs,
     GroundingArgs,
     InstructionArtifact,
-    LocalEditArgs,
     ObserveLLMOutput,
     PromptReconstructArgs,
-    ReferenceEditArgs,
     ReplanMode,
     ReplanRequest,
     SegmentArgs,
@@ -573,35 +570,19 @@ class ExecuteAgent:
             )
 
         if tool_name == ToolName.EDIT:
-            if runtime_ctx["mask_ref"] is not None:
-                return self._registry.get(ToolName.EDIT).run(
-                    state,
-                    task_id=task_id,
-                    loop_index=loop_index,
-                    args=LocalEditArgs(
-                        mode=EditMode.LOCAL_EDIT,
-                        image_ref=runtime_ctx["initial_base_image_ref"],
-                        mask_ref=runtime_ctx["mask_ref"],
-                    ),
-                )
-            if runtime_ctx["reference_refs"]:
-                return self._registry.get(ToolName.EDIT).run(
-                    state,
-                    task_id=task_id,
-                    loop_index=loop_index,
-                    args=ReferenceEditArgs(
-                        mode=EditMode.REFERENCE_EDIT,
-                        image_ref=runtime_ctx["base_image_ref"],
-                        reference_refs=runtime_ctx["reference_refs"],
-                    ),
-                )
             return self._registry.get(ToolName.EDIT).run(
                 state,
                 task_id=task_id,
                 loop_index=loop_index,
-                args=GlobalEditArgs(
-                    mode=EditMode.GLOBAL_EDIT,
-                    image_ref=runtime_ctx["base_image_ref"],
+                args=EditArgs(
+                    instruction=self._resolve_active_instruction_text_from_artifacts(
+                        state, task_id
+                    ),
+                    image_refs=self._build_edit_image_refs(
+                        state=state,
+                        task_id=task_id,
+                        runtime_ctx=runtime_ctx,
+                    ),
                 ),
             )
 
@@ -642,6 +623,37 @@ class ExecuteAgent:
             ):
                 return artifact_id
         return None
+
+    def _build_edit_image_refs(
+        self,
+        *,
+        state: RuntimeState,
+        task_id: str,
+        runtime_ctx: dict[str, Any],
+    ) -> list[str]:
+        image_refs: list[str] = []
+
+        def append_image_ref(artifact_id: str | None) -> None:
+            if artifact_id is None:
+                return
+            artifact = self._get_artifact(state, artifact_id)
+            if artifact is None or artifact.kind != "image":
+                return
+            if artifact_id in image_refs:
+                return
+            image_refs.append(artifact_id)
+
+        append_image_ref(runtime_ctx["base_image_ref"])
+        append_image_ref(self._find_latest_collage_ref(state, task_id))
+        append_image_ref(runtime_ctx["crop_ref"])
+        for artifact_id in runtime_ctx["reference_refs"]:
+            append_image_ref(artifact_id)
+            if len(image_refs) >= 3:
+                break
+
+        if not image_refs:
+            raise ValueError("edit requires at least one image input")
+        return image_refs[:3]
 
     def _has_understanding_for_image(
         self,

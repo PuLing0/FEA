@@ -39,14 +39,12 @@ from schema import (
     ExecuteLLMOutput,
     ExecutionOutcome,
     GeometryArtifact,
-    GlobalEditArgs,
     GroundingArgs,
     GroundingCandidate,
     GroundingLLMOutput,
     GroundingPoint,
     ImageArtifact,
     InstructionArtifact,
-    LocalEditArgs,
     MaskArtifact,
     ObserveArtifactSummary,
     ObserveLLMOutput,
@@ -351,8 +349,9 @@ def test_tool_args_construct() -> None:
         block_artifact_ids=["art_img_001", "art_img_002"],
         layout_goal="identity and clothing are primary",
     )
-    global_edit = GlobalEditArgs(
-        image_ref="art_img_001",
+    edit = EditArgs(
+        instruction="把人物放到背景中",
+        image_refs=["art_img_001", "art_img_002"],
     )
 
     assert understand.image_ref == "art_img_001"
@@ -361,7 +360,7 @@ def test_tool_args_construct() -> None:
     assert crop.mask_ref == "art_mask_001"
     assert crop.grounding_ref is None
     assert collage.block_artifact_ids == ["art_img_001", "art_img_002"]
-    assert global_edit.mode == "global_edit"
+    assert edit.image_refs == ["art_img_001", "art_img_002"]
 
 
 def test_segment_args_require_prompt() -> None:
@@ -435,23 +434,39 @@ class EditArgsHolder(BaseModel):
     value: EditArgs
 
 
-def test_edit_args_discriminated_union_accepts_valid_local() -> None:
+def test_edit_args_accepts_valid_payload() -> None:
     payload = {
         "value": {
-            "mode": "local_edit",
-            "image_ref": "art_img_001",
-            "mask_ref": "art_mask_001",
+            "instruction": "把人物放到背景里",
+            "image_refs": ["art_img_001", "art_img_002"],
         }
     }
     parsed = EditArgsHolder.model_validate(payload)
-    assert isinstance(parsed.value, LocalEditArgs)
+    assert parsed.value.instruction == "把人物放到背景里"
+    assert parsed.value.image_refs == ["art_img_001", "art_img_002"]
 
 
-def test_edit_args_discriminated_union_rejects_invalid_local() -> None:
+def test_edit_args_rejects_too_many_images() -> None:
     payload = {
         "value": {
-            "mode": "local_edit",
-            "image_ref": "art_img_001",
+            "instruction": "把人物放到背景里",
+            "image_refs": [
+                "art_img_001",
+                "art_img_002",
+                "art_img_003",
+                "art_img_004",
+            ],
+        }
+    }
+    with pytest.raises(ValidationError):
+        EditArgsHolder.model_validate(payload)
+
+
+def test_edit_args_rejects_duplicate_images() -> None:
+    payload = {
+        "value": {
+            "instruction": "把人物放到背景里",
+            "image_refs": ["art_img_001", "art_img_001"],
         }
     }
     with pytest.raises(ValidationError):
@@ -507,7 +522,7 @@ def test_tool_invocation_record_links_outputs() -> None:
         task_id="task_001",
         loop_index=1,
         tool_name=ToolName.EDIT,
-        args={"mode": "local_edit", "image_ref": "art_img_001"},
+        args={"instruction": "把人物放到背景里", "image_refs": ["art_img_001"]},
         status="succeeded",
         output_refs=["art_img_002"],
         raw_output_uri="runs/sess_001/task_001/loop_01/edit/result.json",
@@ -899,27 +914,60 @@ def test_plan_agent_uses_llm_when_enabled(mocker) -> None:
 
 
 def test_execute_agent_uses_llm_strategy_when_enabled(mocker) -> None:
-    graph = build_runtime_graph()
-    state = graph.invoke(
-        {
-            "input": {
-                "session_id": "exec_llm",
-                "image_uri": "store://images/input.png",
-                "instruction_text": "global recolor",
-                "desired_decision_route": "pass",
-                "use_llm": False,
-            }
-        }
-    )
-    state["session"].phase = SessionPhase.EXECUTING
-    state["session"].current_task_id = "task_001"
-    state["session"].task_states["task_001"].status = TaskStatus.RUNNING
-    state["session"].task_states["task_001"].latest_artifact_ids = []
-    state["session"].task_states["task_001"].loop_count = 0
-    state["session"].task_states["task_001"].resolved_input_artifact_ids = []
-    state["operations"] = state["operations"][:1]
-    state["task_act_records"] = []
-    state["input"]["use_llm"] = True
+    from PIL import Image
+
+    state = {
+        "input": {
+            "session_id": "exec_llm",
+            "instruction_text": "global recolor",
+            "desired_decision_route": "pass",
+            "use_llm": True,
+        },
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="global_edit",
+                instruction="global recolor",
+                input_artifact_ids=["art_img_input_001"],
+                acceptance_criteria=["candidate exists"],
+            )
+        },
+        "session": SessionState(
+            session_id="exec_llm",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.RUNNING,
+                )
+            },
+            artifact_index=ArtifactIndex(
+                by_type={ArtifactKind.IMAGE: ["art_img_input_001"]}
+            ),
+        ),
+        "plans": {
+            "plan_001": Plan(
+                id="plan_001",
+                instruction="global recolor",
+                task_ids=["task_001"],
+                input_artifact_ids=["art_img_input_001"],
+            )
+        },
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri="examples/fig1.jpg",
+                payload={"role": "input"},
+                scope="session",
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+        "task_loops": [],
+    }
 
     mocker.patch("agents.execute_agent.load_llm_config", return_value=mocker.Mock(api_key="k", base_url="u", model_name="m"))
     mocker.patch(
@@ -927,7 +975,6 @@ def test_execute_agent_uses_llm_strategy_when_enabled(mocker) -> None:
         return_value=ExecuteLLMOutput(
             reasoning="global edit is enough",
             selected_tools=["edit"],
-            edit_mode="global_edit",
         ),
     )
     mocker.patch.object(
@@ -953,6 +1000,15 @@ def test_execute_agent_uses_llm_strategy_when_enabled(mocker) -> None:
         "runtime.input_selector.invoke_llm",
         return_value=mocker.Mock(content="Need one base image and no dependency result."),
     )
+    mocker.patch("runtime.input_selector.ensure_understanding_for_images")
+    mocker.patch(
+        "tools.edit_tool.edit_images",
+        return_value=Image.new("RGB", (16, 16), color=(0, 128, 255)),
+    )
+    mocker.patch(
+        "tools.edit_tool.backend_config_snapshot",
+        return_value={"model_path": "mock-firered"},
+    )
 
     result = ExecuteAgent().run(state)
 
@@ -964,10 +1020,10 @@ def test_execute_agent_uses_llm_strategy_when_enabled(mocker) -> None:
     latest_refs = result["session"].task_states["task_001"].latest_artifact_ids
     assert len(latest_refs) == 1
     assert latest_refs[0].startswith("art_image_")
-    assert any(
-        result["artifacts"][artifact_id].kind == ArtifactKind.INSTRUCTION
-        for artifact_id in result["session"].task_states["task_001"].task_artifact_ids
-    )
+    assert result["operations"][-1].args == {
+        "instruction": "global recolor",
+        "image_refs": ["art_img_input_001"],
+    }
     assert result["task_act_records"]
 
 
@@ -1685,10 +1741,13 @@ def test_edit_tool_prefers_instruction_artifact_human_text() -> None:
         state,
         task_id="task_001",
         loop_index=1,
-        args=GlobalEditArgs(image_ref="art_img_001"),
+        args=EditArgs(
+            instruction="将人物放到背景里",
+            image_refs=["art_img_001"],
+        ),
     )
 
-    assert "Relevant artifacts: art_img_input_004" in execution.artifacts[0].payload["task_instruction"]
+    assert execution.invocation.args["instruction"] == "将人物放到背景里"
 
 
 def test_local_edit_flow_materializes_task_inputs_and_intermediate_task_artifacts() -> None:
@@ -2140,7 +2199,10 @@ def test_execute_agent_observe_injects_artifact_summary(mocker) -> None:
     fake_execution = mocker.Mock()
     fake_execution.invocation = mocker.Mock()
     fake_execution.invocation.tool_name = ToolName.EDIT
-    fake_execution.invocation.args = {"mode": "reference_edit"}
+    fake_execution.invocation.args = {
+        "instruction": "把人物放到背景里",
+        "image_refs": ["art_img_input_001", "art_img_input_002"],
+    }
     fake_execution.invocation.output_refs = ["art_image_candidate_001"]
     fake_execution.artifacts = [
         ImageArtifact(
@@ -2304,7 +2366,10 @@ def test_execute_agent_observe_uses_multimodal_when_image_artifact_exists(mocker
     }
     fake_execution = mocker.Mock()
     fake_execution.invocation = mocker.Mock()
-    fake_execution.invocation.args = {"mode": "reference_edit"}
+    fake_execution.invocation.args = {
+        "instruction": "将人物主体放到背景图里",
+        "image_refs": ["art_img_input_001", "art_img_input_002"],
+    }
     fake_execution.artifacts = [
         ImageArtifact(
             id="art_image_001",
@@ -2361,7 +2426,10 @@ def test_execute_agent_observe_rejects_non_local_image_uri(mocker) -> None:
     }
     fake_execution = mocker.Mock()
     fake_execution.invocation = mocker.Mock()
-    fake_execution.invocation.args = {"mode": "reference_edit"}
+    fake_execution.invocation.args = {
+        "instruction": "将人物主体放到背景图里",
+        "image_refs": ["art_img_input_001", "art_img_input_002"],
+    }
     fake_execution.artifacts = [
         ImageArtifact(
             id="art_image_001",
@@ -2470,7 +2538,10 @@ def test_execute_agent_uses_llm_selected_base_image_artifact_id(mocker) -> None:
         fake = mocker.Mock()
         fake.invocation = mocker.Mock()
         fake.invocation.tool_name = ToolName.EDIT
-        fake.invocation.args = {"mode": "reference_edit"}
+        fake.invocation.args = {
+            "instruction": "把人物放到背景里",
+            "image_refs": ["art_img_input_002", "art_img_input_001"],
+        }
         fake.invocation.output_refs = ["art_image_candidate_001"]
         fake.artifacts = [
             ImageArtifact(
@@ -2574,7 +2645,10 @@ def test_execute_agent_retry_candidate_has_priority_as_base_image(mocker) -> Non
         fake = mocker.Mock()
         fake.invocation = mocker.Mock()
         fake.invocation.tool_name = ToolName.EDIT
-        fake.invocation.args = {"mode": "reference_edit"}
+        fake.invocation.args = {
+            "instruction": "继续修正当前结果",
+            "image_refs": ["art_image_candidate_001", "art_img_input_001"],
+        }
         fake.invocation.output_refs = ["art_image_candidate_002"]
         fake.artifacts = [
             ImageArtifact(
@@ -2591,6 +2665,148 @@ def test_execute_agent_retry_candidate_has_priority_as_base_image(mocker) -> Non
     ExecuteAgent().run(state)
 
     assert captured["base_image_ref"] == "art_image_candidate_001"
+
+
+def test_execute_agent_build_edit_image_refs_prefers_base_and_caps_at_three() -> None:
+    state = {
+        "session": SessionState(
+            session_id="sess_edit_refs",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.RUNNING,
+                    task_artifact_ids=["art_collage_001", "art_crop_001"],
+                )
+            },
+        ),
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri="examples/fig1.jpg",
+                payload={"role": "input"},
+                scope="session",
+            ),
+            "art_img_input_002": ImageArtifact(
+                id="art_img_input_002",
+                uri="examples/fig2.jpg",
+                payload={"role": "input"},
+                scope="session",
+            ),
+            "art_img_input_003": ImageArtifact(
+                id="art_img_input_003",
+                uri="examples/fig3.jpg",
+                payload={"role": "input"},
+                scope="session",
+            ),
+            "art_collage_001": ImageArtifact(
+                id="art_collage_001",
+                uri="examples/fig4.jpg",
+                payload={"role": "collage_reference"},
+                scope="task",
+            ),
+            "art_crop_001": ImageArtifact(
+                id="art_crop_001",
+                uri="examples/fig1.jpg",
+                payload={"role": "cropped_preview"},
+                scope="task",
+            ),
+        },
+    }
+
+    image_refs = ExecuteAgent()._build_edit_image_refs(
+        state=state,
+        task_id="task_001",
+        runtime_ctx={
+            "base_image_ref": "art_img_input_001",
+            "initial_base_image_ref": "art_img_input_001",
+            "reference_refs": ["art_img_input_002", "art_img_input_003"],
+            "grounding_ref": None,
+            "mask_ref": None,
+            "crop_ref": "art_crop_001",
+        },
+    )
+
+    assert image_refs == ["art_img_input_001", "art_collage_001", "art_crop_001"]
+
+
+def test_edit_tool_generates_local_candidate_image_with_unified_args(tmp_path, mocker) -> None:
+    from PIL import Image
+    from tools.edit_tool import EditTool
+
+    source_path = tmp_path / "source.png"
+    Image.new("RGB", (16, 16), color=(255, 255, 255)).save(source_path)
+
+    state = {
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="reference_edit",
+                instruction="把人物放到背景里",
+            )
+        },
+        "session": SessionState(
+            session_id="sess_edit_tool",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.RUNNING,
+                    task_artifact_ids=["art_inst_001"],
+                )
+            },
+        ),
+        "artifacts": {
+            "art_inst_001": InstructionArtifact(
+                id="art_inst_001",
+                payload={"instruction_text": "把人物放到背景里"},
+            ),
+            "art_img_001": ImageArtifact(
+                id="art_img_001",
+                uri=str(source_path),
+                payload={"role": "input"},
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+    }
+
+    mocker.patch(
+        "tools.edit_tool.edit_images",
+        return_value=Image.new("RGB", (16, 16), color=(0, 128, 255)),
+    )
+    mocker.patch(
+        "tools.edit_tool.backend_config_snapshot",
+        return_value={"model_path": "mock-firered"},
+    )
+
+    execution = EditTool().run(
+        state,
+        task_id="task_001",
+        loop_index=1,
+        args=EditArgs(
+            instruction="把人物放到背景里",
+            image_refs=["art_img_001"],
+        ),
+    )
+
+    artifact = execution.artifacts[0]
+    assert artifact.payload["role"] == "candidate_image"
+    assert artifact.payload["primary_image_ref"] == "art_img_001"
+    assert artifact.payload["auxiliary_image_refs"] == []
+    assert artifact.payload["backend_name"] == "firered"
+    assert artifact.payload["source"] == "edit_output"
+    assert artifact.source_ids == ["art_img_001"]
+    assert Path(artifact.uri).is_file()
+    assert execution.invocation.args == {
+        "instruction": "把人物放到背景里",
+        "image_refs": ["art_img_001"],
+    }
 
 
 def test_plan_agent_replan_creates_new_plan_version_and_marks_old_tasks() -> None:

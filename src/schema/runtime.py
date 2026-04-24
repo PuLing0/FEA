@@ -60,7 +60,6 @@ class ExecuteLLMOutput(StrictModel):
 
     reasoning: str
     selected_tools: list[str] = Field(default_factory=list)
-    edit_mode: str | None = None
     base_image_artifact_id: str | None = None
 
 

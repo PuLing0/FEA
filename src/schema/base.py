@@ -75,12 +75,6 @@ class ToolName(str, Enum):
     EVALUATE = "evaluate"
 
 
-class EditMode(str, Enum):
-    LOCAL_EDIT = "local_edit"
-    GLOBAL_EDIT = "global_edit"
-    REFERENCE_EDIT = "reference_edit"
-
-
 class ReplanMode(str, Enum):
     SPLIT_TASK = "split_task"
     REROUTE_PLAN = "reroute_plan"
