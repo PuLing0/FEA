@@ -69,9 +69,18 @@ class CropArgs(StrictModel):
 
 
 class CollageArgs(StrictModel):
-    block_artifact_ids: list[str] = Field(min_length=1)
-    layout_goal: str
-    previous_collage_ref: str | None = None
+    block_artifact_ids: list[str] = Field(min_length=2)
+    layout_goal: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_collage_args(self) -> "CollageArgs":
+        normalized_goal = self.layout_goal.strip()
+        if not normalized_goal:
+            raise ValueError("layout_goal must be non-empty")
+        self.layout_goal = normalized_goal
+        if len(set(self.block_artifact_ids)) != len(self.block_artifact_ids):
+            raise ValueError("block_artifact_ids must not contain duplicates")
+        return self
 
 
 class PromptReconstructArgs(StrictModel):
@@ -94,8 +103,47 @@ class EditArgs(StrictModel):
 
 
 class EvaluateArgs(StrictModel):
-    candidate_refs: list[str] = Field(min_length=1)
+    input_refs: list[str] = Field(default_factory=list)
+    candidate_ref: str | None = None
+    instruction: str | None = None
+    candidate_refs: list[str] = Field(default_factory=list)
     checks: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_evaluate_args(self) -> "EvaluateArgs":
+        if self.candidate_ref is None:
+            if not self.candidate_refs:
+                raise ValueError("evaluate requires candidate_ref or candidate_refs")
+            self.candidate_ref = self.candidate_refs[-1]
+        if not self.candidate_refs:
+            self.candidate_refs = [self.candidate_ref]
+        if self.candidate_ref not in self.candidate_refs:
+            self.candidate_refs.append(self.candidate_ref)
+        if self.instruction is not None:
+            normalized_instruction = self.instruction.strip()
+            if not normalized_instruction:
+                raise ValueError("instruction must be non-empty when provided")
+            self.instruction = normalized_instruction
+        return self
+
+
+EvaluationVerdict = Literal["pass", "needs_revision", "replan"]
+
+
+class EvaluationScores(StrictModel):
+    instruction_success: int = Field(ge=0, le=5)
+    reference_consistency: int = Field(ge=0, le=5)
+    overediting: int = Field(ge=0, le=5)
+    naturalness: int = Field(ge=0, le=5)
+    artifacts: int = Field(ge=0, le=5)
+
+
+class EvaluateLLMOutput(StrictModel):
+    is_satisfied: bool
+    scores: EvaluationScores
+    reason: str
+    issues: list[str] = Field(default_factory=list)
+    new_rewritten_prompt: str | None = None
 
 
 class ToolInvocationRecord(StrictModel):
