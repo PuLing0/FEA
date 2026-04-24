@@ -7,7 +7,17 @@ from langgraph.graph import END, START, StateGraph
 from agents.evaluator_agent import EvaluatorAgent
 from agents.execute_agent import ExecuteAgent
 from agents.plan_agent import PlanAgent
-from schema import ArtifactIndex, ArtifactKind, ImageArtifact, SessionPhase, SessionState, ToolName, UnderstandArgs
+from schema import (
+    ArtifactIndex,
+    ArtifactKind,
+    ImageArtifact,
+    SessionPhase,
+    SessionState,
+    ToolInvocationRecord,
+    ToolName,
+    UnderstandArgs,
+    UnderstandingArtifact,
+)
 
 from .state import RuntimeState
 from tools.registry import build_default_tool_registry
@@ -58,6 +68,41 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
         )
         state["artifacts"][image.id] = image
         state["session"].artifact_index.by_type.setdefault(ArtifactKind.IMAGE, []).append(image.id)
+
+        if not runtime_input.get("use_llm", False):
+            understanding = UnderstandingArtifact(
+                id=f"art_understanding_bootstrap_{index:03d}",
+                payload={
+                    "image_ref": image.id,
+                    "task_instruction": runtime_input["instruction_text"],
+                    "summary": f"Input image slot {index}: {image_uri}",
+                },
+                source_ids=[image.id],
+                created_by=ToolName.UNDERSTAND.value,
+                scope="session",
+            )
+            state["artifacts"][understanding.id] = understanding
+            state["operations"].append(
+                ToolInvocationRecord(
+                    id=f"op_understand_bootstrap_{index:03d}",
+                    task_id="bootstrap",
+                    loop_index=0,
+                    tool_name=ToolName.UNDERSTAND,
+                    args={
+                        "image_ref": image.id,
+                        "question": f"understand image slot {index} for the user request",
+                    },
+                    status="succeeded",
+                    output_refs=[understanding.id],
+                    result_payload={
+                        "image_ref": image.id,
+                        "summary": understanding.payload["summary"],
+                        "understanding_ref": understanding.id,
+                    },
+                    raw_output_uri=f"runs/bootstrap/{ToolName.UNDERSTAND.value}.json",
+                )
+            )
+            continue
 
         understand_execution = TOOL_REGISTRY.get(ToolName.UNDERSTAND).run(
             state,
