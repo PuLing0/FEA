@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from llm import invoke_structured_llm, load_llm_config
+from llm import load_llm_config
 from runtime.scheduler import select_next_runnable_task
 from runtime.state import RuntimeState
 from schema import (
     ArtifactKind,
     Decision,
-    DecisionLLMOutput,
     DecisionRoute,
     EvaluateArgs,
     ReplanMode,
@@ -39,12 +38,16 @@ class EvaluatorAgent:
             raise ValueError("EvaluatorAgent only accepts successful execute checkpoint outputs")
 
         task_state.evaluator_checkpoint_count += 1
+        latest_edit_instruction = self._find_latest_edit_instruction(state, current_task_id)
         evaluate_execution = self._registry.get(ToolName.EVALUATE).run(
             state,
             task_id=current_task_id,
             loop_index=task_state.loop_count,
             args=EvaluateArgs(
+                input_refs=self._build_evaluate_input_refs(state, current_task_id),
+                candidate_ref=task_state.latest_artifact_ids[-1],
                 candidate_refs=list(task_state.latest_artifact_ids),
+                instruction=latest_edit_instruction or task.instruction,
                 checks=task.acceptance_criteria,
             ),
         )
@@ -54,15 +57,11 @@ class EvaluatorAgent:
             if artifact.id not in task_state.task_artifact_ids:
                 task_state.task_artifact_ids.append(artifact.id)
 
-        llm_decision = (
-            self._build_decision_with_llm(state, current_task_id)
-            if self._use_llm(state)
-            else None
-        )
-        route = (
-            llm_decision.route
-            if llm_decision
-            else self._fallback_route(state, current_task_id)
+        evaluation_payload = evaluate_execution.artifacts[0].payload if evaluate_execution.artifacts else {}
+        route = self._route_from_evaluation_payload(
+            evaluation_payload=evaluation_payload,
+            state=state,
+            task_id=current_task_id,
         )
 
         common = {
@@ -72,17 +71,26 @@ class EvaluatorAgent:
             "plan_id": session.current_plan_id,
             "source_execution_outcome": task_state.latest_execution_outcome,
             "candidate_artifact_ids": list(task_state.latest_artifact_ids),
-            "summary": llm_decision.summary if llm_decision else "minimal evaluator checkpoint decision",
-            "issues": llm_decision.issues if llm_decision else [],
+            "summary": evaluation_payload.get("reason", "structured evaluator checkpoint decision"),
+            "issues": evaluation_payload.get("issues", []),
+            "meta": {"evaluation_ref": evaluate_execution.artifacts[0].id if evaluate_execution.artifacts else None},
         }
 
         if route == DecisionRoute.CONTINUE_EXECUTE:
             task_state.latest_evaluate_checkpoint = "failed"
+            fix_focuses = evaluation_payload.get("issues") or []
+            if not fix_focuses and evaluation_payload.get("new_rewritten_prompt"):
+                fix_focuses = [evaluation_payload["new_rewritten_prompt"]]
+            if not fix_focuses:
+                fix_focuses = ["continue the current task using evaluator feedback to choose the next tool"]
             task_retry = TaskRetryAdvice(
-                reason="the task output is not good enough yet, but it is still worth refining in the same task",
+                reason=evaluation_payload.get(
+                    "reason",
+                    "the current task is still worth continuing with an appropriate next tool",
+                ),
                 base_candidate_artifact_id=task_state.latest_artifact_ids[-1],
                 reuse_artifact_ids=self._build_reuse_artifact_ids(task_state),
-                fix_focuses=["improve the current candidate based on evaluator feedback"],
+                fix_focuses=fix_focuses,
                 avoid_changes=["do not discard the original input images"],
             )
             decision = Decision(
@@ -99,7 +107,10 @@ class EvaluatorAgent:
                 **common,
                 replan=ReplanRequest(
                     mode=self._fallback_replan_mode(task.type),
-                    reason="the current task should not continue as-is after evaluator review",
+                    reason=evaluation_payload.get(
+                        "reason",
+                        "the current task should not continue as-is after evaluator review",
+                    ),
                     preserve_artifact_ids=list(task_state.task_artifact_ids[-6:]),
                 ),
             )
@@ -185,6 +196,7 @@ class EvaluatorAgent:
     def _build_retry_context_text(self, task_retry: TaskRetryAdvice) -> str:
         lines = [
             "Evaluator feedback:",
+            "- Continue the current task; choose the next tool based on this feedback.",
             f"- Reason: {task_retry.reason}",
         ]
         if task_retry.base_candidate_artifact_id:
@@ -208,13 +220,27 @@ class EvaluatorAgent:
             if artifact_id != task_state.latest_artifact_ids[-1]
         ]
 
+    def _route_from_evaluation_payload(
+        self,
+        *,
+        evaluation_payload: dict,
+        state: RuntimeState,
+        task_id: str,
+    ) -> DecisionRoute:
+        verdict = evaluation_payload.get("verdict")
+        if verdict == "pass":
+            return DecisionRoute.PASS
+        if verdict == "needs_revision":
+            return DecisionRoute.CONTINUE_EXECUTE
+        if verdict == "replan":
+            return DecisionRoute.REPLAN
+        return self._fallback_route(state, task_id)
+
     def _fallback_route(self, state: RuntimeState, task_id: str) -> DecisionRoute:
         max_evaluator_checkpoints = state.get("max_evaluator_checkpoints", 3)
         task_state = state["session"].task_states[task_id]
-        desired_route = DecisionRoute(state["input"]["desired_decision_route"])
-        if desired_route == DecisionRoute.FAIL:
-            return DecisionRoute.FAIL
-        if task_state.evaluator_checkpoint_count >= max_evaluator_checkpoints:
+        desired_route = DecisionRoute(state["input"].get("desired_decision_route", "replan"))
+        if desired_route == DecisionRoute.CONTINUE_EXECUTE and task_state.evaluator_checkpoint_count >= max_evaluator_checkpoints:
             return DecisionRoute.REPLAN
         return desired_route
 
@@ -232,28 +258,21 @@ class EvaluatorAgent:
             return False
         return bool(config.api_key and config.base_url and config.model_name)
 
-    def _build_decision_with_llm(
-        self,
-        state: RuntimeState,
-        task_id: str,
-    ) -> DecisionLLMOutput:
-        task = state["tasks"][task_id]
+    def _build_evaluate_input_refs(self, state: RuntimeState, task_id: str) -> list[str]:
         task_state = state["session"].task_states[task_id]
-        return invoke_structured_llm(
-            system_prompt=(
-                "You are an evaluator agent for image editing. "
-                "You only evaluate a successful execute checkpoint output. "
-                "Return only one route from continue_execute, pass, replan, fail."
-            ),
-            user_prompt=(
-                f"User instruction: {state['input']['instruction_text']}\n"
-                f"Task type: {task.type}\n"
-                f"Task instruction: {task.instruction}\n"
-                f"Acceptance criteria: {task.acceptance_criteria}\n"
-                f"Candidate refs: {task_state.latest_artifact_ids}\n"
-                f"Evaluator checkpoint count: {task_state.evaluator_checkpoint_count}\n"
-                f"Execution outcome: {task_state.latest_execution_outcome}\n"
-                "Choose the next route and summarize why."
-            ),
-            output_schema=DecisionLLMOutput,
-        )
+        refs = task_state.resolved_input_artifact_ids or state["tasks"][task_id].input_artifact_ids
+        return [
+            artifact_id
+            for artifact_id in refs
+            if artifact_id in state["artifacts"]
+            and state["artifacts"][artifact_id].kind == ArtifactKind.IMAGE
+        ]
+
+    def _find_latest_edit_instruction(self, state: RuntimeState, task_id: str) -> str | None:
+        for operation in reversed(state.get("operations", [])):
+            if operation.task_id != task_id or operation.tool_name != ToolName.EDIT:
+                continue
+            instruction = operation.args.get("instruction")
+            if isinstance(instruction, str) and instruction.strip():
+                return instruction.strip()
+        return None

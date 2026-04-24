@@ -1,39 +1,249 @@
-"""Minimal evaluate tool implementation."""
+"""Structured multimodal evaluate tool implementation."""
 
 from __future__ import annotations
 
+from math import sqrt
 from pathlib import Path
+from typing import Any
 
-from llm import invoke_multimodal_llm
+from llm import invoke_structured_multimodal_llm
+from PIL import Image, ImageDraw, ImageFont
 from runtime.instruction_resolver import resolve_active_instruction_text
-from schema import ArtifactKind, EvaluateArgs, EvaluationArtifact, ToolInvocationRecord, ToolName
+from schema import (
+    ArtifactKind,
+    EvaluateArgs,
+    EvaluateLLMOutput,
+    EvaluationArtifact,
+    EvaluationScores,
+    ToolInvocationRecord,
+    ToolName,
+)
 
 from .base import ToolExecutionResult
 from .utils import next_artifact_id, next_operation_id
 
 
+REFERENCE_BOARD_MAX_SIDE = 2048
+PASS_MIN_SUBSCORE = 4
+PASS_WEIGHTED_SCORE = 3.5
+MAX_NEEDS_REVISION_COUNT = 3
+
+SCORE_RUBRIC = """
+All score dimensions use this 0-5 scale:
+0: Not applicable or impossible to judge from the provided images.
+1: Severe failure. The dimension is essentially wrong and should trigger replan.
+2: Major issue. The result is mostly unsatisfactory for this dimension.
+3: Partial success. The core idea is visible, but important problems remain.
+4: Good. Minor issues remain, but this dimension is mostly successful.
+5: Excellent. This dimension is fully satisfied with no meaningful issue.
+
+Dimensions:
+- instruction_success: Whether the candidate fulfills the final edit instruction.
+- reference_consistency: Whether the candidate uses the task input/reference images correctly.
+- overediting: Whether the candidate avoids changing content that should be preserved.
+- naturalness: Whether lighting, perspective, scale, composition, and blending look natural.
+- artifacts: Whether the image avoids distortions, broken anatomy, blurred faces, watermarks, damaged edges, or texture artifacts.
+""".strip()
+
+
 class EvaluateTool:
     name = ToolName.EVALUATE
 
-    def _resolve_candidate_image_paths(self, state, candidate_refs: list[str]) -> list[str]:
-        image_paths: list[str] = []
-        for candidate_ref in candidate_refs:
-            artifact = state["artifacts"].get(candidate_ref)
-            if artifact is None:
-                raise ValueError(f"Unknown candidate artifact ref: {candidate_ref}")
-            if artifact.kind != ArtifactKind.IMAGE:
-                raise ValueError(f"Candidate artifact is not an image: {candidate_ref}")
-            if not artifact.uri:
-                raise ValueError(f"Candidate image has no uri: {candidate_ref}")
-            if "://" in artifact.uri:
-                raise ValueError(
-                    f"Candidate image uri is not a local file path: {artifact.uri}"
-                )
-            path = Path(artifact.uri)
-            if not path.is_file():
-                raise FileNotFoundError(f"Image path does not exist: {artifact.uri}")
-            image_paths.append(str(path))
-        return image_paths
+    def _resolve_image_artifact(self, state, artifact_ref: str, *, label: str):
+        artifact = state["artifacts"].get(artifact_ref)
+        if artifact is None:
+            raise ValueError(f"Unknown {label} artifact ref: {artifact_ref}")
+        if artifact.kind != ArtifactKind.IMAGE:
+            raise ValueError(f"{label.capitalize()} artifact is not an image: {artifact_ref}")
+        if not artifact.uri:
+            raise ValueError(f"{label.capitalize()} image has no uri: {artifact_ref}")
+        if "://" in artifact.uri:
+            raise ValueError(
+                f"{label.capitalize()} image uri is not a local file path: {artifact.uri}"
+            )
+        path = Path(artifact.uri)
+        if not path.is_file():
+            raise FileNotFoundError(f"Image path does not exist: {artifact.uri}")
+        return artifact, path
+
+    def _resolve_image_paths(self, state, refs: list[str], *, label: str) -> list[Path]:
+        return [
+            self._resolve_image_artifact(state, artifact_ref, label=label)[1]
+            for artifact_ref in refs
+        ]
+
+    def _build_reference_board(
+        self,
+        *,
+        state,
+        input_refs: list[str],
+        task_id: str,
+        loop_index: int,
+    ) -> tuple[str | None, list[str]]:
+        if not input_refs:
+            return None, []
+        input_paths = self._resolve_image_paths(state, input_refs, label="input")
+        if len(input_paths) == 1:
+            return str(input_paths[0]), []
+
+        images = []
+        for artifact_ref, path in zip(input_refs, input_paths, strict=True):
+            with Image.open(path) as image:
+                images.append((artifact_ref, image.convert("RGB")))
+
+        cell_width = max(image.width for _, image in images)
+        cell_height = max(image.height for _, image in images)
+        label_height = 36
+        columns = 2 if len(images) <= 4 else 3
+        rows = (len(images) + columns - 1) // columns
+        board = Image.new(
+            "RGB",
+            (columns * cell_width, rows * (cell_height + label_height)),
+            color=(245, 245, 245),
+        )
+        draw = ImageDraw.Draw(board)
+        font = ImageFont.load_default()
+
+        for index, (artifact_ref, image) in enumerate(images):
+            row = index // columns
+            col = index % columns
+            x = col * cell_width
+            y = row * (cell_height + label_height)
+            board.paste(image, (x, y + label_height))
+            draw.rectangle((x, y, x + cell_width, y + label_height), fill=(230, 230, 230))
+            draw.text((x + 8, y + 10), artifact_ref, fill=(0, 0, 0), font=font)
+
+        max_side = max(board.size)
+        if max_side > REFERENCE_BOARD_MAX_SIDE:
+            scale = REFERENCE_BOARD_MAX_SIDE / float(max_side)
+            board = board.resize(
+                (int(board.width * scale), int(board.height * scale)),
+                Image.Resampling.LANCZOS,
+            )
+
+        output_dir = Path("generated") / "evaluate"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        board_path = output_dir / f"{task_id}_{loop_index:03d}_reference_board.png"
+        board.save(board_path)
+        return str(board_path), [str(board_path)]
+
+    @staticmethod
+    def _calculate_scores(scores: EvaluationScores) -> dict[str, float | int]:
+        semantic_score = min(
+            scores.instruction_success,
+            scores.reference_consistency,
+            scores.overediting,
+        )
+        quality_score = min(scores.naturalness, scores.artifacts)
+        weighted_score = (
+            scores.instruction_success * 0.30
+            + scores.reference_consistency * 0.25
+            + scores.overediting * 0.15
+            + scores.naturalness * 0.15
+            + scores.artifacts * 0.15
+        )
+        overall_score = sqrt(semantic_score * quality_score)
+        return {
+            "instruction_success": scores.instruction_success,
+            "reference_consistency": scores.reference_consistency,
+            "overediting": scores.overediting,
+            "naturalness": scores.naturalness,
+            "artifacts": scores.artifacts,
+            "semantic_score": round(float(semantic_score), 2),
+            "quality_score": round(float(quality_score), 2),
+            "weighted_score": round(float(weighted_score), 2),
+            "overall_score": round(float(overall_score), 2),
+        }
+
+    @staticmethod
+    def _derive_verdict(
+        *,
+        is_satisfied: bool,
+        scores: EvaluationScores,
+        calculated_scores: dict[str, float | int],
+        evaluator_checkpoint_count: int,
+    ) -> str:
+        subscores = [
+            scores.instruction_success,
+            scores.reference_consistency,
+            scores.overediting,
+            scores.naturalness,
+            scores.artifacts,
+        ]
+        if (
+            is_satisfied
+            and min(subscores) > 3
+            and float(calculated_scores["weighted_score"]) > PASS_WEIGHTED_SCORE
+        ):
+            return "pass"
+        if any(score == 1 for score in subscores):
+            return "replan"
+        if evaluator_checkpoint_count >= MAX_NEEDS_REVISION_COUNT:
+            return "replan"
+        return "needs_revision"
+
+    def _evaluate_with_llm(
+        self,
+        *,
+        reference_board_path: str | None,
+        candidate_path: str,
+        instruction: str,
+        checks: list[str],
+        input_refs: list[str],
+        candidate_ref: str,
+    ) -> EvaluateLLMOutput:
+        image_paths = [path for path in [reference_board_path, candidate_path] if path]
+        reference_text = (
+            "Image 1 is a reference board containing all task input/reference images. "
+            "Image 2 is the candidate edited result."
+            if reference_board_path
+            else "Only one image is provided: the candidate edited result."
+        )
+        return invoke_structured_multimodal_llm(
+            system_prompt=(
+                "You are a strict image-editing evaluator. Return only structured output. "
+                "Judge both whether the edit is satisfactory and the 0-5 score dimensions. "
+                "If the result needs more work, provide concrete issues and a refined edit prompt."
+            ),
+            user_prompt=(
+                f"{reference_text}\n"
+                f"Task input refs: {input_refs}\n"
+                f"Candidate ref: {candidate_ref}\n"
+                f"Final edit instruction: {instruction}\n"
+                f"Acceptance checks: {checks}\n\n"
+                f"Scoring rubric:\n{SCORE_RUBRIC}\n\n"
+                "Set is_satisfied=true only when the candidate is ready to pass without further editing. "
+                "When is_satisfied=false, explain the main issues and provide new_rewritten_prompt."
+            ),
+            image_paths=image_paths,
+            output_schema=EvaluateLLMOutput,
+        )
+
+    def _resolve_instruction(self, state, task_id: str, args: EvaluateArgs) -> str:
+        if args.instruction:
+            return args.instruction
+        return resolve_active_instruction_text(state, task_id)
+
+    def _resolve_input_refs(self, state, task_id: str, args: EvaluateArgs) -> list[str]:
+        if args.input_refs:
+            return list(args.input_refs)
+        task_state = state["session"].task_states.get(task_id)
+        if task_state and task_state.resolved_input_artifact_ids:
+            return [
+                artifact_id
+                for artifact_id in task_state.resolved_input_artifact_ids
+                if state["artifacts"].get(artifact_id) is not None
+                and state["artifacts"][artifact_id].kind == ArtifactKind.IMAGE
+            ]
+        task = state.get("tasks", {}).get(task_id)
+        if task:
+            return [
+                artifact_id
+                for artifact_id in task.input_artifact_ids
+                if state["artifacts"].get(artifact_id) is not None
+                and state["artifacts"][artifact_id].kind == ArtifactKind.IMAGE
+            ]
+        return []
 
     def run(
         self,
@@ -43,32 +253,52 @@ class EvaluateTool:
         loop_index: int,
         args: EvaluateArgs,
     ) -> ToolExecutionResult:
-        task_instruction = resolve_active_instruction_text(state, task_id)
-        image_paths = self._resolve_candidate_image_paths(state, args.candidate_refs)
-        response = invoke_multimodal_llm(
-            system_prompt=(
-                "You evaluate candidate images for an image-editing task. "
-                "Check whether the visible result satisfies the acceptance criteria. "
-                "Return one concise factual evaluation summary."
-            ),
-            user_prompt=(
-                f"Task instruction: {task_instruction}\n"
-                f"Acceptance criteria: {args.checks}\n"
-                "Evaluate the candidate image(s) and summarize whether they satisfy the checks."
-            ),
-            image_paths=image_paths,
+        candidate_ref = args.candidate_ref
+        assert candidate_ref is not None
+        _, candidate_path = self._resolve_image_artifact(state, candidate_ref, label="candidate")
+        input_refs = self._resolve_input_refs(state, task_id, args)
+        instruction = self._resolve_instruction(state, task_id, args)
+        reference_board_path, generated_refs = self._build_reference_board(
+            state=state,
+            input_refs=input_refs,
+            task_id=task_id,
+            loop_index=loop_index,
         )
-        evaluation_summary = str(response.content).strip()
+        llm_output = self._evaluate_with_llm(
+            reference_board_path=reference_board_path,
+            candidate_path=str(candidate_path),
+            instruction=instruction,
+            checks=args.checks,
+            input_refs=input_refs,
+            candidate_ref=candidate_ref,
+        )
+        calculated_scores = self._calculate_scores(llm_output.scores)
+        evaluator_checkpoint_count = state["session"].task_states[task_id].evaluator_checkpoint_count
+        verdict = self._derive_verdict(
+            is_satisfied=llm_output.is_satisfied,
+            scores=llm_output.scores,
+            calculated_scores=calculated_scores,
+            evaluator_checkpoint_count=evaluator_checkpoint_count,
+        )
+        payload: dict[str, Any] = {
+            "input_refs": input_refs,
+            "candidate_ref": candidate_ref,
+            "candidate_refs": list(args.candidate_refs),
+            "reference_board_uri": reference_board_path,
+            "instruction": instruction,
+            "checks": args.checks,
+            "is_satisfied": llm_output.is_satisfied,
+            "verdict": verdict,
+            "scores": calculated_scores,
+            "reason": llm_output.reason,
+            "issues": llm_output.issues,
+            "new_rewritten_prompt": llm_output.new_rewritten_prompt,
+            "score_rubric": SCORE_RUBRIC,
+        }
         artifact = EvaluationArtifact(
             id=next_artifact_id(state, ArtifactKind.EVALUATION),
-            payload={
-                "candidate_refs": args.candidate_refs,
-                "task_instruction": task_instruction,
-                "checks": args.checks,
-                "verdict": "needs_review",
-                "summary": evaluation_summary,
-            },
-            source_ids=[*args.candidate_refs],
+            payload=payload,
+            source_ids=[*input_refs, candidate_ref],
             created_by=self.name.value,
             scope="task",
         )
@@ -80,14 +310,7 @@ class EvaluateTool:
             args=args.model_dump(),
             status="succeeded",
             output_refs=[artifact.id],
-            result_payload={
-                "candidate_refs": args.candidate_refs,
-                "task_instruction": task_instruction,
-                "checks": args.checks,
-                "verdict": "needs_review",
-                "summary": evaluation_summary,
-                "evaluation_ref": artifact.id,
-            },
+            result_payload={**payload, "evaluation_ref": artifact.id, "generated_refs": generated_refs},
             raw_output_uri=f"runs/{task_id}/{self.name.value}.json",
         )
         return ToolExecutionResult(invocation=invocation, artifacts=[artifact])
