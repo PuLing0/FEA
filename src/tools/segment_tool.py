@@ -1,4 +1,4 @@
-"""Segmentation tool using image plus text prompt."""
+"""Single-path segmentation tool using SAM 3.1 text prompts."""
 
 from __future__ import annotations
 
@@ -9,15 +9,9 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from schema import ArtifactKind, GroundingPoint, MaskArtifact, SegmentArgs, ToolInvocationRecord, ToolName
-from vision_backends.grabcut_refinement import (
-    GrabCutRefinementError,
-    RefinementSeedCandidate,
-    refine_candidates as grabcut_refine_candidates,
-)
+from schema import ArtifactKind, MaskArtifact, SegmentArgs, ToolInvocationRecord, ToolName
 from vision_backends.sam3_point_backend import (
     Sam3BackendError,
-    predict_candidates as sam31_predict_candidates,
     predict_text_prompt_candidates as sam31_predict_text_prompt_candidates,
 )
 
@@ -55,7 +49,7 @@ class SegmentTool:
             raise FileNotFoundError(f"Image path does not exist: {artifact.uri}")
         return str(path)
 
-    def _predict_text_only_candidates(
+    def _predict_text_prompt_candidates(
         self,
         *,
         image_array: np.ndarray,
@@ -83,7 +77,7 @@ class SegmentTool:
             for index, item in enumerate(raw_candidates)
         ]
 
-    def _should_try_text_only_proposal(self, *, backend_name: str | None) -> bool:
+    def _is_sam31_text_prompt_backend_available(self, *, backend_name: str | None) -> bool:
         resolved_backend = (backend_name or "sam31").strip().lower()
         if resolved_backend != "sam31":
             return False
@@ -133,26 +127,13 @@ class SegmentTool:
             result[y, x] = True
         return result
 
-    def _postprocess_mask(
-        self,
-        *,
-        mask: np.ndarray,
-        positive_points: list[GroundingPoint],
-    ) -> np.ndarray:
+    def _postprocess_mask(self, *, mask: np.ndarray) -> np.ndarray:
         cleaned = self._largest_component(mask)
         if not cleaned.any():
             return cleaned
-
-        if positive_points and not any(
-            0 <= point.y < cleaned.shape[0]
-            and 0 <= point.x < cleaned.shape[1]
-            and cleaned[point.y, point.x]
-            for point in positive_points
-        ):
-            return np.asarray(mask, dtype=bool)
         return cleaned
 
-    def _score_text_candidate(
+    def _score_candidate(
         self,
         *,
         candidate: SegmentCandidate,
@@ -190,7 +171,7 @@ class SegmentTool:
             "aspect_ratio": aspect_ratio,
         }
 
-    def _select_best_text_candidate(
+    def _select_best_candidate(
         self,
         *,
         candidates: list[SegmentCandidate],
@@ -200,7 +181,7 @@ class SegmentTool:
             mask = np.asarray(candidate.mask, dtype=bool)
             if mask.ndim != 2 or not mask.any():
                 continue
-            metrics = self._score_text_candidate(candidate=candidate)
+            metrics = self._score_candidate(candidate=candidate)
             if metrics is None:
                 continue
             candidate.metrics = metrics
@@ -215,7 +196,7 @@ class SegmentTool:
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"{task_id}_{loop_index:03d}_mask.png"
         mask_uint8 = (np.asarray(mask, dtype=bool).astype(np.uint8)) * 255
-        Image.fromarray(mask_uint8, mode="L").save(output_path)
+        Image.fromarray(mask_uint8).save(output_path)
         return str(output_path)
 
     def run(
@@ -232,28 +213,33 @@ class SegmentTool:
         if not text_prompt:
             raise ValueError("segment requires a non-empty prompt")
 
-        text_only_candidates: list[SegmentCandidate] = []
-        if self._should_try_text_only_proposal(backend_name=args.backend_name):
-            try:
-                text_only_candidates = self._predict_text_only_candidates(
-                    image_array=image_array,
-                    text_prompt=text_prompt,
-                    source_stage="sam_text_only",
-                )
-            except Sam3BackendError:
-                text_only_candidates = []
+        if not self._is_sam31_text_prompt_backend_available(
+            backend_name=args.backend_name
+        ):
+            raise ValueError(
+                "segment only supports the SAM 3.1 text-prompt path; set "
+                "backend_name='sam31' and provide a valid SAM3_CHECKPOINT_PATH"
+            )
 
-        final_candidate = self._select_best_text_candidate(
-            candidates=text_only_candidates,
+        try:
+            text_prompt_candidates = self._predict_text_prompt_candidates(
+                image_array=image_array,
+                text_prompt=text_prompt,
+                source_stage="sam_text_only",
+            )
+        except Sam3BackendError as exc:
+            raise ValueError(
+                "segment failed while running the SAM 3.1 text-prompt backend"
+            ) from exc
+
+        final_candidate = self._select_best_candidate(
+            candidates=text_prompt_candidates,
         )
         if final_candidate is None:
             raise ValueError(
-                "segment text-only proposal produced no acceptable candidate; geometric fallback has been disabled in this mode"
+                "segment could not find an acceptable SAM 3.1 text-prompt mask candidate"
             )
-        final_candidate.mask = self._postprocess_mask(
-            mask=final_candidate.mask,
-            positive_points=[],
-        )
+        final_candidate.mask = self._postprocess_mask(mask=final_candidate.mask)
 
         mask_path = self._write_mask(
             mask=final_candidate.mask,
