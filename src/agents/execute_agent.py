@@ -14,6 +14,7 @@ from llm import (
 from runtime.input_selector import prepare_task_inputs
 from runtime.state import RuntimeState
 from schema import (
+    ArtifactKind,
     CollageArgs,
     CropArgs,
     Decision,
@@ -150,8 +151,14 @@ class ExecuteAgent:
             )
 
             if observe_result.outcome == "success":
-                latest_refs = [artifact.id for artifact in execution.artifacts]
-                break
+                candidate_refs = [
+                    artifact.id
+                    for artifact in execution.artifacts
+                    if self._is_evaluable_candidate_artifact(artifact)
+                ]
+                if candidate_refs:
+                    latest_refs = candidate_refs
+                    break
 
         task_state.loop_count += 1
         task_state.latest_artifact_ids = latest_refs
@@ -496,6 +503,11 @@ class ExecuteAgent:
 
     def _get_artifact(self, state: RuntimeState, artifact_id: str):
         return state["artifacts"].get(artifact_id)
+
+    def _is_evaluable_candidate_artifact(self, artifact) -> bool:
+        if artifact.kind != ArtifactKind.IMAGE:
+            return False
+        return artifact.created_by == ToolName.EDIT.value or artifact.payload.get("role") == "candidate_image"
 
     def _is_image_artifact(self, state: RuntimeState, artifact_id: str) -> bool:
         artifact = self._get_artifact(state, artifact_id)

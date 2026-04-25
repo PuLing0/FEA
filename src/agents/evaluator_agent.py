@@ -9,6 +9,7 @@ from schema import (
     ArtifactKind,
     Decision,
     DecisionRoute,
+    ExecutionOutcome,
     EvaluateArgs,
     ReplanMode,
     ReplanRequest,
@@ -36,6 +37,21 @@ class EvaluatorAgent:
         task_state = session.task_states[current_task_id]
         if task_state.latest_execute_checkpoint != "passed" or not task_state.latest_artifact_ids:
             raise ValueError("EvaluatorAgent only accepts successful execute checkpoint outputs")
+        if not self._is_evaluable_candidate_ref(state, task_state.latest_artifact_ids[-1]):
+            decision = self._build_invalid_candidate_replan_decision(
+                state=state,
+                task_id=current_task_id,
+                candidate_ref=task_state.latest_artifact_ids[-1],
+            )
+            task_state.latest_evaluate_checkpoint = "failed"
+            self._clear_task_retry_context(task_state)
+            task_state.status = TaskStatus.REPLANNED
+            session.current_task_id = None
+            session.phase = SessionPhase.PLANNING
+            session.latest_decision_id = decision.id
+            state["decision"] = decision
+            state["session"] = session
+            return state
 
         task_state.evaluator_checkpoint_count += 1
         latest_edit_instruction = self._find_latest_edit_instruction(state, current_task_id)
@@ -147,6 +163,43 @@ class EvaluatorAgent:
         state["decision"] = decision
         state["session"] = session
         return state
+
+    def _is_evaluable_candidate_ref(self, state: RuntimeState, artifact_id: str) -> bool:
+        artifact = state["artifacts"].get(artifact_id)
+        if artifact is None or artifact.kind != ArtifactKind.IMAGE:
+            return False
+        return artifact.created_by == ToolName.EDIT.value or artifact.payload.get("role") == "candidate_image"
+
+    def _build_invalid_candidate_replan_decision(
+        self,
+        *,
+        state: RuntimeState,
+        task_id: str,
+        candidate_ref: str,
+    ) -> Decision:
+        task = state["tasks"][task_id]
+        task_state = state["session"].task_states[task_id]
+        artifact = state["artifacts"].get(candidate_ref)
+        artifact_kind = getattr(getattr(artifact, "kind", None), "value", getattr(artifact, "kind", None))
+        return Decision(
+            id=f"dec_eval_invalid_candidate_{task_id}_{task_state.evaluator_checkpoint_count + 1:03d}",
+            route=DecisionRoute.REPLAN,
+            task_id=task_id,
+            plan_id=state["session"].current_plan_id,
+            source_execution_outcome=task_state.latest_execution_outcome or ExecutionOutcome.FAILURE,
+            candidate_artifact_ids=list(task_state.latest_artifact_ids),
+            summary=f"evaluator expected an edit candidate image but received {candidate_ref}",
+            issues=[
+                "invalid_evaluation_candidate",
+                f"candidate_ref={candidate_ref}",
+                f"candidate_kind={artifact_kind or 'unknown'}",
+            ],
+            replan=ReplanRequest(
+                mode=self._fallback_replan_mode(task.type),
+                reason="execute checkpoint ended without an evaluable edit candidate image",
+                preserve_artifact_ids=list(task_state.task_artifact_ids[-6:]),
+            ),
+        )
 
     def _apply_task_retry_context(
         self,
