@@ -42,3 +42,4 @@ class RuntimeState(TypedDict, total=False):
     max_task_loops: int
     max_execute_acts: int
     max_evaluator_checkpoints: int
+    max_tool_failures: int

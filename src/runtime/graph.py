@@ -39,6 +39,10 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
     runtime_input.setdefault("use_llm", False)
     if "image_uris" not in runtime_input or not runtime_input["image_uris"]:
         runtime_input["image_uris"] = [runtime_input["image_uri"]]
+    max_task_loops = state.get("max_task_loops", 2)
+    max_execute_acts = state.get("max_execute_acts", 30)
+    max_evaluator_checkpoints = state.get("max_evaluator_checkpoints", 3)
+    max_tool_failures = state.get("max_tool_failures", 3)
     session = _initial_session(runtime_input["session_id"])
     session.artifact_index = ArtifactIndex(
         by_type={
@@ -54,9 +58,10 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
         "task_act_records": [],
         "task_loops": [],
         "operations": [],
-        "max_task_loops": 2,
-        "max_execute_acts": 30,
-        "max_evaluator_checkpoints": 3,
+        "max_task_loops": max_task_loops,
+        "max_execute_acts": max_execute_acts,
+        "max_evaluator_checkpoints": max_evaluator_checkpoints,
+        "max_tool_failures": max_tool_failures,
     }
     for index, image_uri in enumerate(runtime_input["image_uris"], start=1):
         image = ImageArtifact(
