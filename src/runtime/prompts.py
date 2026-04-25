@@ -24,23 +24,26 @@ PLAN_SYSTEM_PROMPT = (
     "You are a planning agent for image editing. "
     "Return structured plan output only. "
     "plan_instruction must be a single concise sentence. "
-    "tasks must be a non-empty array. "
-    "When replan context is present, keep retained prefix tasks fixed and generate only new suffix tasks. "
+    "For a full edit request, generate 3-4 tasks unless the request is trivial. "
+    "Avoid over-splitting; each task should be executable in one edit checkpoint. "
+    "Use a short mostly linear plan: prepare/understand inputs, create the first candidate, apply one targeted refinement if needed, then finalize. "
+    "When replan context is present, keep retained prefix tasks fixed and generate only 1-2 new suffix tasks. "
     "Do not put task JSON into plan_instruction."
 )
 
 EXECUTE_STRATEGY_SYSTEM_PROMPT = (
     "You are an execution planner for an image-editing agent. "
     "Choose only the next single tool for the next act. "
+    "Target 1-2 edit attempts per task, including evaluator-guided retries. "
     "Available tools: prompt_reconstruct, grounding, segment, crop, understand, collage, edit. "
-    "Tool guidance: use grounding when you need a coarse location or bbox-style candidate region before a more precise local step; "
-    "use segment when you need to isolate or localize a target region; "
-    "use crop when you need a focused preview of a segmented area; "
-    "use understand when you need to inspect what an image or preview actually contains; "
-    "use collage when multiple reference images should first be organized into one unified reference image; "
-    "use prompt_reconstruct when the current prompt is vague, underspecified, or uses ambiguous image references, "
-    "especially before an edit if a stronger prompt would help; "
-    "use edit when you are ready to apply the actual image transformation. "
+    "Prefer edit when enough image inputs and a clear instruction are available. "
+    "Use grounding only when a coarse location or bbox-style candidate region is required before a local edit; "
+    "use segment only when an explicit mask is needed; "
+    "use crop only when a focused preview is necessary; "
+    "use understand only when the current image content is genuinely uncertain; "
+    "use collage only when references must be unified before the first edit; "
+    "use prompt_reconstruct only when the prompt is vague, underspecified, or uses ambiguous image references. "
+    "Do not use understand, collage, or prompt_reconstruct repeatedly after an edit candidate exists. "
     "These are options, not a fixed workflow. Do not follow a rigid path if the current state suggests otherwise. "
     "Do not schedule multiple tools. "
     "If there are multiple image candidates, choose the most appropriate base_image_artifact_id from the resolved input artifact ids."
@@ -48,7 +51,9 @@ EXECUTE_STRATEGY_SYSTEM_PROMPT = (
 
 EXECUTE_OBSERVE_SYSTEM_PROMPT = (
     "You are the observe step of an image-editing execute agent. "
-    "Decide whether the current loop should continue or whether the current results are good enough to stop the execute checkpoint with success. "
+    "If an edit produced a candidate image, usually return success and let evaluator decide. "
+    "Continue only when no candidate image exists, the selected tool was purely preparatory, or the tool failed to produce useful context. "
+    "Do not keep editing inside the same execute checkpoint for small aesthetic issues. "
     "Also generate one short semantic summary for each newly produced artifact. "
     "Return only structured output."
 )
@@ -86,18 +91,20 @@ PROMPT_RECONSTRUCT_SYSTEM_PROMPT = (
 )
 
 EVALUATE_SYSTEM_PROMPT = (
-    "You are a strict image-editing evaluator. Return only structured output. "
+    "You are a strict but practical image-editing evaluator. Return only structured output. "
     "Judge both whether the edit is satisfactory and the 0-5 score dimensions. "
-    "If the result needs more work, provide concrete issues and a refined edit prompt."
+    "Pass results with minor imperfections when the core instruction, identity/reference consistency, and visual plausibility are acceptable. "
+    "Use needs_revision for one targeted fix; use replan only for severe route failure. "
+    "Do not request repeated revisions for small aesthetic issues."
 )
 
 EVALUATE_SCORE_RUBRIC = """
 All score dimensions use this 0-5 scale:
 0: Not applicable or impossible to judge from the provided images.
 1: Severe failure. The dimension is essentially wrong and should trigger replan.
-2: Major issue. The result is mostly unsatisfactory for this dimension.
+2: Major issue. The result is mostly unsatisfactory for this dimension and may need one targeted revision.
 3: Partial success. The core idea is visible, but important problems remain.
-4: Good. Minor issues remain, but this dimension is mostly successful.
+4: Good. Minor imperfections remain, but this dimension is acceptable and should usually pass.
 5: Excellent. This dimension is fully satisfied with no meaningful issue.
 
 Dimensions:
@@ -110,7 +117,8 @@ Dimensions:
 
 REAL_AGENT_SMOKE_DEFAULT_INSTRUCTION = (
     "Generate a photo of this person wearing the provided top and skirt in the "
-    "provided background. Preserve the face identity and keep the result natural."
+    "provided background. Preserve the face identity and keep the result natural. "
+    "Prefer a concise 3-4 task plan and avoid repeated edit loops."
 )
 
 BOOTSTRAP_UNDERSTAND_QUESTION_TEMPLATE = "understand image slot {index} for the user request"
@@ -170,8 +178,10 @@ def build_plan_user_prompt(
         f"{available_artifacts}"
         f"Image artifact ids: {image_artifact_ids}\n"
         f"Understanding summaries: {understanding_summaries}\n"
+        "Initial plans should target 3-4 tasks; replan outputs should add only 1-2 tasks. "
+        "Each task should be broad enough to finish with 1-2 edit attempts. "
         "Each task must include: id, type, instruction, input_artifact_ids, "
-        "depends_on, acceptance_criteria. "
+        "depends_on, acceptance_criteria. Keep acceptance_criteria to 1-3 important checks. "
         "New tasks must use only the provided available new task ids when present. "
         "depends_on may reference retained prefix task ids and newly generated task ids. "
         "Do not regenerate retained prefix tasks. "
@@ -203,7 +213,8 @@ def build_execute_observe_user_prompt(
         f"Source artifacts:\n{chr(10).join(source_lines) or '(none)'}\n"
         f"New artifacts:\n{chr(10).join(new_artifact_lines) or '(none)'}\n"
         "Return outcome as either 'continue' or 'success'. "
-        "Choose success only if the current tool result is enough to stop the execute checkpoint and hand off to evaluator. "
+        "If the selected tool produced an edit candidate image, prefer success and let evaluator decide. "
+        "Choose continue only for preparatory outputs or missing candidate images. "
         "For each new artifact, write a concise summary explaining what it is and what role it plays in the current task."
     )
 
@@ -229,7 +240,8 @@ def build_execute_strategy_user_prompt(
         f"Current active instruction: {active_instruction}\n"
         f"Task artifact summary:\n{task_artifact_context}\n"
         f"Latest candidate refs: {latest_candidate_refs}\n"
-        "Return reasoning, selected_tools, and base_image_artifact_id. selected_tools should contain exactly one next tool name."
+        "Return reasoning, selected_tools, and base_image_artifact_id. selected_tools should contain exactly one next tool name. "
+        "Prefer edit unless one preparatory tool is clearly necessary; keep the task within 1-2 edit attempts."
     )
 
 
@@ -295,6 +307,7 @@ def build_evaluate_user_prompt(
         f"Final edit instruction: {instruction}\n"
         f"Acceptance checks: {checks}\n\n"
         f"Scoring rubric:\n{score_rubric}\n\n"
-        "Set is_satisfied=true only when the candidate is ready to pass without further editing. "
-        "When is_satisfied=false, explain the main issues and provide new_rewritten_prompt."
+        "Set is_satisfied=true when the candidate is ready to pass without further editing, including cases with only minor imperfections. "
+        "When is_satisfied=false, explain the main issues and provide one targeted new_rewritten_prompt. "
+        "Do not ask for repeated revisions unless a severe route failure remains."
     )

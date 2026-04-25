@@ -4056,8 +4056,11 @@ def test_prompt_module_builds_plan_prompt() -> None:
     )
 
     assert "planning agent" in PLAN_SYSTEM_PROMPT
+    assert "3-4 tasks" in PLAN_SYSTEM_PROMPT
+    assert "Avoid over-splitting" in PLAN_SYSTEM_PROMPT
     assert "Instruction: 把人物放到背景里" in prompt
     assert "Available artifacts for planning" in prompt
+    assert "1-2 edit attempts" in prompt
     assert "Do not invent future artifact ids" in prompt
 
 
@@ -4073,5 +4076,48 @@ def test_prompt_module_builds_evaluate_prompt_with_rubric() -> None:
     )
 
     assert EVALUATE_SCORE_RUBRIC in prompt
+    assert "minor imperfections" in EVALUATE_SCORE_RUBRIC.lower()
     assert "Candidate ref: art_image_001" in prompt
     assert "Set is_satisfied=true" in prompt
+    assert "severe route failure" in prompt
+
+
+def test_prompt_module_includes_execute_convergence_guidance() -> None:
+    from runtime.prompts import (
+        EXECUTE_OBSERVE_SYSTEM_PROMPT,
+        EXECUTE_STRATEGY_SYSTEM_PROMPT,
+        build_execute_observe_user_prompt,
+        build_execute_strategy_user_prompt,
+    )
+
+    task = Task(
+        id="task_prompt",
+        plan_id="plan_prompt",
+        type="reference_edit",
+        instruction="把人物放到背景里",
+    )
+    strategy_prompt = build_execute_strategy_user_prompt(
+        task=task,
+        user_instruction="生成最终图",
+        resolved_ids=["art_img_input_001"],
+        resolved_image_summaries="- art_img_input_001: 人物",
+        retry_context=None,
+        active_instruction="把人物放到背景里",
+        task_artifact_context="(none)",
+        latest_candidate_refs=[],
+    )
+    observe_prompt = build_execute_observe_user_prompt(
+        task=task,
+        active_instruction="把人物放到背景里",
+        retry_context=None,
+        selected_tool="edit",
+        tool_args={"image_refs": ["art_img_input_001"]},
+        source_lines=[],
+        new_artifact_lines=["- art_image_001 | kind=image"],
+    )
+
+    assert "Target 1-2 edit attempts per task" in EXECUTE_STRATEGY_SYSTEM_PROMPT
+    assert "Prefer edit" in EXECUTE_STRATEGY_SYSTEM_PROMPT
+    assert "let evaluator decide" in EXECUTE_OBSERVE_SYSTEM_PROMPT
+    assert "1-2 edit attempts" in strategy_prompt
+    assert "prefer success and let evaluator decide" in observe_prompt
