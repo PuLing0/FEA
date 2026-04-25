@@ -31,6 +31,7 @@ from agent import create_agent  # noqa: E402
 from llm import load_llm_config  # noqa: E402
 from runtime.prompts import REAL_AGENT_SMOKE_DEFAULT_INSTRUCTION  # noqa: E402
 from schema import ArtifactKind, SessionPhase, ToolName  # noqa: E402
+from vision_backends.firered_edit_backend import unload_pipeline  # noqa: E402
 
 DEFAULT_IMAGES = [
     REPO_ROOT / "examples" / "fig1.jpg",
@@ -180,43 +181,46 @@ def main() -> int:
         "max_evaluator_checkpoints": int(os.getenv("REAL_AGENT_SMOKE_MAX_EVALUATOR_CHECKPOINTS", "1")),
         "max_tool_failures": int(os.getenv("REAL_AGENT_SMOKE_MAX_TOOL_FAILURES", "1")),
     }
-    result, stop_reason = _run_graph_smoke(graph, input_state)
+    try:
+        result, stop_reason = _run_graph_smoke(graph, input_state)
 
-    session = result["session"]
-    decision = result.get("decision")
-    final_artifact_id = session.final_result_id or _find_latest_edit_output_id(result) or _latest_image_artifact_id(result)
-    summary = {
-        "run_id": result.get("run_id"),
-        "run_log_uri": result.get("run_log_uri"),
-        "stop_reason": stop_reason,
-        "session_phase": _enum_value(session.phase),
-        "current_plan_id": session.current_plan_id,
-        "current_task_id": session.current_task_id,
-        "latest_decision_id": session.latest_decision_id,
-        "final_result_id": session.final_result_id,
-        "fallback_final_image_id": final_artifact_id,
-        "decision": None
-        if decision is None
-        else {
-            "id": decision.id,
-            "route": _enum_value(decision.route),
-            "task_id": decision.task_id,
-            "summary": decision.summary,
-            "issues": list(decision.issues),
-        },
-        "final_artifact": _summarize_artifact(result, final_artifact_id),
-        "operations": _summarize_operations(result),
-    }
-    print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
+        session = result["session"]
+        decision = result.get("decision")
+        final_artifact_id = session.final_result_id or _find_latest_edit_output_id(result) or _latest_image_artifact_id(result)
+        summary = {
+            "run_id": result.get("run_id"),
+            "run_log_uri": result.get("run_log_uri"),
+            "stop_reason": stop_reason,
+            "session_phase": _enum_value(session.phase),
+            "current_plan_id": session.current_plan_id,
+            "current_task_id": session.current_task_id,
+            "latest_decision_id": session.latest_decision_id,
+            "final_result_id": session.final_result_id,
+            "fallback_final_image_id": final_artifact_id,
+            "decision": None
+            if decision is None
+            else {
+                "id": decision.id,
+                "route": _enum_value(decision.route),
+                "task_id": decision.task_id,
+                "summary": decision.summary,
+                "issues": list(decision.issues),
+            },
+            "final_artifact": _summarize_artifact(result, final_artifact_id),
+            "operations": _summarize_operations(result),
+        }
+        print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
 
-    final_artifact = result.get("artifacts", {}).get(final_artifact_id) if final_artifact_id else None
-    if stop_reason == "graph_terminal" and session.phase == SessionPhase.FAILED:
-        print("agent smoke ended in failed phase", file=sys.stderr)
-        return 1
-    if final_artifact is None or not final_artifact.uri or not Path(final_artifact.uri).is_file():
-        print("agent smoke did not produce a readable final image artifact", file=sys.stderr)
-        return 1
-    return 0
+        final_artifact = result.get("artifacts", {}).get(final_artifact_id) if final_artifact_id else None
+        if stop_reason == "graph_terminal" and session.phase == SessionPhase.FAILED:
+            print("agent smoke ended in failed phase", file=sys.stderr)
+            return 1
+        if final_artifact is None or not final_artifact.uri or not Path(final_artifact.uri).is_file():
+            print("agent smoke did not produce a readable final image artifact", file=sys.stderr)
+            return 1
+        return 0
+    finally:
+        unload_pipeline()
 
 
 if __name__ == "__main__":

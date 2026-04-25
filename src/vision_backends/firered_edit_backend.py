@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 from functools import lru_cache
 import importlib
 import os
@@ -79,7 +80,12 @@ def _build_backend_settings() -> dict[str, Any]:
         "per_gpu_max_memory": _get_setting("FIRERED_PER_GPU_MAX_MEMORY"),
         "cpu_max_memory": _get_setting("FIRERED_CPU_MAX_MEMORY", "128GiB"),
         "generator_device": _get_setting("FIRERED_GENERATOR_DEVICE", "auto"),
-        "enable_attention_slicing": _get_bool("FIRERED_ENABLE_ATTENTION_SLICING", False),
+        "enable_attention_slicing": _get_bool("FIRERED_ENABLE_ATTENTION_SLICING", True),
+        "enable_torch_compile": _get_bool("FIRERED_ENABLE_TORCH_COMPILE", True),
+        "enable_warmup": _get_bool("FIRERED_ENABLE_WARMUP", True),
+        "warmup_steps": _get_int("FIRERED_WARMUP_STEPS", 4),
+        "warmup_height": _get_optional_int("FIRERED_WARMUP_HEIGHT"),
+        "warmup_width": _get_optional_int("FIRERED_WARMUP_WIDTH"),
         "lora_path": None if disable_lora else _get_setting("FIRERED_LORA_PATH", DEFAULT_LORA_PATH),
         "lora_weight_name": None
         if disable_lora
@@ -131,6 +137,53 @@ def _resolve_generator_device(torch_module: Any, settings: dict[str, Any]) -> st
     if generator_device == "auto":
         return "cuda:0" if torch_module.cuda.is_available() else "cpu"
     return str(generator_device)
+
+
+def _apply_torch_compile(torch_module: Any, pipe: Any) -> list[str]:
+    notes = []
+    transformer = getattr(pipe, "transformer", None)
+    if transformer is not None and hasattr(transformer, "compile_repeated_blocks"):
+        transformer.compile_repeated_blocks(mode="default", dynamic=True)
+        notes.append("transformer.compile_repeated_blocks")
+    vae = getattr(pipe, "vae", None)
+    if vae is not None:
+        pipe.vae = torch_module.compile(vae, mode="reduce-overhead")
+        notes.append("torch.compile(vae)")
+    pipe._firered_torch_compile_notes = notes
+    return notes
+
+
+def _build_warmup_inputs(torch_module: Any, settings: dict[str, Any]) -> dict[str, Any]:
+    width = settings["warmup_width"] or settings["width"] or 512
+    height = settings["warmup_height"] or settings["height"] or 512
+    image = Image.new("RGB", (width, height), (128, 128, 128))
+    inputs = {
+        "image": [image],
+        "prompt": "warmup session",
+        "generator": torch_module.Generator(
+            device=_resolve_generator_device(torch_module, settings),
+        ).manual_seed(settings["seed"]),
+        "true_cfg_scale": settings["true_cfg_scale"],
+        "guidance_scale": settings["guidance_scale"],
+        "negative_prompt": settings["negative_prompt"],
+        "num_inference_steps": settings["warmup_steps"],
+        "num_images_per_prompt": 1,
+    }
+    if settings["warmup_height"] is not None or settings["height"] is not None:
+        inputs["height"] = height
+    if settings["warmup_width"] is not None or settings["width"] is not None:
+        inputs["width"] = width
+    return inputs
+
+
+def _apply_post_load_optimizations(torch_module: Any, pipe: Any, settings: dict[str, Any]) -> None:
+    if settings["enable_attention_slicing"]:
+        pipe.enable_attention_slicing()
+    if settings["enable_torch_compile"]:
+        _apply_torch_compile(torch_module, pipe)
+    if settings["enable_warmup"]:
+        with torch_module.inference_mode():
+            pipe(**_build_warmup_inputs(torch_module, settings))
 
 
 @lru_cache(maxsize=1)
@@ -198,9 +251,7 @@ def load_pipeline():
             if settings["fuse_lora"]:
                 pipe.fuse_lora()
 
-        if settings["enable_attention_slicing"]:
-            pipe.enable_attention_slicing()
-
+        _apply_post_load_optimizations(torch, pipe, settings)
         pipe.set_progress_bar_config(disable=None)
         return pipe
 
@@ -247,11 +298,23 @@ def load_pipeline():
         if settings["fuse_lora"]:
             pipe.fuse_lora()
 
-    if settings["enable_attention_slicing"] or device_map:
-        pipe.enable_attention_slicing()
+    _apply_post_load_optimizations(torch, pipe, settings)
 
     pipe.set_progress_bar_config(disable=None)
     return pipe
+
+
+def unload_pipeline() -> None:
+    """Clear the cached FireRed pipeline and release CUDA cache when possible."""
+
+    load_pipeline.cache_clear()
+    gc.collect()
+    try:
+        torch = importlib.import_module("torch")
+    except Exception:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def edit_images(*, images: list[Image.Image], instruction: str) -> Image.Image:
@@ -314,6 +377,11 @@ def backend_config_snapshot() -> dict[str, Any]:
         "cpu_max_memory": settings["cpu_max_memory"],
         "generator_device": settings["generator_device"],
         "enable_attention_slicing": settings["enable_attention_slicing"],
+        "enable_torch_compile": settings["enable_torch_compile"],
+        "enable_warmup": settings["enable_warmup"],
+        "warmup_steps": settings["warmup_steps"],
+        "warmup_height": settings["warmup_height"],
+        "warmup_width": settings["warmup_width"],
         "lora_path": settings["lora_path"],
         "lora_weight_name": settings["lora_weight_name"],
         "lora_adapter_name": settings["lora_adapter_name"],
@@ -333,4 +401,5 @@ __all__ = [
     "backend_config_snapshot",
     "edit_images",
     "load_pipeline",
+    "unload_pipeline",
 ]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Annotated
 
@@ -7,7 +8,7 @@ import numpy as np
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from agent import agent, create_agent
+from agent import agent, create_agent, main as agent_main
 from agents import EvaluatorAgent, ExecuteAgent, PlanAgent
 from llm import (
     encode_image_path_to_data_url,
@@ -1044,6 +1045,150 @@ def test_agent_entrypoint_exports_compiled_graph() -> None:
     compiled = create_agent()
     assert type(compiled).__name__ == "CompiledStateGraph"
     assert type(agent).__name__ == "CompiledStateGraph"
+
+
+def test_agent_cli_help_returns_success(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        agent_main(["--help"])
+
+    assert exc_info.value.code == 0
+    captured = capsys.readouterr()
+    assert "Run the fig edit agent runtime" in captured.out
+    assert "--images" in captured.out
+
+
+def test_agent_cli_runs_rule_based_fallback(mocker, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setenv("AGENT_LOG_ENABLED", "false")
+    monkeypatch.setenv("AGENT_LOG_CONSOLE", "false")
+    unload_mock = mocker.patch("agent.unload_pipeline")
+
+    exit_code = agent_main(
+        [
+            "--no-use-llm",
+            "--stop-after-first-edit",
+            "--session-id",
+            "agent-cli-test",
+            "--images",
+            "examples/fig1.jpg",
+            "--instruction",
+            "Keep the image unchanged.",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    summary = json.loads(captured.out)
+    assert exit_code == 0
+    assert summary["stop_reason"] == "first_edit_candidate"
+    assert summary["final_artifact"]["kind"] == "image"
+    assert summary["operations"][-1]["tool_name"] == "edit"
+    unload_mock.assert_called_once_with()
+
+
+def test_firered_backend_optimization_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vision_backends.firered_edit_backend import backend_config_snapshot
+
+    monkeypatch.delenv("FIRERED_ENABLE_ATTENTION_SLICING", raising=False)
+    monkeypatch.delenv("FIRERED_ENABLE_TORCH_COMPILE", raising=False)
+    monkeypatch.delenv("FIRERED_ENABLE_WARMUP", raising=False)
+    monkeypatch.delenv("FIRERED_WARMUP_STEPS", raising=False)
+
+    snapshot = backend_config_snapshot()
+
+    assert snapshot["enable_attention_slicing"] is True
+    assert snapshot["enable_torch_compile"] is True
+    assert snapshot["enable_warmup"] is True
+    assert snapshot["warmup_steps"] == 4
+
+
+def test_firered_post_load_optimizations_apply_once_per_cached_load(mocker) -> None:
+    from vision_backends import firered_edit_backend as backend
+
+    class FakeTorch:
+        class inference_mode:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class Generator:
+            def __init__(self, device):
+                self.device = device
+
+            def manual_seed(self, seed):
+                self.seed = seed
+                return self
+
+        class cuda:
+            @staticmethod
+            def is_available():
+                return False
+
+        @staticmethod
+        def compile(module, mode=None):
+            module.compiled_mode = mode
+            return module
+
+    class FakeTransformer:
+        def compile_repeated_blocks(self, mode, dynamic):
+            self.compile_args = {"mode": mode, "dynamic": dynamic}
+
+    class FakePipe:
+        def __init__(self):
+            self.transformer = FakeTransformer()
+            self.vae = type("FakeVAE", (), {})()
+            self.calls = []
+            self.slicing_enabled = False
+
+        def enable_attention_slicing(self):
+            self.slicing_enabled = True
+
+        def __call__(self, **inputs):
+            self.calls.append(inputs)
+            return object()
+
+    fake_pipe = FakePipe()
+    settings = backend.backend_config_snapshot()
+    settings.update(
+        {
+            "enable_attention_slicing": True,
+            "enable_torch_compile": True,
+            "enable_warmup": True,
+            "warmup_steps": 2,
+            "warmup_height": 64,
+            "warmup_width": 96,
+            "height": 128,
+            "width": 160,
+            "generator_device": "cpu",
+        }
+    )
+
+    backend._apply_post_load_optimizations(FakeTorch, fake_pipe, settings)
+
+    assert fake_pipe.slicing_enabled is True
+    assert fake_pipe.transformer.compile_args == {"mode": "default", "dynamic": True}
+    assert fake_pipe.vae.compiled_mode == "reduce-overhead"
+    assert len(fake_pipe.calls) == 1
+    assert fake_pipe.calls[0]["num_inference_steps"] == 2
+    assert fake_pipe.calls[0]["height"] == 64
+    assert fake_pipe.calls[0]["width"] == 96
+
+
+def test_firered_unload_pipeline_clears_cache(mocker) -> None:
+    from vision_backends import firered_edit_backend as backend
+
+    cache_clear = mocker.patch.object(backend.load_pipeline, "cache_clear")
+    collect = mocker.patch("vision_backends.firered_edit_backend.gc.collect")
+    fake_torch = mocker.Mock()
+    fake_torch.cuda.is_available.return_value = True
+    import_module = mocker.patch("vision_backends.firered_edit_backend.importlib.import_module", return_value=fake_torch)
+
+    backend.unload_pipeline()
+
+    cache_clear.assert_called_once_with()
+    collect.assert_called_once_with()
+    import_module.assert_called_once_with("torch")
+    fake_torch.cuda.empty_cache.assert_called_once_with()
 
 
 def test_load_llm_config_reads_environment(monkeypatch: pytest.MonkeyPatch) -> None:
