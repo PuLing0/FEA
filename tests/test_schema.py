@@ -3715,3 +3715,64 @@ def test_plan_agent_replan_prompt_includes_available_artifact_summaries(mocker) 
     assert "已保留的人物主体候选图" in captured["user_prompt"]
     assert result["plans"]["plan_002"].task_ids == ["task_001", "task_003"]
     assert result["tasks"]["task_003"].input_artifact_ids == []
+
+
+def test_runtime_run_logger_writes_jsonl(tmp_path, monkeypatch, capsys) -> None:
+    import json
+
+    monkeypatch.setenv("AGENT_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("AGENT_LOG_ENABLED", "true")
+    monkeypatch.setenv("AGENT_LOG_CONSOLE", "true")
+
+    graph = build_runtime_graph(stop_after_plan=True)
+    result = graph.invoke(
+        {
+            "input": {
+                "session_id": "log-smoke",
+                "image_uri": "examples/fig1.jpg",
+                "image_uris": ["examples/fig1.jpg"],
+                "instruction_text": "记录一次日志",
+                "desired_decision_route": "pass",
+                "use_llm": False,
+            }
+        }
+    )
+
+    captured = capsys.readouterr()
+    assert "[agent:" in captured.out
+    assert "run_start" in captured.out
+    assert result["run_id"]
+    assert result["run_log_uri"] is not None
+
+    log_path = Path(result["run_log_uri"])
+    assert log_path.is_file()
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert records[0]["event"] == "run_start"
+    assert any(record["event"] == "node_start" and record["payload"]["node"] == "plan" for record in records)
+    assert any(record["event"] == "plan_created" for record in records)
+    assert all(record["run_id"] == result["run_id"] for record in records)
+
+
+def test_runtime_run_logger_can_disable_file_and_console(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("AGENT_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("AGENT_LOG_ENABLED", "false")
+    monkeypatch.setenv("AGENT_LOG_CONSOLE", "false")
+
+    result = build_runtime_graph(stop_after_plan=True).invoke(
+        {
+            "input": {
+                "session_id": "log-disabled",
+                "image_uri": "examples/fig1.jpg",
+                "image_uris": ["examples/fig1.jpg"],
+                "instruction_text": "不要写日志",
+                "desired_decision_route": "pass",
+                "use_llm": False,
+            }
+        }
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert result["run_id"]
+    assert result["run_log_uri"] is None
+    assert list(tmp_path.iterdir()) == []

@@ -188,6 +188,8 @@ def main() -> int:
     decision = result.get("decision")
     final_artifact_id = session.final_result_id or _find_latest_edit_output_id(result) or _latest_image_artifact_id(result)
     summary = {
+        "run_id": result.get("run_id"),
+        "run_log_uri": result.get("run_log_uri"),
         "stop_reason": stop_reason,
         "session_phase": _enum_value(session.phase),
         "current_plan_id": session.current_plan_id,
