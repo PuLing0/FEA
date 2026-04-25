@@ -4041,3 +4041,37 @@ def test_runtime_run_logger_can_disable_file_and_console(tmp_path, monkeypatch, 
     assert result["run_id"]
     assert result["run_log_uri"] is None
     assert list(tmp_path.iterdir()) == []
+
+
+def test_prompt_module_builds_plan_prompt() -> None:
+    from runtime.prompts import PLAN_SYSTEM_PROMPT, build_plan_user_prompt
+
+    prompt = build_plan_user_prompt(
+        instruction_text="把人物放到背景里",
+        replan_context="Replan mode: split_task\n",
+        retained_prefix_plan="Retained prefix task ids: ['task_001']\n",
+        available_artifacts="Available artifacts for planning:\n- art_image_001\n",
+        image_artifact_ids=["art_img_input_001"],
+        understanding_summaries=[{"summary": "人物参考图"}],
+    )
+
+    assert "planning agent" in PLAN_SYSTEM_PROMPT
+    assert "Instruction: 把人物放到背景里" in prompt
+    assert "Available artifacts for planning" in prompt
+    assert "Do not invent future artifact ids" in prompt
+
+
+def test_prompt_module_builds_evaluate_prompt_with_rubric() -> None:
+    from runtime.prompts import EVALUATE_SCORE_RUBRIC, build_evaluate_user_prompt
+
+    prompt = build_evaluate_user_prompt(
+        reference_text="Image 1 is reference. Image 2 is candidate.",
+        input_refs=["art_img_input_001"],
+        candidate_ref="art_image_001",
+        instruction="保持人物身份",
+        checks=["身份一致"],
+    )
+
+    assert EVALUATE_SCORE_RUBRIC in prompt
+    assert "Candidate ref: art_image_001" in prompt
+    assert "Set is_satisfied=true" in prompt

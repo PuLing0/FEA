@@ -9,6 +9,7 @@ from typing import Any
 from llm import invoke_structured_multimodal_llm
 from PIL import Image, ImageDraw, ImageFont
 from runtime.instruction_resolver import resolve_active_instruction_text
+from runtime.prompts import EVALUATE_SCORE_RUBRIC, EVALUATE_SYSTEM_PROMPT, build_evaluate_user_prompt
 from schema import (
     ArtifactKind,
     EvaluateArgs,
@@ -28,22 +29,8 @@ PASS_MIN_SUBSCORE = 4
 PASS_WEIGHTED_SCORE = 3.5
 MAX_NEEDS_REVISION_COUNT = 3
 
-SCORE_RUBRIC = """
-All score dimensions use this 0-5 scale:
-0: Not applicable or impossible to judge from the provided images.
-1: Severe failure. The dimension is essentially wrong and should trigger replan.
-2: Major issue. The result is mostly unsatisfactory for this dimension.
-3: Partial success. The core idea is visible, but important problems remain.
-4: Good. Minor issues remain, but this dimension is mostly successful.
-5: Excellent. This dimension is fully satisfied with no meaningful issue.
+SCORE_RUBRIC = EVALUATE_SCORE_RUBRIC
 
-Dimensions:
-- instruction_success: Whether the candidate fulfills the final edit instruction.
-- reference_consistency: Whether the candidate uses the task input/reference images correctly.
-- overediting: Whether the candidate avoids changing content that should be preserved.
-- naturalness: Whether lighting, perspective, scale, composition, and blending look natural.
-- artifacts: Whether the image avoids distortions, broken anatomy, blurred faces, watermarks, damaged edges, or texture artifacts.
-""".strip()
 
 
 class EvaluateTool:
@@ -200,20 +187,14 @@ class EvaluateTool:
             else "Only one image is provided: the candidate edited result."
         )
         return invoke_structured_multimodal_llm(
-            system_prompt=(
-                "You are a strict image-editing evaluator. Return only structured output. "
-                "Judge both whether the edit is satisfactory and the 0-5 score dimensions. "
-                "If the result needs more work, provide concrete issues and a refined edit prompt."
-            ),
-            user_prompt=(
-                f"{reference_text}\n"
-                f"Task input refs: {input_refs}\n"
-                f"Candidate ref: {candidate_ref}\n"
-                f"Final edit instruction: {instruction}\n"
-                f"Acceptance checks: {checks}\n\n"
-                f"Scoring rubric:\n{SCORE_RUBRIC}\n\n"
-                "Set is_satisfied=true only when the candidate is ready to pass without further editing. "
-                "When is_satisfied=false, explain the main issues and provide new_rewritten_prompt."
+            system_prompt=EVALUATE_SYSTEM_PROMPT,
+            user_prompt=build_evaluate_user_prompt(
+                reference_text=reference_text,
+                input_refs=input_refs,
+                candidate_ref=candidate_ref,
+                instruction=instruction,
+                checks=checks,
+                score_rubric=SCORE_RUBRIC,
             ),
             image_paths=image_paths,
             output_schema=EvaluateLLMOutput,

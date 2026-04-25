@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from llm import invoke_structured_llm, load_llm_config
+from runtime.prompts import PLAN_SYSTEM_PROMPT, build_plan_user_prompt
 from runtime.scheduler import select_next_runnable_task
 from runtime.state import RuntimeState
 from schema import (
@@ -279,30 +280,14 @@ class PlanAgent:
                 f"{self._render_replan_artifact_catalog(state)}\n"
             )
         return invoke_structured_llm(
-            system_prompt=(
-                "You are a planning agent for image editing. "
-                "Return structured plan output only. "
-                "plan_instruction must be a single concise sentence. "
-                "tasks must be a non-empty array. "
-                "When replan context is present, keep retained prefix tasks fixed and generate only new suffix tasks. "
-                "Do not put task JSON into plan_instruction."
-            ),
-            user_prompt=(
-                f"Instruction: {state['input']['instruction_text']}\n"
-                f"{replan_context}"
-                f"{retained_prefix_plan}"
-                f"{available_artifacts}"
-                f"Image artifact ids: {state['session'].artifact_index.by_type.get('image', [])}\n"
-                f"Understanding summaries: {understanding_summaries}\n"
-                "Each task must include: id, type, instruction, input_artifact_ids, "
-                "depends_on, acceptance_criteria. "
-                "New tasks must use only the provided available new task ids when present. "
-                "depends_on may reference retained prefix task ids and newly generated task ids. "
-                "Do not regenerate retained prefix tasks. "
-                "For replan tasks, Available artifacts for planning are context only. "
-                "Default each new replan task's input_artifact_ids to an empty array, because runtime will select real image inputs at task start. "
-                "Only include input_artifact_ids when the task absolutely requires fixed static images from Available artifacts for planning. "
-                "Do not invent future artifact ids in input_artifact_ids; use depends_on for future task outputs."
+            system_prompt=PLAN_SYSTEM_PROMPT,
+            user_prompt=build_plan_user_prompt(
+                instruction_text=state["input"]["instruction_text"],
+                replan_context=replan_context,
+                retained_prefix_plan=retained_prefix_plan,
+                available_artifacts=available_artifacts,
+                image_artifact_ids=state["session"].artifact_index.by_type.get("image", []),
+                understanding_summaries=understanding_summaries,
             ),
             output_schema=PlanLLMOutput,
         )

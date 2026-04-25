@@ -12,6 +12,17 @@ from llm import (
     load_llm_config,
 )
 from runtime.input_selector import prepare_task_inputs
+from runtime.prompts import (
+    EXECUTE_COLLAGE_LAYOUT_GOAL,
+    EXECUTE_GROUNDING_QUERY,
+    EXECUTE_OBSERVE_SYSTEM_PROMPT,
+    EXECUTE_STRATEGY_SYSTEM_PROMPT,
+    EXECUTE_UNDERSTAND_QUESTION,
+    EXECUTION_HISTORY_SUMMARY_SYSTEM_PROMPT,
+    build_execute_observe_user_prompt,
+    build_execute_strategy_user_prompt,
+    build_execution_history_summary_user_prompt,
+)
 from runtime.state import RuntimeState
 from schema import (
     ArtifactKind,
@@ -243,39 +254,24 @@ class ExecuteAgent:
             f"- {artifact.id} | kind={artifact.kind} | payload={artifact.payload} | source_ids={artifact.source_ids}"
             for artifact in execution.artifacts
         ]
-        prompt = (
-            f"Task type: {task.type}\n"
-            f"Task instruction: {task.instruction}\n"
-            f"Acceptance criteria: {task.acceptance_criteria}\n"
-            f"Current active instruction: {self._resolve_active_instruction_text_from_artifacts(state, task_id)}\n"
-            f"Retry context: {state['session'].task_states[task_id].retry_context_text}\n"
-            f"Tool name: {selected_tool.value}\n"
-            f"Tool args: {execution.invocation.args}\n"
-            f"Source artifacts:\n{chr(10).join(source_lines) or '(none)'}\n"
-            f"New artifacts:\n{chr(10).join(new_artifact_lines) or '(none)'}\n"
-            "Return outcome as either 'continue' or 'success'. "
-            "Choose success only if the current tool result is enough to stop the execute checkpoint and hand off to evaluator. "
-            "For each new artifact, write a concise summary explaining what it is and what role it plays in the current task."
+        prompt = build_execute_observe_user_prompt(
+            task=task,
+            active_instruction=self._resolve_active_instruction_text_from_artifacts(state, task_id),
+            retry_context=state["session"].task_states[task_id].retry_context_text,
+            selected_tool=selected_tool.value,
+            tool_args=execution.invocation.args,
+            source_lines=source_lines,
+            new_artifact_lines=new_artifact_lines,
         )
         if image_paths:
             return invoke_structured_multimodal_llm(
-                system_prompt=(
-                    "You are the observe step of an image-editing execute agent. "
-                    "Decide whether the current loop should continue or whether the current results are good enough to stop the execute checkpoint with success. "
-                    "Also generate one short semantic summary for each newly produced artifact. "
-                    "Return only structured output."
-                ),
+                system_prompt=EXECUTE_OBSERVE_SYSTEM_PROMPT,
                 user_prompt=prompt,
                 image_paths=image_paths,
                 output_schema=ObserveLLMOutput,
             )
         return invoke_structured_llm(
-            system_prompt=(
-                "You are the observe step of an image-editing execute agent. "
-                "Decide whether the current loop should continue or whether the current results are good enough to stop the execute checkpoint with success. "
-                "Also generate one short semantic summary for each newly produced artifact. "
-                "Return only structured output."
-            ),
+            system_prompt=EXECUTE_OBSERVE_SYSTEM_PROMPT,
             user_prompt=prompt,
             output_schema=ObserveLLMOutput,
         )
@@ -618,7 +614,7 @@ class ExecuteAgent:
                 loop_index=loop_index,
                 args=GroundingArgs(
                     image_ref=runtime_ctx["base_image_ref"],
-                    grounding_query="Locate the primary edit region relevant to the current task.",
+                    grounding_query=EXECUTE_GROUNDING_QUERY,
                     top_k=1,
                 ),
             )
@@ -658,7 +654,7 @@ class ExecuteAgent:
                 loop_index=loop_index,
                 args=UnderstandArgs(
                     image_ref=image_ref,
-                    question="understand the current preview for this step and summarize what it shows",
+                    question=EXECUTE_UNDERSTAND_QUESTION,
                 ),
             )
 
@@ -676,7 +672,7 @@ class ExecuteAgent:
                 loop_index=loop_index,
                 args=CollageArgs(
                     block_artifact_ids=block_artifact_ids,
-                    layout_goal="organize multiple references into one clear reference board for the next edit",
+                    layout_goal=EXECUTE_COLLAGE_LAYOUT_GOAL,
                 ),
             )
 
@@ -798,33 +794,16 @@ class ExecuteAgent:
     ) -> ExecuteLLMOutput:
         resolved_ids = state["session"].task_states[task.id].resolved_input_artifact_ids
         return invoke_structured_llm(
-            system_prompt=(
-                "You are an execution planner for an image-editing agent. "
-                "Choose only the next single tool for the next act. "
-                "Available tools: prompt_reconstruct, grounding, segment, crop, understand, collage, edit. "
-                "Tool guidance: use grounding when you need a coarse location or bbox-style candidate region before a more precise local step; "
-                "use segment when you need to isolate or localize a target region; "
-                "use crop when you need a focused preview of a segmented area; "
-                "use understand when you need to inspect what an image or preview actually contains; "
-                "use collage when multiple reference images should first be organized into one unified reference image; "
-                "use prompt_reconstruct when the current prompt is vague, underspecified, or uses ambiguous image references, "
-                "especially before an edit if a stronger prompt would help; "
-                "use edit when you are ready to apply the actual image transformation. "
-                "These are options, not a fixed workflow. Do not follow a rigid path if the current state suggests otherwise. "
-                "Do not schedule multiple tools. "
-                "If there are multiple image candidates, choose the most appropriate base_image_artifact_id from the resolved input artifact ids."
-            ),
-            user_prompt=(
-                f"Task type: {task.type}\n"
-                f"Task instruction: {task.instruction}\n"
-                f"User instruction: {state['input']['instruction_text']}\n"
-                f"Resolved input artifact ids: {resolved_ids}\n"
-                f"Resolved image candidates:\n{self._build_resolved_image_summaries(state, task.id, resolved_ids)}\n"
-                f"Retry context: {state['session'].task_states[task.id].retry_context_text}\n"
-                f"Current active instruction: {self._resolve_active_instruction_text_from_artifacts(state, task.id)}\n"
-                f"Task artifact summary:\n{self._build_task_artifact_context(state, task.id)}\n"
-                f"Latest candidate refs: {state['session'].task_states[task.id].latest_artifact_ids}\n"
-                "Return reasoning, selected_tools, and base_image_artifact_id. selected_tools should contain exactly one next tool name."
+            system_prompt=EXECUTE_STRATEGY_SYSTEM_PROMPT,
+            user_prompt=build_execute_strategy_user_prompt(
+                task=task,
+                user_instruction=state["input"]["instruction_text"],
+                resolved_ids=resolved_ids,
+                resolved_image_summaries=self._build_resolved_image_summaries(state, task.id, resolved_ids),
+                retry_context=state["session"].task_states[task.id].retry_context_text,
+                active_instruction=self._resolve_active_instruction_text_from_artifacts(state, task.id),
+                task_artifact_context=self._build_task_artifact_context(state, task.id),
+                latest_candidate_refs=state["session"].task_states[task.id].latest_artifact_ids,
             ),
             output_schema=ExecuteLLMOutput,
         )
@@ -1006,14 +985,10 @@ class ExecuteAgent:
             for record in earlier
         )
         response = invoke_llm(
-            system_prompt=(
-                "You summarize earlier execution history for an image-editing task. "
-                "Summarize only confirmed facts from the provided records. "
-                "Do not invent new requirements. Return one concise paragraph only."
-            ),
-            user_prompt=(
-                f"Task instruction: {state['tasks'][task_id].instruction}\n"
-                f"Earlier thinking-act-observe rounds:\n{raw}"
+            system_prompt=EXECUTION_HISTORY_SUMMARY_SYSTEM_PROMPT,
+            user_prompt=build_execution_history_summary_user_prompt(
+                task_instruction=state["tasks"][task_id].instruction,
+                raw_records=raw,
             ),
         )
         return str(response.content).strip()

@@ -5,6 +5,15 @@ from __future__ import annotations
 from typing import Any
 
 from llm import invoke_llm, invoke_structured_llm, load_llm_config
+from runtime.prompts import (
+    CANDIDATE_UNDERSTAND_QUESTION_TEMPLATE,
+    INPUT_SELECTOR_SYSTEM_PROMPT,
+    INPUT_THINKING_SYSTEM_PROMPT,
+    INPUT_VALIDATION_SYSTEM_PROMPT,
+    build_input_selector_user_prompt,
+    build_input_thinking_user_prompt,
+    build_input_validation_user_prompt,
+)
 from runtime.state import RuntimeState
 from schema import ArtifactKind, StrictModel, ToolName, UnderstandArgs
 from tools.registry import build_default_tool_registry
@@ -120,7 +129,7 @@ def ensure_understanding_for_images(state: RuntimeState, image_ids: list[str], *
             loop_index=0,
             args=UnderstandArgs(
                 image_ref=image_id,
-                question=f"understand candidate image {image_id} for task execution",
+                question=CANDIDATE_UNDERSTAND_QUESTION_TEMPLATE.format(image_id=image_id),
             ),
         )
         state["operations"].append(understand_execution.invocation)
@@ -167,17 +176,10 @@ def build_input_thinking(state: RuntimeState, task_id: str, candidates_text: str
     task = state["tasks"][task_id]
     if _use_llm(state):
         response = invoke_llm(
-            system_prompt=(
-                "You are preparing inputs for an image-editing task. "
-                "Think only about what categories of images are needed before execution starts."
-            ),
-            user_prompt=(
-                f"Task type: {task.type}\n"
-                f"Task instruction: {task.instruction}\n"
-                f"Task depends_on: {task.depends_on}\n"
-                f"Static task inputs: {task.input_artifact_ids}\n"
-                f"Candidate images:\n{candidates_text}\n"
-                "Briefly explain what image inputs are needed for this task before execution starts."
+            system_prompt=INPUT_THINKING_SYSTEM_PROMPT,
+            user_prompt=build_input_thinking_user_prompt(
+                task=task,
+                candidates_text=candidates_text,
             ),
         )
         return str(response.content)
@@ -202,17 +204,11 @@ def select_input_artifacts(
 
     if _use_llm(state):
         return invoke_structured_llm(
-            system_prompt=(
-                "You are a stateless image input selector. "
-                "Given candidate image descriptions and an input-thinking note, choose only the images needed for the task."
-            ),
-            user_prompt=(
-                f"Task type: {task.type}\n"
-                f"Task instruction: {task.instruction}\n"
-                f"Task depends_on: {task.depends_on}\n"
-                f"Input thinking:\n{thinking}\n"
-                f"Candidate images:\n{candidates_text}\n"
-                "Return only selected_artifact_ids."
+            system_prompt=INPUT_SELECTOR_SYSTEM_PROMPT,
+            user_prompt=build_input_selector_user_prompt(
+                task=task,
+                thinking=thinking,
+                candidates_text=candidates_text,
             ),
             output_schema=TaskInputSelectionOutput,
         )
@@ -248,17 +244,12 @@ def validate_selected_inputs(
 
     if _use_llm(state):
         response = invoke_llm(
-            system_prompt=(
-                "You validate selected task input images before execution starts. "
-                "Confirm whether the selected set is sufficient and coherent."
-            ),
-            user_prompt=(
-                f"Task type: {task.type}\n"
-                f"Task instruction: {task.instruction}\n"
-                f"Selected artifact ids: {selection.selected_artifact_ids}\n"
-                f"Input thinking: {state['session'].task_states[task_id].input_selection_reasoning}\n"
-                f"Candidate images:\n{candidates_text}\n"
-                "Briefly validate whether the selected image set is appropriate."
+            system_prompt=INPUT_VALIDATION_SYSTEM_PROMPT,
+            user_prompt=build_input_validation_user_prompt(
+                task=task,
+                selected_artifact_ids=selection.selected_artifact_ids,
+                input_thinking=state["session"].task_states[task_id].input_selection_reasoning,
+                candidates_text=candidates_text,
             ),
         )
         return str(response.content)

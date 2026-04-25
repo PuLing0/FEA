@@ -6,6 +6,7 @@ from pathlib import Path
 
 from llm import invoke_multimodal_llm
 from runtime.instruction_resolver import resolve_active_instruction_text
+from runtime.prompts import UNDERSTAND_SYSTEM_PROMPT, build_understand_user_prompt
 from schema import ArtifactKind, ToolInvocationRecord, ToolName, UnderstandArgs, UnderstandingArtifact
 
 from .base import ToolExecutionResult
@@ -47,14 +48,10 @@ class UnderstandTool:
         )
         image_path = self._resolve_local_image_path(state, args.image_ref)
         response = invoke_multimodal_llm(
-            system_prompt=(
-                "You understand an input image for an image-editing agent. "
-                "Return one concise factual summary focused on what is visible and relevant to the task."
-            ),
-            user_prompt=(
-                f"Task instruction: {task_instruction}\n"
-                f"Question: {args.question or 'Summarize the visible contents relevant to the task.'}\n"
-                "Return only the summary."
+            system_prompt=UNDERSTAND_SYSTEM_PROMPT,
+            user_prompt=build_understand_user_prompt(
+                task_instruction=task_instruction,
+                question=args.question,
             ),
             image_paths=[image_path],
         )

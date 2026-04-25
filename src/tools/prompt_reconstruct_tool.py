@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from llm import invoke_llm
+from runtime.prompts import PROMPT_RECONSTRUCT_SYSTEM_PROMPT
 from schema import (
     ArtifactKind,
     InstructionArtifact,
@@ -28,11 +29,7 @@ class PromptReconstructTool:
     ) -> ToolExecutionResult:
         context_text = state["_prompt_reconstruct_context"]
         response = invoke_llm(
-            system_prompt=(
-                "You rewrite execution prompts for an image editing task. "
-                "Make the instruction clearer, more specific, and replace ambiguous image references "
-                "with explicit artifact ids when available. Output only the final rewritten instruction text."
-            ),
+            system_prompt=PROMPT_RECONSTRUCT_SYSTEM_PROMPT,
             user_prompt=context_text,
         )
         instruction_text = str(response.content).strip()

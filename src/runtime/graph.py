@@ -19,6 +19,7 @@ from schema import (
     UnderstandingArtifact,
 )
 
+from .prompts import BOOTSTRAP_UNDERSTAND_QUESTION_TEMPLATE
 from .run_logger import (
     create_run_logger,
     log_event,
@@ -120,7 +121,7 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
                     tool_name=ToolName.UNDERSTAND,
                     args={
                         "image_ref": image.id,
-                        "question": f"understand image slot {index} for the user request",
+                        "question": BOOTSTRAP_UNDERSTAND_QUESTION_TEMPLATE.format(index=index),
                     },
                     status="succeeded",
                     output_refs=[understanding.id],
@@ -142,7 +143,7 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
             loop_index=0,
             args=UnderstandArgs(
                 image_ref=image.id,
-                question=f"understand image slot {index} for the user request",
+                question=BOOTSTRAP_UNDERSTAND_QUESTION_TEMPLATE.format(index=index),
             ),
         )
         state["operations"].append(understand_execution.invocation)

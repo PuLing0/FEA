@@ -29,6 +29,7 @@ load_dotenv(REPO_ROOT / ".env")
 
 from agent import create_agent  # noqa: E402
 from llm import load_llm_config  # noqa: E402
+from runtime.prompts import REAL_AGENT_SMOKE_DEFAULT_INSTRUCTION  # noqa: E402
 from schema import ArtifactKind, SessionPhase, ToolName  # noqa: E402
 
 DEFAULT_IMAGES = [
@@ -37,10 +38,7 @@ DEFAULT_IMAGES = [
     REPO_ROOT / "examples" / "fig3.jpg",
     REPO_ROOT / "examples" / "fig4.jpg",
 ]
-DEFAULT_INSTRUCTION = (
-    "Generate a photo of this person wearing the provided top and skirt in the "
-    "provided background. Preserve the face identity and keep the result natural."
-)
+DEFAULT_INSTRUCTION = REAL_AGENT_SMOKE_DEFAULT_INSTRUCTION
 
 
 def _require_opt_in() -> None:

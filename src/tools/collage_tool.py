@@ -10,6 +10,7 @@ from PIL import Image
 from pydantic import Field, model_validator
 
 from runtime.instruction_resolver import resolve_active_instruction_text
+from runtime.prompts import COLLAGE_LAYOUT_SYSTEM_PROMPT, build_collage_layout_user_prompt
 from schema import (
     ArtifactKind,
     CollageArgs,
@@ -175,21 +176,14 @@ class CollageTool:
             for index, source_image in enumerate(source_images, start=1)
         )
         return invoke_structured_multimodal_llm(
-            system_prompt=(
-                "You are a layout planner for hard image collages. "
-                "Return only the structured layout. Use every provided artifact exactly once. "
-                "Do not invent artifact ids. Keep all layers fully inside the canvas."
-            ),
-            user_prompt=(
-                f"Task instruction: {task_instruction}\n"
-                f"Layout goal: {args.layout_goal}\n\n"
-                f"Source images:\n{source_context}\n\n"
-                "Create a clear collage reference image for a downstream image-editing model. "
-                "The collage is a hard composition of existing images, not a generative edit. "
-                f"Canvas must be <= {MAX_CANVAS_WIDTH}x{MAX_CANVAS_HEIGHT} and <= "
-                f"{MAX_CANVAS_PIXELS} pixels. "
-                "For each item, x/y are the top-left paste coordinates after resize/rotation, "
-                "width/height are the resized dimensions before rotation, and opacity is within [0, 1]."
+            system_prompt=COLLAGE_LAYOUT_SYSTEM_PROMPT,
+            user_prompt=build_collage_layout_user_prompt(
+                task_instruction=task_instruction,
+                layout_goal=args.layout_goal,
+                source_context=source_context,
+                max_canvas_width=MAX_CANVAS_WIDTH,
+                max_canvas_height=MAX_CANVAS_HEIGHT,
+                max_canvas_pixels=MAX_CANVAS_PIXELS,
             ),
             image_paths=[str(source_image.path) for source_image in source_images],
             output_schema=CollageLayoutResult,

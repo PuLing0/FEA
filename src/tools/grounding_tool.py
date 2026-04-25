@@ -8,6 +8,7 @@ from PIL import Image
 
 from llm import invoke_structured_multimodal_llm
 from runtime.instruction_resolver import resolve_active_instruction_text
+from runtime.prompts import GROUNDING_SYSTEM_PROMPT, build_grounding_user_prompt
 from schema import (
     ArtifactKind,
     GeometryArtifact,
@@ -103,19 +104,13 @@ class GroundingTool:
             width, height = image.size
 
         llm_output = invoke_structured_multimodal_llm(
-            system_prompt=(
-                "You are an image grounding assistant. "
-                "Given an image and a semantic grounding query, return up to the requested number of candidates. "
-                "Each candidate must include a short label and a bbox [x1, y1, x2, y2]. "
-                "You may optionally include score, positive_points, and negative_points. "
-                "Use bbox as the primary localization output. "
-                "Do not return any prose outside the structured schema."
-            ),
-            user_prompt=(
-                f"Grounding query: {args.grounding_query}\n"
-                f"Task context: {task_instruction}\n"
-                f"Image size: {width} x {height}\n"
-                f"Return at most {top_k} candidate(s)."
+            system_prompt=GROUNDING_SYSTEM_PROMPT,
+            user_prompt=build_grounding_user_prompt(
+                grounding_query=args.grounding_query,
+                task_instruction=task_instruction,
+                width=width,
+                height=height,
+                top_k=top_k,
             ),
             image_paths=[image_path],
             output_schema=GroundingLLMOutput,
