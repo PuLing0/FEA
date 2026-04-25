@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import os
 from pathlib import Path
 
@@ -21,6 +22,8 @@ from vision_backends.firered_edit_backend import (
     DEFAULT_LORA_PATH,
     DEFAULT_LORA_WEIGHT_NAME,
     DEFAULT_MODEL_PATH,
+    _build_backend_settings,
+    _maybe_configure_cuda_visible_devices,
     load_pipeline,
 )
 
@@ -36,13 +39,43 @@ EDIT_INSTRUCTION = (
 )
 
 
+def _clear_firered_runtime_cache() -> None:
+    _maybe_configure_cuda_visible_devices(_build_backend_settings())
+    load_pipeline.cache_clear()
+    gc.collect()
+    try:
+        import torch
+    except Exception:
+        return
+    if not torch.cuda.is_available():
+        return
+    for index in range(torch.cuda.device_count()):
+        with torch.cuda.device(index):
+            torch.cuda.empty_cache()
+
+
+@pytest.fixture(autouse=True)
+def clear_firered_runtime_between_tests():
+    _clear_firered_runtime_cache()
+    yield
+    _clear_firered_runtime_cache()
+
+
 def _require_real_firered_assets() -> Path:
+    _maybe_configure_cuda_visible_devices(_build_backend_settings())
+
     import torch
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the real FireRed edit tool test.")
 
     model_path = Path(os.getenv("FIRERED_MODEL_PATH", DEFAULT_MODEL_PATH))
+    disable_lora = os.getenv("FIRERED_DISABLE_LORA", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     lora_path = Path(os.getenv("FIRERED_LORA_PATH", DEFAULT_LORA_PATH))
     lora_weight_name = os.getenv("FIRERED_LORA_WEIGHT_NAME", DEFAULT_LORA_WEIGHT_NAME)
     image_path = Path(os.getenv("FIRERED_EDIT_TEST_IMAGE", str(DEFAULT_EXAMPLE_IMAGE)))
@@ -51,10 +84,11 @@ def _require_real_firered_assets() -> Path:
         pytest.skip(f"FireRed model path not found: {model_path}")
     if not (model_path / "model_index.json").is_file():
         pytest.skip(f"FireRed model_index.json not found under: {model_path}")
-    if not lora_path.is_dir():
-        pytest.skip(f"FireRed LoRA path not found: {lora_path}")
-    if not (lora_path / lora_weight_name).is_file():
-        pytest.skip(f"FireRed LoRA weight not found: {lora_path / lora_weight_name}")
+    if not disable_lora:
+        if not lora_path.is_dir():
+            pytest.skip(f"FireRed LoRA path not found: {lora_path}")
+        if not (lora_path / lora_weight_name).is_file():
+            pytest.skip(f"FireRed LoRA weight not found: {lora_path / lora_weight_name}")
     if not image_path.is_file():
         pytest.skip(f"FireRed edit test image not found: {image_path}")
     return image_path
@@ -111,6 +145,7 @@ def test_edit_tool_runs_with_real_firered_backend(monkeypatch) -> None:
     monkeypatch.setenv("FIRERED_WIDTH", str(OUTPUT_WIDTH))
     monkeypatch.setenv("FIRERED_NUM_INFERENCE_STEPS", "8")
     monkeypatch.setenv("FIRERED_FUSE_LORA", "false")
+    monkeypatch.setenv("FIRERED_DISABLE_LORA", "true")
     load_pipeline.cache_clear()
 
     execution = EditTool().run(
@@ -147,3 +182,40 @@ def test_edit_tool_runs_with_real_firered_backend(monkeypatch) -> None:
     with Image.open(artifact.uri) as output_image:
         assert output_image.mode == "RGB"
         assert output_image.size == (OUTPUT_WIDTH, OUTPUT_HEIGHT)
+
+
+def test_edit_tool_runs_with_real_firered_lora_backend(monkeypatch) -> None:
+    if os.getenv("RUN_REAL_VISION_TESTS") != "1":
+        pytest.skip("set RUN_REAL_VISION_TESTS=1 to run real vision backend integration tests")
+
+    monkeypatch.setenv("FIRERED_DISABLE_LORA", "false")
+    image_path = _require_real_firered_assets()
+    monkeypatch.setenv("FIRERED_HEIGHT", "768")
+    monkeypatch.setenv("FIRERED_WIDTH", "352")
+    monkeypatch.setenv("FIRERED_NUM_INFERENCE_STEPS", "8")
+    monkeypatch.setenv("FIRERED_FUSE_LORA", "false")
+    load_pipeline.cache_clear()
+
+    execution = EditTool().run(
+        _build_edit_state(image_path),
+        task_id="task_firered_edit",
+        loop_index=2,
+        args=EditArgs(
+            instruction=EDIT_INSTRUCTION,
+            image_refs=["art_img_firered_input"],
+        ),
+    )
+
+    assert execution.invocation.status == "succeeded"
+    artifact = execution.artifacts[0]
+    assert artifact.payload["backend_name"] == "firered"
+    assert Path(artifact.uri).is_file()
+
+    snapshot = artifact.payload["backend_config_snapshot"]
+    assert snapshot["lora_path"] is not None
+    assert snapshot["lora_weight_name"] is not None
+    assert snapshot["fuse_lora"] is False
+
+    with Image.open(artifact.uri) as output_image:
+        assert output_image.mode == "RGB"
+        assert output_image.size == (352, 768)

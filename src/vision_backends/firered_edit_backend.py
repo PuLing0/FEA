@@ -69,6 +69,7 @@ def _get_float(name: str, default: float) -> float:
 
 
 def _build_backend_settings() -> dict[str, Any]:
+    disable_lora = _get_bool("FIRERED_DISABLE_LORA", False)
     return {
         "model_path": _get_setting("FIRERED_MODEL_PATH", DEFAULT_MODEL_PATH),
         "inference_mode": _get_setting("FIRERED_INFERENCE_MODE", "normal"),
@@ -79,8 +80,10 @@ def _build_backend_settings() -> dict[str, Any]:
         "cpu_max_memory": _get_setting("FIRERED_CPU_MAX_MEMORY", "128GiB"),
         "generator_device": _get_setting("FIRERED_GENERATOR_DEVICE", "auto"),
         "enable_attention_slicing": _get_bool("FIRERED_ENABLE_ATTENTION_SLICING", False),
-        "lora_path": _get_setting("FIRERED_LORA_PATH", DEFAULT_LORA_PATH),
-        "lora_weight_name": _get_setting(
+        "lora_path": None if disable_lora else _get_setting("FIRERED_LORA_PATH", DEFAULT_LORA_PATH),
+        "lora_weight_name": None
+        if disable_lora
+        else _get_setting(
             "FIRERED_LORA_WEIGHT_NAME",
             DEFAULT_LORA_WEIGHT_NAME,
         ),
