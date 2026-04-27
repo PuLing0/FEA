@@ -165,6 +165,9 @@ def build_manual_shard_plan(
     if len(forward_devices) >= 4:
         transformer_devices = forward_devices[:2]
         text_devices = forward_devices[2:4]
+    elif len(forward_devices) == 3:
+        transformer_devices = forward_devices[:2]
+        text_devices = forward_devices[2:]
     else:
         transformer_devices = list(forward_devices)
         text_devices = list(forward_devices)
@@ -223,7 +226,7 @@ def build_manual_shard_plan(
     vae_device = forward_devices[-1]
 
     return {
-        "strategy": "manual_grouped_component_shard" if len(forward_devices) >= 4 else "manual_visible_gpu_shard",
+        "strategy": "manual_grouped_component_shard" if len(forward_devices) >= 3 else "manual_visible_gpu_shard",
         "visible_gpu_ids": forward_devices,
         "transformer_devices": transformer_devices,
         "text_encoder_devices": text_devices,
