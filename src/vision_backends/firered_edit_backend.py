@@ -317,6 +317,12 @@ def unload_pipeline() -> None:
         torch.cuda.empty_cache()
 
 
+def is_pipeline_loaded() -> bool:
+    """Return whether the FireRed pipeline is currently cached in-process."""
+
+    return load_pipeline.cache_info().currsize > 0
+
+
 def edit_images(*, images: list[Image.Image], instruction: str) -> Image.Image:
     """Run one FireRed edit call and return a single edited image."""
 
@@ -400,6 +406,7 @@ __all__ = [
     "FireRedBackendError",
     "backend_config_snapshot",
     "edit_images",
+    "is_pipeline_loaded",
     "load_pipeline",
     "unload_pipeline",
 ]

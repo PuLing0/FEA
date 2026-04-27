@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
+import re
 
 import numpy as np
 from PIL import Image
@@ -13,6 +14,11 @@ from schema import ArtifactKind, MaskArtifact, SegmentArgs, ToolInvocationRecord
 from vision_backends.sam3_point_backend import (
     Sam3BackendError,
     predict_text_prompt_candidates as sam31_predict_text_prompt_candidates,
+)
+from vision_backends.remote_client import (
+    RemoteBackendError,
+    request_sam31_segment,
+    resolve_segment_backend,
 )
 
 from .base import ToolExecutionResult
@@ -31,6 +37,13 @@ class SegmentCandidate:
 
 class SegmentTool:
     name = ToolName.SEGMENT
+
+    _SEGMENT_PROMPT_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("person", ("person", "face", "woman", "man", "girl", "boy", "subject", "model", "identity")),
+        ("top", ("top", "shirt", "blouse", "jacket", "upper body", "upper-body")),
+        ("skirt", ("skirt", "dress", "lower body", "lower-body")),
+        ("background", ("background", "scene", "temple", "outdoor", "indoor", "location")),
+    )
 
     def _resolve_local_image_path(self, state, image_ref: str) -> str:
         artifact = state["artifacts"].get(image_ref)
@@ -76,6 +89,72 @@ class SegmentTool:
             )
             for index, item in enumerate(raw_candidates)
         ]
+
+    def _normalize_prompt_text(self, prompt: str) -> str:
+        return re.sub(r"\s+", " ", str(prompt).strip())
+
+    def _build_prompt_candidates(self, prompt: str) -> list[str]:
+        normalized_prompt = self._normalize_prompt_text(prompt)
+        if not normalized_prompt:
+            return []
+
+        candidates: list[str] = []
+
+        def add(candidate: str) -> None:
+            cleaned = self._normalize_prompt_text(candidate)
+            if cleaned and cleaned not in candidates:
+                candidates.append(cleaned)
+
+        if len(normalized_prompt.split()) <= 8 and len(normalized_prompt) <= 64:
+            add(normalized_prompt)
+
+        lowered = normalized_prompt.lower()
+        for canonical, keywords in self._SEGMENT_PROMPT_KEYWORDS:
+            if any(keyword in lowered for keyword in keywords):
+                add(canonical)
+
+        quoted_terms = re.findall(r"['\"]([^'\"]+)['\"]", normalized_prompt)
+        for term in quoted_terms:
+            if len(term.split()) <= 4:
+                add(term)
+
+        if not candidates:
+            add("person")
+            add("top")
+            add("skirt")
+            add("background")
+        return candidates
+
+    def _write_mask_file(self, *, mask: np.ndarray, output_path: str) -> str:
+        mask_uint8 = (np.asarray(mask, dtype=bool).astype(np.uint8)) * 255
+        Image.fromarray(mask_uint8).save(output_path)
+        return output_path
+
+    def _build_full_image_mask(self, *, image_path: str) -> np.ndarray:
+        with Image.open(Path(image_path)).convert("RGB") as image:
+            return np.ones((image.height, image.width), dtype=bool)
+
+    def _build_full_image_mask_result(
+        self,
+        *,
+        image_path: str,
+        mask_path: str,
+        prompt: str,
+    ) -> tuple[str, float, dict[str, float | str], str, str]:
+        self._write_mask_file(
+            mask=self._build_full_image_mask(image_path=image_path),
+            output_path=mask_path,
+        )
+        return (
+            mask_path,
+            0.0,
+            {
+                "final_score": 0.0,
+                "fallback_reason": "full_image_mask_after_segment_prompt_failures",
+            },
+            "fallback_full_image",
+            prompt,
+        )
 
     def _is_sam31_text_prompt_backend_available(self, *, backend_name: str | None) -> bool:
         resolved_backend = (backend_name or "sam31").strip().lower()
@@ -199,6 +278,19 @@ class SegmentTool:
         Image.fromarray(mask_uint8).save(output_path)
         return str(output_path)
 
+    def _build_mask_path(self, *, task_id: str, loop_index: int) -> str:
+        output_dir = Path("generated") / "segment"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return str(output_dir / f"{task_id}_{loop_index:03d}_mask.png")
+
+    def _is_retryable_prompt_failure(self, message: str) -> bool:
+        normalized = str(message).lower()
+        return (
+            "no acceptable mask candidate" in normalized
+            or "found no acceptable mask candidate" in normalized
+            or "text_prompt must be non-empty" in normalized
+        )
+
     def run(
         self,
         state,
@@ -208,44 +300,101 @@ class SegmentTool:
         args: SegmentArgs,
     ) -> ToolExecutionResult:
         image_path = self._resolve_local_image_path(state, args.image_ref)
-        image_array = np.asarray(Image.open(Path(image_path)).convert("RGB"), dtype=np.uint8)
         text_prompt = str(args.prompt).strip()
         if not text_prompt:
             raise ValueError("segment requires a non-empty prompt")
+        prompt_candidates = self._build_prompt_candidates(text_prompt)
+        if not prompt_candidates:
+            raise ValueError("segment requires at least one usable prompt candidate")
+        backend_name = resolve_segment_backend()
+        if backend_name == "remote":
+            requested_mask_path = self._build_mask_path(task_id=task_id, loop_index=loop_index)
+            remote_error_messages: list[str] = []
+            remote_result = None
+            for prompt_candidate in prompt_candidates:
+                try:
+                    remote_result = request_sam31_segment(
+                        image_path=image_path,
+                        prompt=prompt_candidate,
+                        output_path=requested_mask_path,
+                    )
+                    break
+                except RemoteBackendError as exc:
+                    remote_error_messages.append(str(exc))
+                    if not self._is_retryable_prompt_failure(str(exc)):
+                        raise ValueError(
+                            f"segment failed while running the remote SAM 3.1 backend: {exc}"
+                        ) from exc
+            if remote_result is None:
+                mask_path, mask_score, selection_metrics, source_stage, text_prompt = (
+                    self._build_full_image_mask_result(
+                        image_path=image_path,
+                        mask_path=requested_mask_path,
+                        prompt=prompt_candidates[0],
+                    )
+                )
+                selection_metrics["remote_errors"] = " | ".join(remote_error_messages)
+            else:
+                mask_path = remote_result.mask_path
+                mask_score = remote_result.mask_score
+                selection_metrics = remote_result.selection_metrics
+                source_stage = remote_result.source_stage
+                text_prompt = remote_result.text_prompt
+        elif backend_name == "local":
+            image_array = np.asarray(Image.open(Path(image_path)).convert("RGB"), dtype=np.uint8)
+            if not self._is_sam31_text_prompt_backend_available(
+                backend_name=args.backend_name
+            ):
+                raise ValueError(
+                    "segment only supports the SAM 3.1 text-prompt path; set "
+                    "backend_name='sam31' and provide a valid SAM3_CHECKPOINT_PATH"
+                )
 
-        if not self._is_sam31_text_prompt_backend_available(
-            backend_name=args.backend_name
-        ):
-            raise ValueError(
-                "segment only supports the SAM 3.1 text-prompt path; set "
-                "backend_name='sam31' and provide a valid SAM3_CHECKPOINT_PATH"
-            )
+            final_candidate = None
+            local_error_messages: list[str] = []
+            for prompt_candidate in prompt_candidates:
+                try:
+                    text_prompt_candidates = self._predict_text_prompt_candidates(
+                        image_array=image_array,
+                        text_prompt=prompt_candidate,
+                        source_stage="sam_text_only",
+                    )
+                except Sam3BackendError as exc:
+                    local_error_messages.append(str(exc))
+                    continue
 
-        try:
-            text_prompt_candidates = self._predict_text_prompt_candidates(
-                image_array=image_array,
-                text_prompt=text_prompt,
-                source_stage="sam_text_only",
-            )
-        except Sam3BackendError as exc:
-            raise ValueError(
-                "segment failed while running the SAM 3.1 text-prompt backend"
-            ) from exc
+                final_candidate = self._select_best_candidate(
+                    candidates=text_prompt_candidates,
+                )
+                if final_candidate is not None:
+                    final_candidate.mask = self._postprocess_mask(mask=final_candidate.mask)
+                    text_prompt = prompt_candidate
+                    break
 
-        final_candidate = self._select_best_candidate(
-            candidates=text_prompt_candidates,
-        )
-        if final_candidate is None:
-            raise ValueError(
-                "segment could not find an acceptable SAM 3.1 text-prompt mask candidate"
-            )
-        final_candidate.mask = self._postprocess_mask(mask=final_candidate.mask)
+            if final_candidate is None:
+                mask_path, mask_score, selection_metrics, source_stage, text_prompt = (
+                    self._build_full_image_mask_result(
+                        image_path=image_path,
+                        mask_path=self._build_mask_path(task_id=task_id, loop_index=loop_index),
+                        prompt=prompt_candidates[0],
+                    )
+                )
+                if local_error_messages:
+                    selection_metrics["local_errors"] = " | ".join(local_error_messages)
+            else:
+                mask_path = self._write_mask(
+                    mask=final_candidate.mask,
+                    task_id=task_id,
+                    loop_index=loop_index,
+                )
+                mask_score = final_candidate.score
+                selection_metrics = final_candidate.metrics
+                source_stage = final_candidate.source_stage
+        else:
+            raise ValueError("SEGMENT_BACKEND must be 'local' or 'remote'")
 
-        mask_path = self._write_mask(
-            mask=final_candidate.mask,
-            task_id=task_id,
-            loop_index=loop_index,
-        )
+        if not Path(mask_path).is_file():
+            raise FileNotFoundError(f"segment backend output path does not exist: {mask_path}")
 
         artifact = MaskArtifact(
             id=next_artifact_id(state, ArtifactKind.MASK),
@@ -253,9 +402,9 @@ class SegmentTool:
             payload={
                 "image_ref": args.image_ref,
                 "prompt": text_prompt,
-                "mask_score": final_candidate.score,
-                "selection_metrics": final_candidate.metrics,
-                "source_stage": final_candidate.source_stage,
+                "mask_score": mask_score,
+                "selection_metrics": selection_metrics,
+                "source_stage": source_stage,
                 "text_prompt": text_prompt,
             },
             source_ids=[args.image_ref],
@@ -273,7 +422,7 @@ class SegmentTool:
             result_payload={
                 "image_ref": args.image_ref,
                 "prompt": text_prompt,
-                "mask_score": final_candidate.score,
+                "mask_score": mask_score,
                 "mask_ref": artifact.id,
             },
             raw_output_uri=f"runs/{task_id}/{self.name.value}.json",

@@ -85,6 +85,12 @@ REAL_TOOL_TESTS = {
     "test_understand_tool_uses_multimodal_llm",
     "test_evaluate_tool_uses_multimodal_llm",
     "test_edit_tool_generates_local_candidate_image_with_unified_args",
+    "test_edit_tool_uses_remote_backend_when_configured",
+    "test_segment_tool_uses_remote_backend_when_configured",
+    "test_segment_tool_remote_retries_with_shorter_prompt",
+    "test_segment_tool_remote_falls_back_to_full_image_mask_after_prompt_failures",
+    "test_firered_edit_server_endpoint_writes_output",
+    "test_sam31_segment_server_endpoint_writes_output",
 }
 
 
@@ -157,8 +163,11 @@ def test_evaluate_tool_derive_verdict_max_revision_count_replans_when_not_passed
 
 
 @pytest.fixture(autouse=True)
-def fake_model_tools_for_schema_tests(mocker, request):
+def fake_model_tools_for_schema_tests(mocker, monkeypatch, request):
     """Keep schema/runtime regression tests from loading real model backends."""
+
+    monkeypatch.setenv("EDIT_BACKEND", "local")
+    monkeypatch.setenv("SEGMENT_BACKEND", "local")
 
     if request.node.name in REAL_TOOL_TESTS:
         return
@@ -1191,6 +1200,80 @@ def test_firered_unload_pipeline_clears_cache(mocker) -> None:
     fake_torch.cuda.empty_cache.assert_called_once_with()
 
 
+def test_firered_manual_shard_plan_uses_third_gpu_for_non_transformer_weights(mocker) -> None:
+    from vision_backends._vendor import firered_manual_pipeline as manual_pipeline
+
+    mocker.patch.object(
+        manual_pipeline,
+        "_inspect_transformer_structure",
+        return_value={"block_count": 60},
+    )
+    mocker.patch.object(
+        manual_pipeline,
+        "_inspect_text_encoder_structure",
+        return_value={"visual_block_count": 32, "language_layer_count": 28},
+    )
+
+    shard_plan = manual_pipeline.build_manual_shard_plan(
+        model_path="mock-model",
+        visible_gpu_ids=[0, 1, 2],
+        local_files_only=True,
+        include_estimates=False,
+    )
+
+    assert shard_plan["strategy"] == "manual_grouped_component_shard"
+    assert shard_plan["transformer_devices"] == [0, 1]
+    assert shard_plan["text_encoder_devices"] == [2]
+    assert shard_plan["vae_device"] == 2
+    assert shard_plan["transformer_device_map"]["transformer_blocks.0"] == 0
+    assert shard_plan["transformer_device_map"]["transformer_blocks.29"] == 0
+    assert shard_plan["transformer_device_map"]["transformer_blocks.30"] == 1
+    assert shard_plan["transformer_device_map"]["transformer_blocks.59"] == 1
+    assert shard_plan["text_encoder_device_map"]["model.visual.patch_embed"] == 2
+    assert shard_plan["text_encoder_device_map"]["model.visual.merger"] == 2
+    assert shard_plan["text_encoder_device_map"]["model.language_model.embed_tokens"] == 2
+    assert shard_plan["text_encoder_device_map"]["model.language_model.layers.0"] == 2
+    assert shard_plan["text_encoder_device_map"]["model.language_model.layers.27"] == 2
+
+
+def test_firered_manual_shard_plan_preserves_original_four_gpu_layout(mocker) -> None:
+    from vision_backends._vendor import firered_manual_pipeline as manual_pipeline
+
+    mocker.patch.object(
+        manual_pipeline,
+        "_inspect_transformer_structure",
+        return_value={"block_count": 60},
+    )
+    mocker.patch.object(
+        manual_pipeline,
+        "_inspect_text_encoder_structure",
+        return_value={"visual_block_count": 32, "language_layer_count": 28},
+    )
+
+    shard_plan = manual_pipeline.build_manual_shard_plan(
+        model_path="mock-model",
+        visible_gpu_ids=[0, 1, 2, 3],
+        local_files_only=True,
+        include_estimates=False,
+    )
+
+    assert shard_plan["strategy"] == "manual_grouped_component_shard"
+    assert shard_plan["transformer_devices"] == [0, 1]
+    assert shard_plan["text_encoder_devices"] == [2, 3]
+    assert shard_plan["vae_device"] == 3
+    assert shard_plan["transformer_device_map"]["transformer_blocks.0"] == 0
+    assert shard_plan["transformer_device_map"]["transformer_blocks.29"] == 0
+    assert shard_plan["transformer_device_map"]["transformer_blocks.30"] == 1
+    assert shard_plan["transformer_device_map"]["transformer_blocks.59"] == 1
+    assert shard_plan["text_encoder_device_map"]["model.visual.patch_embed"] == 2
+    assert shard_plan["text_encoder_device_map"]["model.visual.merger"] == 3
+    assert shard_plan["text_encoder_device_map"]["model.language_model.embed_tokens"] == 3
+    assert shard_plan["text_encoder_device_map"]["model.language_model.layers.0"] == 3
+    assert shard_plan["text_encoder_device_map"]["model.language_model.layers.13"] == 3
+    assert shard_plan["text_encoder_device_map"]["model.language_model.layers.14"] == 2
+    assert shard_plan["text_encoder_device_map"]["model.language_model.layers.27"] == 2
+
+
 def test_load_llm_config_reads_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LLM_API_KEY", "test-key")
     monkeypatch.setenv("LLM_BASE_URL", "https://example.invalid/v1")
@@ -1852,6 +1935,274 @@ def test_segment_tool_uses_grounding_and_writes_mask_file(tmp_path, mocker) -> N
     assert Path(artifact.uri).is_file()
     with Image.open(artifact.uri) as mask_image:
         assert mask_image.mode == "L"
+
+
+def test_segment_tool_uses_remote_backend_when_configured(tmp_path, mocker, monkeypatch: pytest.MonkeyPatch) -> None:
+    from PIL import Image
+    from tools.segment_tool import SegmentTool
+    from vision_backends.remote_client import RemoteSegmentResult
+
+    image_path = tmp_path / "source.png"
+    Image.new("RGB", (12, 12), color=(255, 255, 255)).save(image_path)
+    monkeypatch.setenv("SEGMENT_BACKEND", "remote")
+    mocker.patch("tools.segment_tool.resolve_segment_backend", return_value="remote")
+
+    state = {
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="local_edit",
+                instruction="分割主体",
+            )
+        },
+        "session": SessionState(
+            session_id="sess_segment_remote",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={"task_001": TaskState(task_id="task_001", status=TaskStatus.RUNNING)},
+            artifact_index=ArtifactIndex(by_type={}),
+        ),
+        "artifacts": {
+            "art_img_001": ImageArtifact(
+                id="art_img_001",
+                uri=str(image_path),
+                payload={"role": "input"},
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+    }
+
+    def fake_remote_segment(*, image_path, prompt, output_path):
+        Image.fromarray(np.pad(np.ones((8, 8), dtype=np.uint8), 2) * 255).save(output_path)
+        return RemoteSegmentResult(
+            mask_path=output_path,
+            mask_score=0.91,
+            selection_metrics={"final_score": 0.88},
+            source_stage="remote_sam31",
+            text_prompt=prompt,
+        )
+
+    remote_mock = mocker.patch("tools.segment_tool.request_sam31_segment", side_effect=fake_remote_segment)
+
+    execution = SegmentTool().run(
+        state,
+        task_id="task_001",
+        loop_index=1,
+        args=SegmentArgs(
+            image_ref="art_img_001",
+            prompt="subject",
+        ),
+    )
+
+    artifact = execution.artifacts[0]
+    remote_mock.assert_called_once()
+    assert artifact.kind == ArtifactKind.MASK
+    assert artifact.payload["source_stage"] == "remote_sam31"
+    assert artifact.payload["selection_metrics"] == {"final_score": 0.88}
+    assert Path(artifact.uri).is_file()
+
+
+def test_segment_tool_remote_retries_with_shorter_prompt(tmp_path, mocker, monkeypatch: pytest.MonkeyPatch) -> None:
+    from PIL import Image
+    from tools.segment_tool import SegmentTool
+    from vision_backends.remote_client import RemoteBackendError, RemoteSegmentResult
+
+    image_path = tmp_path / "source.png"
+    Image.new("RGB", (12, 12), color=(255, 255, 255)).save(image_path)
+    monkeypatch.setenv("SEGMENT_BACKEND", "remote")
+    mocker.patch("tools.segment_tool.resolve_segment_backend", return_value="remote")
+
+    state = {
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="local_edit",
+                instruction="segment retry",
+            )
+        },
+        "session": SessionState(
+            session_id="sess_segment_remote_retry",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={"task_001": TaskState(task_id="task_001", status=TaskStatus.RUNNING)},
+            artifact_index=ArtifactIndex(by_type={}),
+        ),
+        "artifacts": {
+            "art_img_001": ImageArtifact(
+                id="art_img_001",
+                uri=str(image_path),
+                payload={"role": "input"},
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+    }
+
+    seen_prompts: list[str] = []
+
+    def fake_remote_segment(*, image_path, prompt, output_path):
+        seen_prompts.append(prompt)
+        if prompt != "person":
+            raise RemoteBackendError("remote backend HTTP 400: SAM 3.1 found no acceptable mask candidate")
+        Image.fromarray(np.pad(np.ones((8, 8), dtype=np.uint8), 2) * 255).save(output_path)
+        return RemoteSegmentResult(
+            mask_path=output_path,
+            mask_score=0.91,
+            selection_metrics={"final_score": 0.88},
+            source_stage="remote_sam31",
+            text_prompt=prompt,
+        )
+
+    mocker.patch("tools.segment_tool.request_sam31_segment", side_effect=fake_remote_segment)
+
+    execution = SegmentTool().run(
+        state,
+        task_id="task_001",
+        loop_index=1,
+        args=SegmentArgs(
+            image_ref="art_img_001",
+            prompt="Generate a photo of this person wearing the provided top and skirt in the provided background.",
+        ),
+    )
+
+    artifact = execution.artifacts[0]
+    assert seen_prompts == ["person"]
+    assert artifact.payload["prompt"] == "person"
+    assert artifact.payload["source_stage"] == "remote_sam31"
+
+
+def test_segment_tool_remote_falls_back_to_full_image_mask_after_prompt_failures(
+    tmp_path, mocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from PIL import Image
+    from tools.segment_tool import SegmentTool
+    from vision_backends.remote_client import RemoteBackendError
+
+    image_path = tmp_path / "source.png"
+    Image.new("RGB", (9, 7), color=(255, 255, 255)).save(image_path)
+    monkeypatch.setenv("SEGMENT_BACKEND", "remote")
+    mocker.patch("tools.segment_tool.resolve_segment_backend", return_value="remote")
+
+    state = {
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="local_edit",
+                instruction="segment fallback",
+            )
+        },
+        "session": SessionState(
+            session_id="sess_segment_remote_fallback",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={"task_001": TaskState(task_id="task_001", status=TaskStatus.RUNNING)},
+            artifact_index=ArtifactIndex(by_type={}),
+        ),
+        "artifacts": {
+            "art_img_001": ImageArtifact(
+                id="art_img_001",
+                uri=str(image_path),
+                payload={"role": "input"},
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+    }
+
+    mocker.patch(
+        "tools.segment_tool.request_sam31_segment",
+        side_effect=RemoteBackendError("remote backend HTTP 400: SAM 3.1 found no acceptable mask candidate"),
+    )
+
+    execution = SegmentTool().run(
+        state,
+        task_id="task_001",
+        loop_index=1,
+        args=SegmentArgs(
+            image_ref="art_img_001",
+            prompt="Generate a photo of this person wearing the provided top and skirt in the provided background.",
+        ),
+    )
+
+    artifact = execution.artifacts[0]
+    assert artifact.payload["source_stage"] == "fallback_full_image"
+    with Image.open(artifact.uri) as mask_image:
+        assert mask_image.size == (9, 7)
+        assert mask_image.getbbox() == (0, 0, 9, 7)
+
+
+def test_sam31_segment_server_endpoint_writes_output(tmp_path, mocker) -> None:
+    from PIL import Image
+    from vision_backends import sam31_segment_server
+
+    source_path = tmp_path / "source.png"
+    output_path = tmp_path / "mask.png"
+    Image.new("RGB", (12, 12), color=(255, 255, 255)).save(source_path)
+    mocker.patch("tools.segment_tool.SegmentTool._is_sam31_text_prompt_backend_available", return_value=True)
+    mocker.patch(
+        "tools.segment_tool.sam31_predict_text_prompt_candidates",
+        return_value=[
+            {
+                "name": "sam31_text_0",
+                "mask": np.pad(np.ones((8, 8), dtype=bool), 2),
+                "score": 0.9,
+            }
+        ],
+    )
+
+    response = sam31_segment_server.handle_segment(
+        {
+            "image_path": str(source_path),
+            "prompt": "subject",
+            "output_path": str(output_path),
+        }
+    )
+
+    assert response["mask_path"] == str(output_path)
+    assert response["mask_score"] == 0.9
+    assert response["source_stage"] == "remote_sam31"
+    assert output_path.is_file()
+
+
+def test_sam31_segment_server_preload_backend_loads_runtime(mocker) -> None:
+    from vision_backends import sam31_segment_server
+
+    preload_mock = mocker.patch("vision_backends.sam31_segment_server.preload_text_prompt_runtime")
+
+    sam31_segment_server.preload_backend()
+
+    preload_mock.assert_called_once_with()
+
+
+def test_sam31_segment_server_health_reports_loaded_state(monkeypatch: pytest.MonkeyPatch, mocker) -> None:
+    from vision_backends import sam31_segment_server
+
+    monkeypatch.setenv("SAM3_CHECKPOINT_PATH", "/tmp/sam31.ckpt")
+    monkeypatch.setenv("SAM31_PRELOAD_ON_START", "true")
+    mocker.patch(
+        "vision_backends.sam31_segment_server.sam3_runtime_status",
+        return_value={
+            "sam3_image_model_loaded": True,
+            "sam3_text_processor_loaded": True,
+        },
+    )
+
+    payload = sam31_segment_server.health()
+
+    assert payload["status"] == "ok"
+    assert payload["service"] == "sam31_segment"
+    assert payload["sam3_checkpoint_configured"] is True
+    assert payload["sam31_preload_on_start"] is True
+    assert payload["sam3_image_model_loaded"] is True
+    assert payload["sam3_text_processor_loaded"] is True
+    assert payload["sam3_ready"] is True
 
 
 
@@ -3709,6 +4060,170 @@ def test_edit_tool_generates_local_candidate_image_with_unified_args(tmp_path, m
         "instruction": "把人物放到背景里",
         "image_refs": ["art_img_001"],
     }
+
+
+def test_edit_tool_uses_remote_backend_when_configured(tmp_path, mocker, monkeypatch: pytest.MonkeyPatch) -> None:
+    from PIL import Image
+    from tools.edit_tool import EditTool
+    from vision_backends.remote_client import RemoteEditResult
+
+    source_path = tmp_path / "source.png"
+    Image.new("RGB", (16, 16), color=(255, 255, 255)).save(source_path)
+    monkeypatch.setenv("EDIT_BACKEND", "remote")
+
+    state = {
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="reference_edit",
+                instruction="把人物放到背景里",
+            )
+        },
+        "session": SessionState(
+            session_id="sess_edit_remote",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.RUNNING,
+                    task_artifact_ids=[],
+                )
+            },
+        ),
+        "artifacts": {
+            "art_img_001": ImageArtifact(
+                id="art_img_001",
+                uri=str(source_path),
+                payload={"role": "input"},
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+    }
+
+    def fake_remote_edit(*, image_paths, instruction, output_path):
+        Image.new("RGB", (16, 16), color=(0, 128, 255)).save(output_path)
+        return RemoteEditResult(
+            output_path=output_path,
+            backend_config={"backend": "remote-firered"},
+        )
+
+    remote_mock = mocker.patch("tools.edit_tool.request_firered_edit", side_effect=fake_remote_edit)
+
+    execution = EditTool().run(
+        state,
+        task_id="task_001",
+        loop_index=1,
+        args=EditArgs(
+            instruction="把人物放到背景里",
+            image_refs=["art_img_001"],
+        ),
+    )
+
+    artifact = execution.artifacts[0]
+    remote_mock.assert_called_once()
+    assert artifact.payload["backend_name"] == "firered_remote"
+    assert artifact.payload["backend_config_snapshot"] == {"backend": "remote-firered"}
+    assert Path(artifact.uri).is_file()
+
+
+def test_firered_edit_server_endpoint_writes_output(tmp_path, mocker) -> None:
+    from PIL import Image
+    from vision_backends import firered_edit_server
+
+    source_path = tmp_path / "source.png"
+    output_path = tmp_path / "out.png"
+    Image.new("RGB", (16, 16), color=(255, 255, 255)).save(source_path)
+    mocker.patch("vision_backends.firered_edit_server.edit_images", return_value=Image.new("RGB", (16, 16), color=(0, 128, 255)))
+    mocker.patch("vision_backends.firered_edit_server.backend_config_snapshot", return_value={"backend": "mock"})
+
+    response = firered_edit_server.handle_edit(
+        {
+            "image_paths": [str(source_path)],
+            "instruction": "edit",
+            "output_path": str(output_path),
+        }
+    )
+
+    assert response == {"output_path": str(output_path), "backend_config": {"backend": "mock"}}
+    assert output_path.is_file()
+
+
+def test_firered_edit_server_preload_backend_loads_pipeline(mocker) -> None:
+    from vision_backends import firered_edit_server
+
+    load_mock = mocker.patch("vision_backends.firered_edit_server.load_pipeline")
+
+    firered_edit_server.preload_backend()
+
+    load_mock.assert_called_once_with()
+
+
+def test_firered_edit_server_health_reports_loaded_state(monkeypatch: pytest.MonkeyPatch, mocker) -> None:
+    from vision_backends import firered_edit_server
+
+    monkeypatch.setenv("FIRERED_PRELOAD_ON_START", "true")
+    mocker.patch("vision_backends.firered_edit_server.is_pipeline_loaded", return_value=True)
+
+    payload = firered_edit_server.health()
+
+    assert payload["status"] == "ok"
+    assert payload["service"] == "firered_edit"
+    assert payload["firered_cached"] is True
+    assert payload["firered_preload_on_start"] is True
+
+
+def test_remote_client_uses_service_specific_base_urls(monkeypatch: pytest.MonkeyPatch, mocker) -> None:
+    from vision_backends import remote_client
+
+    monkeypatch.setenv("FIRERED_EDIT_BACKEND_BASE_URL", "http://edit.local")
+    monkeypatch.setenv("SAM31_SEGMENT_BACKEND_BASE_URL", "http://sam.local")
+    monkeypatch.setenv("VISION_BACKEND_BASE_URL", "http://shared.local")
+    captured_urls = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            if captured_urls[-1].endswith("/v1/edit/firered"):
+                return b'{"output_path":"generated/edit/out.png","backend_config":{}}'
+            return b'{"mask_path":"generated/segment/mask.png","mask_score":0.5,"selection_metrics":{}}'
+
+    def fake_urlopen(req, timeout):
+        captured_urls.append(req.full_url)
+        return FakeResponse()
+
+    mocker.patch("vision_backends.remote_client.request.urlopen", side_effect=fake_urlopen)
+
+    remote_client.request_firered_edit(image_paths=["in.png"], instruction="edit")
+    remote_client.request_sam31_segment(image_path="in.png", prompt="subject")
+
+    assert captured_urls == [
+        "http://edit.local/v1/edit/firered",
+        "http://sam.local/v1/segment/sam31",
+    ]
+
+
+def test_remote_client_defaults_to_remote_split_services(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vision_backends.remote_client import remote_base_url, resolve_edit_backend, resolve_segment_backend
+
+    monkeypatch.delenv("EDIT_BACKEND", raising=False)
+    monkeypatch.delenv("SEGMENT_BACKEND", raising=False)
+    monkeypatch.delenv("FIRERED_EDIT_BACKEND_BASE_URL", raising=False)
+    monkeypatch.delenv("SAM31_SEGMENT_BACKEND_BASE_URL", raising=False)
+    monkeypatch.delenv("VISION_BACKEND_BASE_URL", raising=False)
+
+    assert resolve_edit_backend() == "remote"
+    assert resolve_segment_backend() == "remote"
+    assert remote_base_url("edit") == "http://127.0.0.1:8765"
+    assert remote_base_url("segment") == "http://127.0.0.1:8766"
 
 
 def test_plan_agent_replan_creates_new_plan_version_and_marks_old_tasks() -> None:

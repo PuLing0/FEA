@@ -19,6 +19,11 @@ from vision_backends.firered_edit_backend import (
     backend_config_snapshot,
     edit_images,
 )
+from vision_backends.remote_client import (
+    RemoteBackendError,
+    request_firered_edit,
+    resolve_edit_backend,
+)
 
 from .base import ToolExecutionResult
 from .utils import next_artifact_id, next_operation_id
@@ -59,6 +64,11 @@ class EditTool:
         image.save(output_path)
         return str(output_path)
 
+    def _build_output_path(self, *, task_id: str, loop_index: int) -> str:
+        output_dir = Path("generated") / "edit"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return str(output_dir / f"{task_id}_{loop_index:03d}.png")
+
     def run(
         self,
         state,
@@ -69,20 +79,40 @@ class EditTool:
     ) -> ToolExecutionResult:
         dumped = args.model_dump()
         task_instruction = resolve_active_instruction_text(state, task_id)
-        images = self._load_images(state, args.image_refs)
-        try:
-            edited_image = edit_images(images=images, instruction=args.instruction)
-        except FireRedBackendError as exc:
-            raise RuntimeError(
-                "edit could not run the FireRed backend. "
-                "Check backend dependencies, runtime configuration, and input image paths."
-            ) from exc
+        backend_name = resolve_edit_backend()
+        backend_snapshot = backend_config_snapshot()
+        if backend_name == "remote":
+            image_paths = [str(self._resolve_image_artifact(state, image_ref).uri) for image_ref in args.image_refs]
+            requested_output_path = self._build_output_path(task_id=task_id, loop_index=loop_index)
+            try:
+                remote_result = request_firered_edit(
+                    image_paths=image_paths,
+                    instruction=args.instruction,
+                    output_path=requested_output_path,
+                )
+            except RemoteBackendError as exc:
+                raise RuntimeError("edit could not run the remote FireRed backend") from exc
+            output_path = remote_result.output_path
+            backend_snapshot = remote_result.backend_config
+        elif backend_name == "local":
+            images = self._load_images(state, args.image_refs)
+            try:
+                edited_image = edit_images(images=images, instruction=args.instruction)
+            except FireRedBackendError as exc:
+                raise RuntimeError(
+                    "edit could not run the FireRed backend. "
+                    "Check backend dependencies, runtime configuration, and input image paths."
+                ) from exc
+            output_path = self._write_output(
+                edited_image,
+                task_id=task_id,
+                loop_index=loop_index,
+            )
+        else:
+            raise ValueError("EDIT_BACKEND must be 'local' or 'remote'")
 
-        output_path = self._write_output(
-            edited_image,
-            task_id=task_id,
-            loop_index=loop_index,
-        )
+        if not Path(output_path).is_file():
+            raise FileNotFoundError(f"edit backend output path does not exist: {output_path}")
         primary_image_ref = args.image_refs[0]
         auxiliary_image_refs = list(args.image_refs[1:])
         artifact = ImageArtifact(
@@ -92,8 +122,8 @@ class EditTool:
                 "role": "candidate_image",
                 "primary_image_ref": primary_image_ref,
                 "auxiliary_image_refs": auxiliary_image_refs,
-                "backend_name": "firered",
-                "backend_config_snapshot": backend_config_snapshot(),
+                "backend_name": "firered_remote" if backend_name == "remote" else "firered",
+                "backend_config_snapshot": backend_snapshot,
                 "source": "edit_output",
                 "task_instruction": task_instruction,
             },

@@ -25,7 +25,8 @@ last logical GPU. Keep the first two visible GPUs as the cards with the most
 available memory.
 
 `FIRERED_DISABLE_LORA` controls whether the configured/default FireRed LoRA is
-loaded:
+loaded. The FireRed service startup script defaults `FIRERED_FUSE_LORA=true` and leaves
+`FIRERED_HEIGHT`/`FIRERED_WIDTH` unset unless you explicitly override them:
 
 - `FIRERED_DISABLE_LORA=true` runs the base model only.
 - `FIRERED_DISABLE_LORA=false` or unset loads `FIRERED_LORA_PATH` and
@@ -50,6 +51,51 @@ FIRERED_CUDA_VISIBLE_DEVICES=5,6,3,4 \
   --steps 8 \
   --output generated/profile_firered_memory.json
 ```
+
+## Remote vision backend mode
+
+Heavy vision models can run in a separate Python process. The agent then sends
+JSON requests with shared local file paths and receives output file paths, like
+the LLM layer sends requests to a remote model provider.
+
+Start each model service independently on the GPU host:
+
+```bash
+./scripts/start_firered_edit_server.sh
+```
+
+```bash
+SAM3_CHECKPOINT_PATH=/path/to/sam3.1/checkpoint.pt \
+./scripts/start_sam31_segment_server.sh
+```
+
+Both service scripts now preload their models on startup by default, so boot can
+take time and GPU memory should be occupied immediately after the process is
+ready.
+
+Run the agent against the default remote services. With default ports, backend mode and backend URL variables are optional:
+
+```bash
+VISION_BACKEND_TIMEOUT_SECONDS=900 \
+./.venv/bin/python src/agent.py \
+  --images examples/fig1.jpg examples/fig2.jpg examples/fig3.jpg examples/fig4.jpg \
+  --instruction "Generate a photo of this person wearing the provided top and skirt in the provided background."
+```
+
+Remote mode is the runtime default; local mode is still available for development and tests:
+
+- `EDIT_BACKEND=remote` is the default; set `EDIT_BACKEND=local` to run FireRed in-process.
+- `SEGMENT_BACKEND=remote` is the default; set `SEGMENT_BACKEND=local` to run SAM3.1 in-process.
+- `FIRERED_EDIT_BACKEND_BASE_URL` points edit requests to the FireRed service and defaults to `http://127.0.0.1:8765`.
+- `SAM31_SEGMENT_BACKEND_BASE_URL` points segment requests to the SAM service and defaults to `http://127.0.0.1:8766`.
+- `VISION_BACKEND_BASE_URL` remains a shared fallback when both services use the same host/port.
+- `FIRERED_PRELOAD_ON_START=true|false` controls FireRed eager preload and defaults to `true`.
+- `SAM31_PRELOAD_ON_START=true|false` controls SAM3.1 eager preload and defaults to `true`.
+- `GET /health` checks service availability plus loaded-state flags such as `firered_cached` and `sam3_ready`.
+
+Remote mode assumes the agent and service share the same filesystem paths for
+input and generated images. Use multipart upload or object storage only if the
+service runs on a separate machine without a shared mount.
 
 ## LLM configuration
 

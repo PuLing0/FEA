@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from functools import lru_cache
+import gc
 import importlib
 import os
 import sys
@@ -256,4 +257,41 @@ def predict_text_prompt_candidates(
     return candidates
 
 
-__all__ = ["Sam3BackendError", "predict_candidates", "predict_text_prompt_candidates"]
+def preload_text_prompt_runtime() -> None:
+    """Load and cache the SAM 3.1 image model and text processor."""
+
+    _load_image_model()
+    _load_text_processor()
+
+
+def sam3_runtime_status() -> dict[str, bool]:
+    """Return whether the cached SAM 3.1 runtime components are loaded."""
+
+    return {
+        "sam3_image_model_loaded": _load_image_model.cache_info().currsize > 0,
+        "sam3_text_processor_loaded": _load_text_processor.cache_info().currsize > 0,
+    }
+
+
+def unload_runtime() -> None:
+    """Clear cached SAM 3.1 runtime state and release CUDA cache when possible."""
+
+    _load_text_processor.cache_clear()
+    _load_image_model.cache_clear()
+    _load_runtime_modules.cache_clear()
+    gc.collect()
+    try:
+        torch = importlib.import_module("torch")
+    except Exception:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+__all__ = [
+    "Sam3BackendError",
+    "predict_candidates",
+    "predict_text_prompt_candidates",
+    "preload_text_prompt_runtime",
+    "sam3_runtime_status",
+    "unload_runtime",
+]
