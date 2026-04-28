@@ -35,9 +35,11 @@ class PromptReconstructTool:
         instruction_text = str(response.content).strip()
         artifact = InstructionArtifact(
             id=next_artifact_id(state, ArtifactKind.INSTRUCTION),
+            summary=instruction_text,
             payload={"instruction_text": instruction_text},
             source_ids=list(args.input_artifact_ids),
             created_by=self.name.value,
+            role="rewritten_instruction",
             scope="task",
         )
         invocation = ToolInvocationRecord(

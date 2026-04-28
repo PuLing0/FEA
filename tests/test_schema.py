@@ -19,11 +19,16 @@ from llm import (
     load_llm_config,
 )
 from runtime.graph import build_runtime_graph
+from runtime.instruction_resolver import (
+    resolve_active_instruction_artifact,
+    resolve_active_instruction_text,
+)
 from runtime.input_selector import (
     TaskInputSelectionOutput,
     build_candidate_image_pool,
     build_candidate_images_text,
 )
+from runtime.run_logger import summarize_task_state
 from runtime.scheduler import select_next_runnable_task
 from schema import (
     ArtifactIndex,
@@ -513,6 +518,132 @@ def test_observe_llm_output_construct() -> None:
 def test_tool_registry_contains_prompt_reconstruct() -> None:
     registry = build_default_tool_registry()
     assert registry.get(ToolName.PROMPT_RECONSTRUCT) is not None
+
+
+def _make_instruction_resolution_state(
+    *,
+    artifacts: dict[str, object],
+    task_artifact_ids: list[str],
+    task_instruction: str = "任务默认指令",
+) -> dict:
+    return {
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="reference_edit",
+                instruction=task_instruction,
+                acceptance_criteria=["满足编辑要求"],
+            )
+        },
+        "session": SessionState(
+            session_id="sess_instruction_resolution",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.RUNNING,
+                    task_artifact_ids=list(task_artifact_ids),
+                )
+            },
+        ),
+        "artifacts": artifacts,
+        "operations": [],
+        "task_act_records": [],
+        "task_loops": [],
+    }
+
+
+def test_instruction_resolver_prefers_task_instruction_over_later_session_root() -> None:
+    state = _make_instruction_resolution_state(
+        artifacts={
+            "art_instruction_task_001_001": InstructionArtifact(
+                id="art_instruction_task_001_001",
+                payload={"instruction_text": "使用任务局部指令"},
+                role="task_instruction",
+                scope="task",
+            ),
+            "art_instruction_session_root_001": InstructionArtifact(
+                id="art_instruction_session_root_001",
+                payload={"instruction_text": "使用全局根指令"},
+                role="session_root_instruction",
+                scope="session",
+            ),
+        },
+        task_artifact_ids=[
+            "art_instruction_task_001_001",
+            "art_instruction_session_root_001",
+        ],
+    )
+
+    artifact = resolve_active_instruction_artifact(state, "task_001")
+
+    assert artifact is not None
+    assert artifact.id == "art_instruction_task_001_001"
+    assert resolve_active_instruction_text(state, "task_001") == "使用任务局部指令"
+
+
+def test_instruction_resolver_prefers_latest_rewritten_instruction_across_roles() -> None:
+    state = _make_instruction_resolution_state(
+        artifacts={
+            "art_instruction_rewrite_001": InstructionArtifact(
+                id="art_instruction_rewrite_001",
+                payload={"instruction_text": "旧改写指令"},
+                role="rewritten_instruction",
+                scope="task",
+            ),
+            "art_instruction_session_root_001": InstructionArtifact(
+                id="art_instruction_session_root_001",
+                payload={"instruction_text": "全局根指令"},
+                role="session_root_instruction",
+                scope="session",
+            ),
+            "art_instruction_task_001_001": InstructionArtifact(
+                id="art_instruction_task_001_001",
+                payload={"instruction_text": "任务局部指令"},
+                role="task_instruction",
+                scope="task",
+            ),
+            "art_instruction_rewrite_002": InstructionArtifact(
+                id="art_instruction_rewrite_002",
+                payload={"instruction_text": "最新改写指令"},
+                role="rewritten_instruction",
+                scope="task",
+            ),
+        },
+        task_artifact_ids=[
+            "art_instruction_rewrite_001",
+            "art_instruction_session_root_001",
+            "art_instruction_task_001_001",
+            "art_instruction_rewrite_002",
+        ],
+    )
+
+    artifact = resolve_active_instruction_artifact(state, "task_001")
+
+    assert artifact is not None
+    assert artifact.id == "art_instruction_rewrite_002"
+    assert resolve_active_instruction_text(state, "task_001") == "最新改写指令"
+
+
+def test_instruction_resolver_ignores_unknown_roles_and_falls_back_to_task_instruction() -> None:
+    state = _make_instruction_resolution_state(
+        artifacts={
+            "art_instruction_note_001": InstructionArtifact(
+                id="art_instruction_note_001",
+                payload={"instruction_text": "这不是有效执行指令"},
+                role="note",
+                scope="task",
+            )
+        },
+        task_artifact_ids=["art_instruction_note_001"],
+        task_instruction="回退到 Task.instruction",
+    )
+
+    assert resolve_active_instruction_artifact(state, "task_001") is None
+    assert resolve_active_instruction_text(state, "task_001") == "回退到 Task.instruction"
 
 
 def test_build_candidate_images_text_uses_compact_scheme_b() -> None:
@@ -1064,6 +1195,47 @@ def test_agent_cli_help_returns_success(capsys: pytest.CaptureFixture[str]) -> N
     captured = capsys.readouterr()
     assert "Run the fig edit agent runtime" in captured.out
     assert "--images" in captured.out
+
+
+def test_agent_cli_defaults_allow_multi_act_execute_loops(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent import _build_parser
+
+    monkeypatch.setenv("AGENT_MAX_EXECUTE_ACTS", "5")
+    args = _build_parser().parse_args(
+        [
+            "--images",
+            "examples/fig1.jpg",
+            "--instruction",
+            "Keep the image unchanged.",
+        ]
+    )
+
+    assert args.max_execute_acts == 5
+
+
+def test_register_and_understand_reads_max_execute_acts_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from runtime.graph import register_and_understand
+
+    monkeypatch.setenv("AGENT_LOG_ENABLED", "false")
+    monkeypatch.setenv("AGENT_LOG_CONSOLE", "false")
+    monkeypatch.setenv("AGENT_MAX_EXECUTE_ACTS", "6")
+
+    result = register_and_understand(
+        {
+            "input": {
+                "session_id": "env-execute-acts",
+                "image_uri": "examples/fig1.jpg",
+                "image_uris": ["examples/fig1.jpg"],
+                "instruction_text": "Keep the image unchanged.",
+                "desired_decision_route": "pass",
+                "use_llm": False,
+            }
+        }
+    )
+
+    assert result["max_execute_acts"] == 6
 
 
 def test_agent_cli_runs_rule_based_fallback(mocker, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -2795,6 +2967,225 @@ def test_execute_agent_exhausted_budget_goes_directly_to_replan() -> None:
     assert result["decision"].replan is not None
 
 
+def test_execute_agent_edit_input_budget_overflow_retries_same_task() -> None:
+    state = {
+        "input": {
+            "instruction_text": "把人物、服饰和背景组合起来",
+            "use_llm": False,
+        },
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="reference_edit",
+                instruction="把人物、服饰和背景组合起来",
+                input_artifact_ids=[
+                    "art_img_input_001",
+                    "art_img_input_002",
+                    "art_img_input_003",
+                    "art_img_input_004",
+                ],
+            )
+        },
+        "session": SessionState(
+            session_id="sess_execute_budget_retry",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.RUNNING,
+                    resolved_input_artifact_ids=[
+                        "art_img_input_001",
+                        "art_img_input_002",
+                        "art_img_input_003",
+                        "art_img_input_004",
+                    ],
+                )
+            },
+            artifact_index=ArtifactIndex(
+                by_type={
+                    ArtifactKind.IMAGE: [
+                        "art_img_input_001",
+                        "art_img_input_002",
+                        "art_img_input_003",
+                        "art_img_input_004",
+                    ]
+                }
+            ),
+        ),
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(id="art_img_input_001", uri="store://images/1.png", payload={"role": "input"}, scope="session"),
+            "art_img_input_002": ImageArtifact(id="art_img_input_002", uri="store://images/2.png", payload={"role": "input"}, scope="session"),
+            "art_img_input_003": ImageArtifact(id="art_img_input_003", uri="store://images/3.png", payload={"role": "input"}, scope="session"),
+            "art_img_input_004": ImageArtifact(id="art_img_input_004", uri="store://images/4.png", payload={"role": "input"}, scope="session"),
+        },
+        "operations": [],
+        "task_act_records": [],
+        "task_loops": [],
+        "max_execute_acts": 1,
+    }
+
+    result = ExecuteAgent().run(state)
+
+    task_state = result["session"].task_states["task_001"]
+    assert result["session"].phase == SessionPhase.EXECUTING
+    assert result["session"].current_task_id == "task_001"
+    assert task_state.status == TaskStatus.RUNNING
+    assert task_state.latest_execute_checkpoint == "retry"
+    assert task_state.edit_input_budget_overflow_count == 1
+    assert result["decision"].route == DecisionRoute.CONTINUE_EXECUTE
+    assert result["decision"].task_retry is not None
+    assert result["operations"][-1].status == "failed"
+    assert result["operations"][-1].error["type"] == "EditInputBudgetExceeded"
+    assert result["operations"][-1].error["attempted_count"] == 4
+    assert task_state.retry_context_text is not None
+    assert "at most 3 image inputs" in task_state.retry_context_text
+
+
+def test_execute_agent_second_consecutive_edit_input_budget_overflow_replans() -> None:
+    state = {
+        "input": {
+            "instruction_text": "把人物、服饰和背景组合起来",
+            "use_llm": False,
+        },
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="reference_edit",
+                instruction="把人物、服饰和背景组合起来",
+                input_artifact_ids=[],
+            )
+        },
+        "session": SessionState(
+            session_id="sess_execute_budget_replan",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.RUNNING,
+                    retry_input_artifact_ids=[
+                        "art_img_input_001",
+                        "art_img_input_002",
+                        "art_img_input_003",
+                        "art_img_input_004",
+                    ],
+                    edit_input_budget_overflow_count=1,
+                )
+            },
+            artifact_index=ArtifactIndex(
+                by_type={
+                    ArtifactKind.IMAGE: [
+                        "art_img_input_001",
+                        "art_img_input_002",
+                        "art_img_input_003",
+                        "art_img_input_004",
+                    ]
+                }
+            ),
+        ),
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(id="art_img_input_001", uri="store://images/1.png", payload={"role": "input"}, scope="session"),
+            "art_img_input_002": ImageArtifact(id="art_img_input_002", uri="store://images/2.png", payload={"role": "input"}, scope="session"),
+            "art_img_input_003": ImageArtifact(id="art_img_input_003", uri="store://images/3.png", payload={"role": "input"}, scope="session"),
+            "art_img_input_004": ImageArtifact(id="art_img_input_004", uri="store://images/4.png", payload={"role": "input"}, scope="session"),
+        },
+        "operations": [],
+        "task_act_records": [],
+        "task_loops": [],
+        "max_execute_acts": 1,
+    }
+
+    result = ExecuteAgent().run(state)
+
+    task_state = result["session"].task_states["task_001"]
+    assert result["session"].phase == SessionPhase.PLANNING
+    assert result["session"].current_task_id is None
+    assert task_state.status == TaskStatus.REPLANNED
+    assert task_state.latest_execute_checkpoint == "failed"
+    assert task_state.edit_input_budget_overflow_count == 0
+    assert result["decision"].route == DecisionRoute.REPLAN
+    assert "edit_input_budget_retry_limit_exceeded" in result["decision"].issues
+
+
+def test_execute_agent_successful_edit_resets_budget_overflow_counter(mocker) -> None:
+    state = {
+        "input": {
+            "instruction_text": "保持图片内容不变",
+            "use_llm": False,
+        },
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="global_edit",
+                instruction="保持图片内容不变",
+                input_artifact_ids=["art_img_input_001"],
+            )
+        },
+        "session": SessionState(
+            session_id="sess_execute_budget_reset",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.RUNNING,
+                    retry_input_artifact_ids=["art_img_input_001"],
+                    edit_input_budget_overflow_count=1,
+                )
+            },
+            artifact_index=ArtifactIndex(by_type={ArtifactKind.IMAGE: ["art_img_input_001"]}),
+        ),
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri="store://images/input.png",
+                payload={"role": "input"},
+                scope="session",
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+        "task_loops": [],
+        "max_execute_acts": 1,
+    }
+
+    fake_execution = mocker.Mock()
+    fake_execution.invocation = ToolInvocationRecord(
+        id="op_edit_001",
+        task_id="task_001",
+        loop_index=1,
+        tool_name=ToolName.EDIT,
+        args={"instruction": "保持图片内容不变", "image_refs": ["art_img_input_001"]},
+        status="succeeded",
+        output_refs=["art_image_candidate_001"],
+    )
+    fake_execution.artifacts = [
+        ImageArtifact(
+            id="art_image_candidate_001",
+            uri="store://generated/task_001/candidate.png",
+            payload={"role": "candidate_image"},
+            created_by=ToolName.EDIT.value,
+            scope="task",
+        )
+    ]
+    mocker.patch("tools.edit_tool.EditTool.run", return_value=fake_execution)
+
+    result = ExecuteAgent().run(state)
+
+    task_state = result["session"].task_states["task_001"]
+    assert task_state.latest_execute_checkpoint == "passed"
+    assert task_state.edit_input_budget_overflow_count == 0
+    assert result["session"].phase == SessionPhase.EVALUATING
+    assert task_state.latest_artifact_ids == ["art_image_candidate_001"]
+
+
 def test_execute_agent_prompt_reconstruct_success_is_not_evaluable_candidate(mocker) -> None:
     state = {
         "input": {
@@ -2994,6 +3385,121 @@ def test_execute_agent_prompt_reconstruct_then_edit_uses_only_image_candidate(mo
         ToolName.PROMPT_RECONSTRUCT.value,
         ToolName.EDIT.value,
     ]
+
+
+def test_execute_agent_edit_uses_task_local_instruction_instead_of_root(tmp_path) -> None:
+    source_path = tmp_path / "source.png"
+    source_path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR"
+        b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00"
+        b"\x90wS\xde"
+        b"\x00\x00\x00\x0cIDATx\x9cc``\x00\x00\x00\x02\x00\x01"
+        b"\x0b\xe7\x02\x9d"
+        b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    state = _make_instruction_resolution_state(
+        artifacts={
+            "art_instruction_task_001_001": InstructionArtifact(
+                id="art_instruction_task_001_001",
+                payload={"instruction_text": "使用任务局部指令"},
+                role="task_instruction",
+                scope="task",
+            ),
+            "art_instruction_session_root_001": InstructionArtifact(
+                id="art_instruction_session_root_001",
+                payload={"instruction_text": "使用全局根指令"},
+                role="session_root_instruction",
+                scope="session",
+            ),
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri=str(source_path),
+                payload={"role": "input"},
+                scope="session",
+            ),
+        },
+        task_artifact_ids=[
+            "art_instruction_task_001_001",
+            "art_instruction_session_root_001",
+        ],
+    )
+    state["session"].task_states["task_001"].resolved_input_artifact_ids = ["art_img_input_001"]
+
+    captured: dict[str, object] = {}
+
+    class FakeEditTool:
+        def run(self, state, *, task_id: str, loop_index: int, args: EditArgs):
+            captured["instruction"] = args.instruction
+            captured["image_refs"] = list(args.image_refs)
+            return type(
+                "FakeExecution",
+                (),
+                {
+                    "invocation": ToolInvocationRecord(
+                        id="op_edit_001",
+                        task_id=task_id,
+                        loop_index=loop_index,
+                        tool_name=ToolName.EDIT,
+                        args=args.model_dump(),
+                        status="succeeded",
+                        output_refs=["art_image_candidate_001"],
+                    ),
+                    "artifacts": [
+                        ImageArtifact(
+                            id="art_image_candidate_001",
+                            uri=str(source_path),
+                            payload={"role": "candidate_image"},
+                            created_by=ToolName.EDIT.value,
+                            scope="task",
+                        )
+                    ],
+                },
+            )()
+
+    registry = build_default_tool_registry()
+    registry._tools[ToolName.EDIT] = FakeEditTool()
+
+    ExecuteAgent(registry=registry)._select_and_run_tool(
+        state=state,
+        task=state["tasks"]["task_001"],
+        task_id="task_001",
+        loop_index=1,
+        selected_tool=ToolName.EDIT,
+        resolved_inputs=["art_img_input_001"],
+        base_image_ref="art_img_input_001",
+    )
+
+    assert captured["instruction"] == "使用任务局部指令"
+    assert captured["image_refs"] == ["art_img_input_001"]
+
+
+def test_execute_agent_prompt_reconstruct_context_uses_shared_active_instruction() -> None:
+    state = _make_instruction_resolution_state(
+        artifacts={
+            "art_instruction_task_001_001": InstructionArtifact(
+                id="art_instruction_task_001_001",
+                payload={"instruction_text": "使用任务局部指令"},
+                role="task_instruction",
+                scope="task",
+            ),
+            "art_instruction_session_root_001": InstructionArtifact(
+                id="art_instruction_session_root_001",
+                payload={"instruction_text": "使用全局根指令"},
+                role="session_root_instruction",
+                scope="session",
+            ),
+        },
+        task_artifact_ids=[
+            "art_instruction_task_001_001",
+            "art_instruction_session_root_001",
+        ],
+    )
+    state["session"].task_states["task_001"].resolved_input_artifact_ids = ["art_img_input_001"]
+
+    context = ExecuteAgent()._build_prompt_reconstruct_context(state, "task_001")
+
+    assert "Current active instruction: 使用任务局部指令" in context
 
 
 def test_execute_agent_tool_failure_goes_directly_to_replan(mocker) -> None:
@@ -3243,6 +3749,115 @@ def test_evaluator_agent_budget_exhausted_upgrades_to_replan() -> None:
     assert result["decision"].replan is not None
     assert result["session"].phase == SessionPhase.PLANNING
     assert result["session"].current_task_id is None
+
+
+def test_route_after_execute_retries_same_task_on_budget_overflow() -> None:
+    from runtime.graph import _route_after_execute
+
+    state = {
+        "session": SessionState(
+            session_id="sess_route_retry",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.RUNNING,
+                    latest_execute_checkpoint="retry",
+                )
+            },
+        )
+    }
+
+    assert _route_after_execute(state) == "execute"
+
+
+def test_runtime_graph_retry_route_does_not_raise_key_error(mocker) -> None:
+    from runtime import graph as runtime_graph
+
+    execute_calls = {"count": 0}
+
+    def fake_register_and_understand(_state):
+        return {
+            "input": {"session_id": "sess_graph_retry", "instruction_text": "retry", "use_llm": False},
+            "session": SessionState(
+                session_id="sess_graph_retry",
+                phase=SessionPhase.PLANNING,
+                current_plan_id=None,
+                current_task_id=None,
+                task_states={},
+                artifact_index=ArtifactIndex(by_type={}),
+            ),
+            "artifacts": {},
+            "plans": {},
+            "tasks": {},
+            "task_act_records": [],
+            "task_loops": [],
+            "operations": [],
+        }
+
+    def fake_plan(state):
+        session = state["session"]
+        if "task_001" not in session.task_states:
+            state["tasks"]["task_001"] = Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="reference_edit",
+                instruction="retry",
+            )
+            session.task_states["task_001"] = TaskState(
+                task_id="task_001",
+                status=TaskStatus.RUNNING,
+            )
+        session.current_plan_id = "plan_001"
+        session.current_task_id = "task_001"
+        session.phase = SessionPhase.EXECUTING
+        state["plans"]["plan_001"] = Plan(id="plan_001", instruction="retry", task_ids=["task_001"])
+        return state
+
+    def fake_execute(state):
+        execute_calls["count"] += 1
+        task_state = state["session"].task_states["task_001"]
+        state["session"].current_task_id = "task_001"
+        if execute_calls["count"] == 1:
+            task_state.latest_execute_checkpoint = "retry"
+            task_state.status = TaskStatus.RUNNING
+            state["session"].phase = SessionPhase.EXECUTING
+        else:
+            task_state.latest_execute_checkpoint = "passed"
+            task_state.latest_artifact_ids = ["art_image_candidate_001"]
+            task_state.status = TaskStatus.WAITING_EVALUATION
+            state["session"].phase = SessionPhase.EVALUATING
+            state["artifacts"]["art_image_candidate_001"] = ImageArtifact(
+                id="art_image_candidate_001",
+                uri="store://generated/candidate.png",
+                payload={"role": "candidate_image"},
+                created_by=ToolName.EDIT.value,
+                scope="task",
+            )
+        return state
+
+    def fake_evaluate(state):
+        task_state = state["session"].task_states["task_001"]
+        task_state.latest_evaluate_checkpoint = "passed"
+        task_state.status = TaskStatus.PASSED
+        task_state.final_artifact_id = "art_image_candidate_001"
+        state["session"].phase = SessionPhase.DONE
+        state["session"].current_task_id = None
+        return state
+
+    mocker.patch.object(runtime_graph, "register_and_understand", side_effect=fake_register_and_understand)
+    mocker.patch.object(runtime_graph, "plan", side_effect=fake_plan)
+    mocker.patch.object(runtime_graph, "execute_current_task", side_effect=fake_execute)
+    mocker.patch.object(runtime_graph, "evaluate_checkpoint", side_effect=fake_evaluate)
+    mocker.patch.object(runtime_graph, "log_event")
+
+    result = runtime_graph.build_runtime_graph().invoke({"input": {"session_id": "sess_graph_retry"}})
+
+    assert execute_calls["count"] == 2
+    assert result["session"].phase == SessionPhase.DONE
+    assert result["session"].task_states["task_001"].status == TaskStatus.PASSED
 
 
 def test_prepare_task_inputs_prefers_retry_input_artifact_ids() -> None:
@@ -3920,7 +4535,9 @@ def test_execute_agent_retry_candidate_has_priority_as_base_image(mocker) -> Non
     assert captured["base_image_ref"] == "art_image_candidate_001"
 
 
-def test_execute_agent_build_edit_image_refs_prefers_base_and_caps_at_three() -> None:
+def test_execute_agent_build_edit_image_refs_raises_when_budget_is_exceeded() -> None:
+    from agents.execute_agent import EditInputBudgetExceeded
+
     state = {
         "session": SessionState(
             session_id="sess_edit_refs",
@@ -3969,20 +4586,27 @@ def test_execute_agent_build_edit_image_refs_prefers_base_and_caps_at_three() ->
         },
     }
 
-    image_refs = ExecuteAgent()._build_edit_image_refs(
-        state=state,
-        task_id="task_001",
-        runtime_ctx={
-            "base_image_ref": "art_img_input_001",
-            "initial_base_image_ref": "art_img_input_001",
-            "reference_refs": ["art_img_input_002", "art_img_input_003"],
-            "grounding_ref": None,
-            "mask_ref": None,
-            "crop_ref": "art_crop_001",
-        },
-    )
+    with pytest.raises(EditInputBudgetExceeded) as exc_info:
+        ExecuteAgent()._build_edit_image_refs(
+            state=state,
+            task_id="task_001",
+            runtime_ctx={
+                "base_image_ref": "art_img_input_001",
+                "initial_base_image_ref": "art_img_input_001",
+                "reference_refs": ["art_img_input_002", "art_img_input_003"],
+                "grounding_ref": None,
+                "mask_ref": None,
+                "crop_ref": "art_crop_001",
+            },
+        )
 
-    assert image_refs == ["art_img_input_001", "art_collage_001", "art_crop_001"]
+    assert exc_info.value.attempted_refs == [
+        "art_img_input_001",
+        "art_collage_001",
+        "art_crop_001",
+        "art_img_input_002",
+        "art_img_input_003",
+    ]
 
 
 def test_edit_tool_generates_local_candidate_image_with_unified_args(tmp_path, mocker) -> None:
@@ -4678,6 +5302,36 @@ def test_runtime_run_logger_writes_jsonl(tmp_path, monkeypatch, capsys) -> None:
     assert all(record["run_id"] == result["run_id"] for record in records)
 
 
+def test_summarize_task_state_includes_active_instruction_fields() -> None:
+    state = _make_instruction_resolution_state(
+        artifacts={
+            "art_instruction_task_001_001": InstructionArtifact(
+                id="art_instruction_task_001_001",
+                payload={"instruction_text": "使用任务局部指令"},
+                role="task_instruction",
+                scope="task",
+            ),
+            "art_instruction_session_root_001": InstructionArtifact(
+                id="art_instruction_session_root_001",
+                payload={"instruction_text": "使用全局根指令"},
+                role="session_root_instruction",
+                scope="session",
+            ),
+        },
+        task_artifact_ids=[
+            "art_instruction_task_001_001",
+            "art_instruction_session_root_001",
+        ],
+    )
+
+    summary = summarize_task_state(state["session"].task_states["task_001"], state)
+
+    assert summary is not None
+    assert summary["active_instruction_artifact_id"] == "art_instruction_task_001_001"
+    assert summary["active_instruction_role"] == "task_instruction"
+    assert summary["active_instruction_preview"] == "使用任务局部指令"
+
+
 def test_runtime_run_logger_can_disable_file_and_console(tmp_path, monkeypatch, capsys) -> None:
     monkeypatch.setenv("AGENT_LOG_DIR", str(tmp_path))
     monkeypatch.setenv("AGENT_LOG_ENABLED", "false")
@@ -4717,10 +5371,14 @@ def test_prompt_module_builds_plan_prompt() -> None:
 
     assert "planning agent" in PLAN_SYSTEM_PROMPT
     assert "3-4 tasks" in PLAN_SYSTEM_PROMPT
+    assert "at most 3 input images" in PLAN_SYSTEM_PROMPT
+    assert "multiple thinking-act-observe rounds" in PLAN_SYSTEM_PROMPT
     assert "Avoid over-splitting" in PLAN_SYSTEM_PROMPT
     assert "Instruction: 把人物放到背景里" in prompt
     assert "Available artifacts for planning" in prompt
     assert "1-2 edit attempts" in prompt
+    assert "at most 3 input images" in prompt
+    assert "multiple thinking-act-observe rounds" in prompt
     assert "Do not invent future artifact ids" in prompt
 
 
@@ -4776,8 +5434,35 @@ def test_prompt_module_includes_execute_convergence_guidance() -> None:
         new_artifact_lines=["- art_image_001 | kind=image"],
     )
 
+    assert "multiple thinking-act-observe rounds" in EXECUTE_STRATEGY_SYSTEM_PROMPT
     assert "Target 1-2 edit attempts per task" in EXECUTE_STRATEGY_SYSTEM_PROMPT
+    assert "at most 3 input images" in EXECUTE_STRATEGY_SYSTEM_PROMPT
     assert "Prefer edit" in EXECUTE_STRATEGY_SYSTEM_PROMPT
     assert "let evaluator decide" in EXECUTE_OBSERVE_SYSTEM_PROMPT
+    assert "same execute checkpoint" in EXECUTE_OBSERVE_SYSTEM_PROMPT
+    assert "3-image input budget" in EXECUTE_OBSERVE_SYSTEM_PROMPT
+    assert "multiple thinking-act-observe rounds" in strategy_prompt
     assert "1-2 edit attempts" in strategy_prompt
+    assert "at most 3 image inputs" in strategy_prompt
     assert "prefer success and let evaluator decide" in observe_prompt
+
+
+def test_collage_prompt_emphasizes_in_bounds_layout() -> None:
+    from runtime.prompts import (
+        COLLAGE_LAYOUT_SYSTEM_PROMPT,
+        build_collage_layout_user_prompt,
+    )
+
+    prompt = build_collage_layout_user_prompt(
+        task_instruction="整理参考图",
+        layout_goal="make a clean reference board",
+        source_context="1. artifact_id=art_face_001; size=20x30",
+        max_canvas_width=4096,
+        max_canvas_height=4096,
+        max_canvas_pixels=16_777_216,
+    )
+
+    assert "after rotation" in COLLAGE_LAYOUT_SYSTEM_PROMPT
+    assert "out-of-bounds layout" in COLLAGE_LAYOUT_SYSTEM_PROMPT
+    assert "including after rotation" in prompt
+    assert "increase the canvas or reposition/resize the item first" in prompt

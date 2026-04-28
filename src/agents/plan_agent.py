@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 from llm import invoke_structured_llm, load_llm_config
+from runtime.artifact_context import add_to_session_working_set, register_artifact_in_session_pool
+from runtime.input_selector import initialize_task_working_set_from_session
 from runtime.prompts import PLAN_SYSTEM_PROMPT, build_plan_user_prompt
 from runtime.scheduler import select_next_runnable_task
 from runtime.state import RuntimeState
@@ -51,7 +53,7 @@ class PlanAgent:
             id=plan_id,
             instruction=plan_instruction,
             task_ids=[task.id for task in tasks],
-            input_artifact_ids=list(state["session"].artifact_index.by_type.get("image", [])),
+            input_artifact_ids=[entry.artifact_id for entry in state["session"].session_working_set],
             understanding_artifact_ids=[],
         )
 
@@ -70,6 +72,7 @@ class PlanAgent:
         session.current_task_id = first_runnable
         if first_runnable is not None:
             session.task_states[first_runnable].status = TaskStatus.RUNNING
+            initialize_task_working_set_from_session(state, first_runnable)
 
     def _apply_replan_plan(self, state: RuntimeState) -> None:
         session = state["session"]
@@ -103,6 +106,13 @@ class PlanAgent:
         )
 
         self._mark_old_plan_tasks_for_replan(state, old_plan_id)
+        for artifact_id in replan.preserve_artifact_ids:
+            add_to_session_working_set(
+                state,
+                artifact_id,
+                usage="replan preserved artifact",
+                selection_reason="carried forward from the failed task working set for replanning",
+            )
 
         state["plans"][new_plan.id] = new_plan
         for task in new_tasks:
@@ -119,6 +129,7 @@ class PlanAgent:
         session.current_task_id = first_runnable
         if first_runnable is not None:
             session.task_states[first_runnable].status = TaskStatus.RUNNING
+            initialize_task_working_set_from_session(state, first_runnable)
 
     def _is_replan(self, state: RuntimeState) -> bool:
         decision = state.get("decision")
@@ -141,9 +152,9 @@ class PlanAgent:
         replan = decision.replan
         assert replan is not None
         artifact_ids: list[str] = [
-            artifact_id
-            for artifact_id in state["session"].artifact_index.by_type.get("image", [])
-            if artifact_id.startswith("art_img_input_")
+            entry.artifact_id
+            for entry in state["session"].session_working_set
+            if entry.artifact_id in state["artifacts"]
         ]
         for artifact_id in replan.preserve_artifact_ids:
             if artifact_id in state["artifacts"] and artifact_id not in artifact_ids:
@@ -207,12 +218,14 @@ class PlanAgent:
     def _attach_instruction_artifact(self, state: RuntimeState, task: Task) -> None:
         instruction_artifact = InstructionArtifact(
             id=f"art_instruction_{task.id}_001",
+            summary=task.instruction,
             payload={"instruction_text": task.instruction},
             source_ids=list(task.input_artifact_ids),
             created_by="plan_agent",
+            role="task_instruction",
             scope="task",
         )
-        state["artifacts"][instruction_artifact.id] = instruction_artifact
+        register_artifact_in_session_pool(state, instruction_artifact)
         state["session"].task_states[task.id].task_artifact_ids.append(instruction_artifact.id)
 
     def _next_plan_id(self, state: RuntimeState) -> str:
@@ -286,7 +299,12 @@ class PlanAgent:
                 replan_context=replan_context,
                 retained_prefix_plan=retained_prefix_plan,
                 available_artifacts=available_artifacts,
-                image_artifact_ids=state["session"].artifact_index.by_type.get("image", []),
+                image_artifact_ids=[
+                    entry.artifact_id
+                    for entry in state["session"].session_working_set
+                    if entry.artifact_id in state["artifacts"]
+                    and state["artifacts"][entry.artifact_id].kind == "image"
+                ],
                 understanding_summaries=understanding_summaries,
             ),
             output_schema=PlanLLMOutput,

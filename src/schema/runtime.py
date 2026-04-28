@@ -63,9 +63,16 @@ class ExecuteLLMOutput(StrictModel):
     base_image_artifact_id: str | None = None
 
 
+class WorkingSetEntry(StrictModel):
+    artifact_id: str
+    usage: str
+    selection_reason: str = ""
+
+
 class ObserveArtifactSummary(StrictModel):
     artifact_id: str
     summary: str
+    role: str | None = None
 
 
 class ObserveLLMOutput(StrictModel):
@@ -111,6 +118,7 @@ class TaskState(StrictModel):
     task_id: str
     status: TaskStatus
     task_artifact_ids: list[str] = Field(default_factory=list)
+    task_working_set: list[WorkingSetEntry] = Field(default_factory=list)
     final_artifact_id: str | None = None
     resolved_input_artifact_ids: list[str] = Field(default_factory=list)
     retry_input_artifact_ids: list[str] = Field(default_factory=list)
@@ -123,6 +131,7 @@ class TaskState(StrictModel):
     latest_evaluate_checkpoint: str | None = None
     loop_count: int = 0
     evaluator_checkpoint_count: int = 0
+    edit_input_budget_overflow_count: int = 0
 
 
 class TaskRetryAdvice(StrictModel):
@@ -177,6 +186,7 @@ class SessionState(StrictModel):
     current_plan_id: str | None = None
     current_task_id: str | None = None
     task_states: dict[str, TaskState] = Field(default_factory=dict)
+    session_working_set: list[WorkingSetEntry] = Field(default_factory=list)
     artifact_index: ArtifactIndex | None = None
     latest_decision_id: str | None = None
     final_result_id: str | None = None

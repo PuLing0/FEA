@@ -278,9 +278,11 @@ class EvaluateTool:
         }
         artifact = EvaluationArtifact(
             id=next_artifact_id(state, ArtifactKind.EVALUATION),
+            summary=llm_output.reason,
             payload=payload,
             source_ids=[*input_refs, candidate_ref],
             created_by=self.name.value,
+            role="evaluation_feedback",
             scope="task",
         )
         invocation = ToolInvocationRecord(

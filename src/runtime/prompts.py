@@ -11,13 +11,22 @@ INPUT_THINKING_SYSTEM_PROMPT = (
 )
 
 INPUT_SELECTOR_SYSTEM_PROMPT = (
-    "You are a stateless image input selector. "
-    "Given candidate image descriptions and an input-thinking note, choose only the images needed for the task."
+    "You are a stateless artifact selector for initializing a task. "
+    "Given the current task instruction and the session working set, choose only the relevant image and instruction artifacts."
 )
 
 INPUT_VALIDATION_SYSTEM_PROMPT = (
     "You validate selected task input images before execution starts. "
     "Confirm whether the selected set is sufficient and coherent."
+)
+
+TASK_WORKING_SET_SELECTOR_SYSTEM_PROMPT = (
+    "You rebuild the current task working set for a continue-execute step. "
+    "You are given the current task pool, the latest task instruction, and the latest evaluation feedback. "
+    "Choose a compact working set for the next execute cycle. "
+    "Prefer keeping the current best candidate as the base when possible. "
+    "If the next step may use edit, keep the image subset small enough to respect the 3-image limit. "
+    "Return only structured output."
 )
 
 PLAN_SYSTEM_PROMPT = (
@@ -26,7 +35,11 @@ PLAN_SYSTEM_PROMPT = (
     "plan_instruction must be a single concise sentence. "
     "For a full edit request, generate 3-4 tasks unless the request is trivial. "
     "Avoid over-splitting; each task should be executable in one edit checkpoint. "
+    "One execute checkpoint may contain multiple thinking-act-observe rounds. "
     "Use a short mostly linear plan: prepare/understand inputs, create the first candidate, apply one targeted refinement if needed, then finalize. "
+    "A single edit tool call may use at most 3 input images. "
+    "A task may contain multiple edit rounds, but each edit round must stay within that 3-image budget. "
+    "When the goal appears to require more than 3 image roles at once, split it into smaller editable sub-goals instead of assuming runtime will handle the overflow automatically. "
     "When replan context is present, keep retained prefix tasks fixed and generate only 1-2 new suffix tasks. "
     "Do not put task JSON into plan_instruction."
 )
@@ -34,7 +47,12 @@ PLAN_SYSTEM_PROMPT = (
 EXECUTE_STRATEGY_SYSTEM_PROMPT = (
     "You are an execution planner for an image-editing agent. "
     "Choose only the next single tool for the next act. "
+    "One execute checkpoint may contain multiple thinking-act-observe rounds. "
+    "Use preparatory tools only when they unlock the next concrete act in the same checkpoint. "
     "Target 1-2 edit attempts per task, including evaluator-guided retries. "
+    "A single edit tool call may use at most 3 input images. "
+    "Before choosing edit, make sure the concrete image set for that round fits within the 3-image limit. "
+    "If the next edit would require more than 3 images, narrow the scope of the next edit round instead of attempting a large jump. "
     "Available tools: prompt_reconstruct, grounding, segment, crop, understand, collage, edit. "
     "Prefer edit when enough image inputs and a clear instruction are available. "
     "Use grounding only when a coarse location or bbox-style candidate region is required before a local edit; "
@@ -53,8 +71,10 @@ EXECUTE_OBSERVE_SYSTEM_PROMPT = (
     "You are the observe step of an image-editing execute agent. "
     "If an edit produced a candidate image, usually return success and let evaluator decide. "
     "Continue only when no candidate image exists, the selected tool was purely preparatory, or the tool failed to produce useful context. "
+    "When a preparatory act succeeds, prefer continue so the next act can happen in the same execute checkpoint. "
+    "If an edit plan exceeds the 3-image input budget, continue and explicitly steer the next round toward a smaller edit goal instead of repeating the same oversized step. "
     "Do not keep editing inside the same execute checkpoint for small aesthetic issues. "
-    "Also generate one short semantic summary for each newly produced artifact. "
+    "Also generate one short semantic summary and one concise role label for each newly produced artifact. "
     "Return only structured output."
 )
 
@@ -81,7 +101,9 @@ GROUNDING_SYSTEM_PROMPT = (
 COLLAGE_LAYOUT_SYSTEM_PROMPT = (
     "You are a layout planner for hard image collages. "
     "Return only the structured layout. Use every provided artifact exactly once. "
-    "Do not invent artifact ids. Keep all layers fully inside the canvas."
+    "Do not invent artifact ids. Keep every layer fully inside the canvas. "
+    "Every returned item must fit within the canvas before and after rotation. "
+    "If needed, enlarge the canvas or place items more conservatively instead of returning any out-of-bounds layout."
 )
 
 PROMPT_RECONSTRUCT_SYSTEM_PROMPT = (
@@ -135,8 +157,8 @@ def build_input_thinking_user_prompt(*, task: Any, candidates_text: str) -> str:
         f"Task instruction: {task.instruction}\n"
         f"Task depends_on: {task.depends_on}\n"
         f"Static task inputs: {task.input_artifact_ids}\n"
-        f"Candidate images:\n{candidates_text}\n"
-        "Briefly explain what image inputs are needed for this task before execution starts."
+        f"Candidate session artifacts:\n{candidates_text}\n"
+        "Briefly explain what image and instruction artifacts are needed for this task before execution starts."
     )
 
 
@@ -146,8 +168,9 @@ def build_input_selector_user_prompt(*, task: Any, thinking: str, candidates_tex
         f"Task instruction: {task.instruction}\n"
         f"Task depends_on: {task.depends_on}\n"
         f"Input thinking:\n{thinking}\n"
-        f"Candidate images:\n{candidates_text}\n"
-        "Return only selected_artifact_ids."
+        f"Session working set candidates:\n{candidates_text}\n"
+        "Return selected_artifact_ids and one working_set_entries item for each selected artifact. "
+        "Each working_set_entries item must include artifact_id, usage, and selection_reason."
     )
 
 
@@ -157,8 +180,8 @@ def build_input_validation_user_prompt(*, task: Any, selected_artifact_ids: list
         f"Task instruction: {task.instruction}\n"
         f"Selected artifact ids: {selected_artifact_ids}\n"
         f"Input thinking: {input_thinking}\n"
-        f"Candidate images:\n{candidates_text}\n"
-        "Briefly validate whether the selected image set is appropriate."
+        f"Candidate session artifacts:\n{candidates_text}\n"
+        "Briefly validate whether the selected artifact set is appropriate."
     )
 
 
@@ -179,7 +202,10 @@ def build_plan_user_prompt(
         f"Image artifact ids: {image_artifact_ids}\n"
         f"Understanding summaries: {understanding_summaries}\n"
         "Initial plans should target 3-4 tasks; replan outputs should add only 1-2 tasks. "
+        "Each task should fit inside one execute checkpoint, and one execute checkpoint may contain multiple thinking-act-observe rounds. "
         "Each task should be broad enough to finish with 1-2 edit attempts. "
+        "A single edit tool call may use at most 3 input images, so do not plan a task that requires one edit round to consume more than 3 images at once. "
+        "If more than 3 image roles are needed, split the work into smaller edit rounds or intermediate editable results. "
         "Each task must include: id, type, instruction, input_artifact_ids, "
         "depends_on, acceptance_criteria. Keep acceptance_criteria to 1-3 important checks. "
         "New tasks must use only the provided available new task ids when present. "
@@ -215,7 +241,7 @@ def build_execute_observe_user_prompt(
         "Return outcome as either 'continue' or 'success'. "
         "If the selected tool produced an edit candidate image, prefer success and let evaluator decide. "
         "Choose continue only for preparatory outputs or missing candidate images. "
-        "For each new artifact, write a concise summary explaining what it is and what role it plays in the current task."
+        "For each new artifact, write a concise summary explaining what it is and provide a concise role label describing what it does in the current task."
     )
 
 
@@ -227,6 +253,7 @@ def build_execute_strategy_user_prompt(
     resolved_image_summaries: str,
     retry_context: str | None,
     active_instruction: str,
+    task_working_set_summary: str = "(no current task working set)",
     task_artifact_context: str,
     latest_candidate_refs: list[str],
 ) -> str:
@@ -238,10 +265,38 @@ def build_execute_strategy_user_prompt(
         f"Resolved image candidates:\n{resolved_image_summaries}\n"
         f"Retry context: {retry_context}\n"
         f"Current active instruction: {active_instruction}\n"
+        f"Current task working set:\n{task_working_set_summary}\n"
         f"Task artifact summary:\n{task_artifact_context}\n"
         f"Latest candidate refs: {latest_candidate_refs}\n"
+        "One execute checkpoint may contain multiple thinking-act-observe rounds. "
+        "If you choose a preparatory tool now, assume a follow-up act can happen in the same checkpoint. "
+        "A single edit round may use at most 3 image inputs. "
+        "If satisfying the whole goal would require more than 3 images, choose a smaller next edit target instead of forcing all references into one edit call. "
         "Return reasoning, selected_tools, and base_image_artifact_id. selected_tools should contain exactly one next tool name. "
         "Prefer edit unless one preparatory tool is clearly necessary; keep the task within 1-2 edit attempts."
+    )
+
+
+def build_task_working_set_selector_user_prompt(
+    *,
+    task: Any,
+    active_instruction: str,
+    retry_context: str | None,
+    latest_candidate_refs: list[str],
+    task_pool_catalog: str,
+) -> str:
+    return (
+        f"Task type: {task.type}\n"
+        f"Task instruction: {task.instruction}\n"
+        f"Current active instruction: {active_instruction}\n"
+        f"Retry context: {retry_context}\n"
+        f"Latest candidate refs: {latest_candidate_refs}\n"
+        f"Task pool artifacts:\n{task_pool_catalog}\n"
+        "Rebuild a compact task working set for the next execute cycle. "
+        "Keep only the artifacts that are directly useful for the next step. "
+        "If an edit may happen next, keep the image subset small enough to fit within the 3-image limit. "
+        "Return selected_artifact_ids and one working_set_entries item for each selected artifact. "
+        "Each working_set_entries item must include artifact_id, usage, and selection_reason."
     )
 
 
@@ -287,7 +342,9 @@ def build_collage_layout_user_prompt(
         f"Canvas must be <= {max_canvas_width}x{max_canvas_height} and <= "
         f"{max_canvas_pixels} pixels. "
         "For each item, x/y are the top-left paste coordinates after resize/rotation, "
-        "width/height are the resized dimensions before rotation, and opacity is within [0, 1]."
+        "width/height are the resized dimensions before rotation, and opacity is within [0, 1]. "
+        "Do not return any item whose box exceeds the canvas, including after rotation. "
+        "If a placement would overflow, increase the canvas or reposition/resize the item first."
     )
 
 

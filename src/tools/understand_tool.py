@@ -58,6 +58,7 @@ class UnderstandTool:
         summary = str(response.content).strip()
         artifact = UnderstandingArtifact(
             id=next_artifact_id(state, ArtifactKind.UNDERSTANDING),
+            summary=summary,
             payload={
                 "image_ref": args.image_ref,
                 "task_instruction": task_instruction,
@@ -65,6 +66,7 @@ class UnderstandTool:
             },
             source_ids=[args.image_ref],
             created_by=self.name.value,
+            role="image_understanding",
             scope="task" if task_id != "bootstrap" else "session",
         )
         invocation = ToolInvocationRecord(

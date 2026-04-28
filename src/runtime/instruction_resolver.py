@@ -5,20 +5,53 @@ from __future__ import annotations
 from runtime.state import RuntimeState
 from schema import InstructionArtifact
 
+INSTRUCTION_ROLE_PRIORITY = (
+    "rewritten_instruction",
+    "task_instruction",
+    "session_root_instruction",
+)
 
-def resolve_active_instruction_text(state: RuntimeState, task_id: str) -> str:
-    """Return the latest task instruction text.
+def resolve_active_instruction_artifact(
+    state: RuntimeState,
+    task_id: str,
+) -> InstructionArtifact | None:
+    """Return the active instruction artifact visible to the task.
 
     Preference order:
-    1. latest task-level instruction artifact
-    2. fallback to Task.instruction
+    1. latest rewritten_instruction
+    2. latest task_instruction
+    3. latest session_root_instruction
     """
 
     task_state = state["session"].task_states[task_id]
-    for artifact_id in reversed(task_state.task_artifact_ids):
+    latest_by_role: dict[str, InstructionArtifact] = {}
+    latest_unclassified: InstructionArtifact | None = None
+    for artifact_id in task_state.task_artifact_ids:
         artifact = state["artifacts"].get(artifact_id)
-        if isinstance(artifact, InstructionArtifact):
-            text = artifact.get_instruction_text().strip()
-            if text:
-                return text
-    return state["tasks"][task_id].instruction
+        if not isinstance(artifact, InstructionArtifact):
+            continue
+        if not artifact.get_instruction_text():
+            continue
+        if artifact.role not in INSTRUCTION_ROLE_PRIORITY:
+            latest_unclassified = artifact
+            continue
+        latest_by_role[artifact.role] = artifact
+    for role in INSTRUCTION_ROLE_PRIORITY:
+        artifact = latest_by_role.get(role)
+        if artifact is not None:
+            return artifact
+    tasks = state.get("tasks", {})
+    if latest_unclassified is not None and task_id not in tasks:
+        return latest_unclassified
+    return None
+
+
+def resolve_active_instruction_text(state: RuntimeState, task_id: str) -> str:
+    """Return the active instruction text visible to the task."""
+
+    artifact = resolve_active_instruction_artifact(state, task_id)
+    if artifact is not None:
+        return artifact.get_instruction_text().strip()
+    tasks = state.get("tasks", {})
+    task = tasks.get(task_id)
+    return task.instruction if task is not None else ""

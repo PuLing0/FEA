@@ -11,6 +11,7 @@ from schema import (
     ArtifactIndex,
     ArtifactKind,
     ImageArtifact,
+    InstructionArtifact,
     SessionPhase,
     SessionState,
     ToolInvocationRecord,
@@ -20,6 +21,11 @@ from schema import (
 )
 
 from .prompts import BOOTSTRAP_UNDERSTAND_QUESTION_TEMPLATE
+from .config import default_max_execute_acts
+from .artifact_context import (
+    add_to_session_working_set,
+    register_artifact_in_session_pool,
+)
 from .run_logger import (
     create_run_logger,
     log_event,
@@ -50,16 +56,12 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
     if "image_uris" not in runtime_input or not runtime_input["image_uris"]:
         runtime_input["image_uris"] = [runtime_input["image_uri"]]
     max_task_loops = state.get("max_task_loops", 2)
-    max_execute_acts = state.get("max_execute_acts", 30)
+    max_execute_acts = state.get("max_execute_acts", default_max_execute_acts())
     max_evaluator_checkpoints = state.get("max_evaluator_checkpoints", 3)
     max_tool_failures = state.get("max_tool_failures", 3)
     logger = create_run_logger(runtime_input["session_id"])
     session = _initial_session(runtime_input["session_id"])
-    session.artifact_index = ArtifactIndex(
-        by_type={
-            ArtifactKind.IMAGE: [],
-        }
-    )
+    session.artifact_index = ArtifactIndex(by_type={})
     state = {
         "input": runtime_input,
         "session": session,
@@ -89,21 +91,44 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
         max_tool_failures=max_tool_failures,
     )
     log_event(state, "node_start", node="register_and_understand")
+    root_instruction = InstructionArtifact(
+        id="art_instruction_session_root_001",
+        summary=runtime_input["instruction_text"],
+        payload={"instruction_text": runtime_input["instruction_text"]},
+        created_by="user",
+        role="session_root_instruction",
+        scope="session",
+    )
+    register_artifact_in_session_pool(state, root_instruction)
+    add_to_session_working_set(
+        state,
+        root_instruction.id,
+        usage="session root instruction",
+        selection_reason="created from the user instruction at session start",
+    )
+    log_event(state, "artifact_created", **summarize_artifact(root_instruction))
     for index, image_uri in enumerate(runtime_input["image_uris"], start=1):
         image = ImageArtifact(
             id=f"art_img_input_{index:03d}",
             uri=image_uri,
-            payload={"role": "input", "slot_index": index},
+            payload={"role": "initial_input", "slot_index": index},
             created_by="user",
+            role="initial_input",
             scope="session",
         )
-        state["artifacts"][image.id] = image
-        state["session"].artifact_index.by_type.setdefault(ArtifactKind.IMAGE, []).append(image.id)
+        register_artifact_in_session_pool(state, image)
+        add_to_session_working_set(
+            state,
+            image.id,
+            usage="session input image",
+            selection_reason="provided by the user at session start",
+        )
         log_event(state, "artifact_created", **summarize_artifact(image))
 
         if not runtime_input.get("use_llm", False):
             understanding = UnderstandingArtifact(
                 id=f"art_understanding_bootstrap_{index:03d}",
+                summary=f"Input image slot {index}: {image_uri}",
                 payload={
                     "image_ref": image.id,
                     "task_instruction": runtime_input["instruction_text"],
@@ -111,9 +136,10 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
                 },
                 source_ids=[image.id],
                 created_by=ToolName.UNDERSTAND.value,
+                role="bootstrap_understanding",
                 scope="session",
             )
-            state["artifacts"][understanding.id] = understanding
+            register_artifact_in_session_pool(state, understanding)
             invocation = ToolInvocationRecord(
                     id=f"op_understand_bootstrap_{index:03d}",
                     task_id="bootstrap",
@@ -133,6 +159,8 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
                     raw_output_uri=f"runs/bootstrap/{ToolName.UNDERSTAND.value}.json",
                 )
             state["operations"].append(invocation)
+            image.summary = understanding.payload["summary"]
+            image.role = "initial_input"
             log_event(state, "operation_succeeded", **summarize_operation(invocation))
             log_event(state, "artifact_created", **summarize_artifact(understanding))
             continue
@@ -149,7 +177,10 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
         state["operations"].append(understand_execution.invocation)
         log_event(state, "operation_succeeded", **summarize_operation(understand_execution.invocation))
         for artifact in understand_execution.artifacts:
-            state["artifacts"][artifact.id] = artifact
+            register_artifact_in_session_pool(state, artifact)
+            if artifact.payload.get("summary"):
+                image.summary = artifact.payload["summary"]
+            image.role = "initial_input"
             log_event(state, "artifact_created", **summarize_artifact(artifact))
     state["session"].phase = SessionPhase.PLANNING
     log_event(state, "node_end", node="register_and_understand", image_artifact_ids=summarize_image_index(state))
@@ -188,7 +219,12 @@ def execute_current_task(state: RuntimeState) -> RuntimeState:
         if artifact_id not in before_artifact_ids:
             log_event(result, "artifact_created", **summarize_artifact(artifact))
     task_state = result["session"].task_states.get(task_id) if task_id else None
-    log_event(result, "execute_checkpoint", task_state=summarize_task_state(task_state), decision=summarize_decision(result.get("decision")))
+    log_event(
+        result,
+        "execute_checkpoint",
+        task_state=summarize_task_state(task_state, result),
+        decision=summarize_decision(result.get("decision")),
+    )
     log_event(result, "node_end", node="execute")
     return result
 
@@ -211,7 +247,7 @@ def evaluate_checkpoint(state: RuntimeState) -> RuntimeState:
         result,
         "evaluate_decision",
         decision_route=getattr(decision.route, "value", decision.route) if decision else None,
-        task_state=summarize_task_state(task_state),
+        task_state=summarize_task_state(task_state, result),
         decision=summarize_decision(decision),
     )
     log_event(result, "node_end", node="evaluate")
@@ -236,6 +272,7 @@ def build_runtime_graph(*, stop_after_plan: bool = False):
         "execute",
         _route_after_execute,
         {
+            "execute": "execute",
             "evaluate": "evaluate",
             "plan": "plan",
             "end": END,
@@ -267,6 +304,9 @@ def _route_after_execute(state: RuntimeState) -> str:
     if task_state.latest_execute_checkpoint == "passed":
         log_event(state, "route_next", route="evaluate")
         return "evaluate"
+    if task_state.latest_execute_checkpoint == "retry":
+        log_event(state, "route_next", route="execute")
+        return "execute"
     if task_state.latest_execute_checkpoint == "failed":
         log_event(state, "route_next", route="plan")
         return "plan"

@@ -11,6 +11,15 @@ from llm import (
     invoke_structured_multimodal_llm,
     load_llm_config,
 )
+from runtime.artifact_context import (
+    build_task_working_set_summary,
+    preserve_from_task_working_set,
+    register_task_artifact,
+)
+from runtime.instruction_resolver import (
+    resolve_active_instruction_artifact,
+    resolve_active_instruction_text,
+)
 from runtime.input_selector import prepare_task_inputs
 from runtime.prompts import (
     EXECUTE_COLLAGE_LAYOUT_GOAL,
@@ -23,6 +32,7 @@ from runtime.prompts import (
     build_execute_strategy_user_prompt,
     build_execution_history_summary_user_prompt,
 )
+from runtime.config import default_max_execute_acts
 from runtime.state import RuntimeState
 from schema import (
     ArtifactKind,
@@ -43,12 +53,29 @@ from schema import (
     SessionPhase,
     TaskActRecord,
     TaskLoop,
+    TaskRetryAdvice,
     TaskStatus,
     ToolName,
     ToolInvocationRecord,
     UnderstandArgs,
 )
 from tools.registry import ToolRegistry, build_default_tool_registry
+
+
+EDIT_IMAGE_INPUT_LIMIT = 3
+
+
+class EditInputBudgetExceeded(RuntimeError):
+    """Raised when one edit round needs more images than the edit tool allows."""
+
+    def __init__(self, attempted_refs: list[str]) -> None:
+        self.attempted_refs = list(attempted_refs)
+        self.attempted_count = len(self.attempted_refs)
+        super().__init__(
+            f"edit step requires {self.attempted_count} image refs, exceeding the "
+            f"{EDIT_IMAGE_INPUT_LIMIT}-image limit; reduce the edit goal and retry "
+            "with a smaller step"
+        )
 
 
 class ExecuteAgent:
@@ -70,7 +97,10 @@ class ExecuteAgent:
         task_state = session.task_states[current_task_id]
         act_records: list[tuple[str, str]] = []
         latest_refs: list[str] = []
-        max_acts = state.get("max_execute_acts", 30)
+        previous_latest_refs = list(task_state.latest_artifact_ids)
+        max_acts = state.get("max_execute_acts", default_max_execute_acts())
+        overflow_retry: EditInputBudgetExceeded | None = None
+        last_base_image_ref: str | None = None
 
         for act_index in range(1, max_acts + 1):
             strategy = (
@@ -97,6 +127,7 @@ class ExecuteAgent:
                 resolved_inputs=resolved_inputs,
                 strategy=strategy,
             )
+            last_base_image_ref = base_image_ref
             try:
                 execution = self._select_and_run_tool(
                     state=state,
@@ -107,6 +138,34 @@ class ExecuteAgent:
                     resolved_inputs=resolved_inputs,
                     base_image_ref=base_image_ref,
                 )
+            except EditInputBudgetExceeded as exc:
+                failed_invocation = self._build_failed_tool_invocation(
+                    state=state,
+                    task_id=current_task_id,
+                    loop_index=loop_index,
+                    tool_name=selected_tool,
+                    error=exc,
+                )
+                state["operations"].append(failed_invocation)
+                observation = (
+                    "Planned edit step exceeded the 3-image input budget: "
+                    f"{exc}. Narrow the next edit goal."
+                )
+                act_records.append((thinking, observation))
+                state["task_act_records"].append(
+                    TaskActRecord(
+                        task_id=current_task_id,
+                        loop_index=loop_index,
+                        act_index=act_index,
+                        thinking_text=thinking,
+                        tool_name=selected_tool.value,
+                        tool_args={},
+                        output_artifact_ids=[],
+                        observation_text=observation,
+                    )
+                )
+                overflow_retry = exc
+                break
             except Exception as exc:
                 failed_invocation = self._build_failed_tool_invocation(
                     state=state,
@@ -133,11 +192,6 @@ class ExecuteAgent:
                 break
 
             state["operations"].append(execution.invocation)
-            for artifact in execution.artifacts:
-                state["artifacts"][artifact.id] = artifact
-                if artifact.id not in task_state.task_artifact_ids:
-                    task_state.task_artifact_ids.append(artifact.id)
-
             observe_result = self._observe_with_llm(
                 state=state,
                 task=task,
@@ -146,6 +200,14 @@ class ExecuteAgent:
                 execution=execution,
             )
             self._apply_observe_artifact_summaries(execution.artifacts, observe_result)
+            for artifact in execution.artifacts:
+                register_task_artifact(
+                    state,
+                    current_task_id,
+                    artifact,
+                    usage=artifact.role or f"artifact produced by {selected_tool.value}",
+                    selection_reason=f"produced in the current execute cycle via {selected_tool.value}",
+                )
             observation = observe_result.observation
             act_records.append((thinking, observation))
             state["task_act_records"].append(
@@ -172,15 +234,52 @@ class ExecuteAgent:
                     break
 
         task_state.loop_count += 1
-        task_state.latest_artifact_ids = latest_refs
-        if latest_refs:
+        if overflow_retry is not None:
+            task_state.latest_execution_outcome = ExecutionOutcome.FAILURE
+            task_state.latest_artifact_ids = previous_latest_refs
+            task_state.edit_input_budget_overflow_count += 1
+            if task_state.edit_input_budget_overflow_count >= 2:
+                task_state.latest_execute_checkpoint = "failed"
+                self._clear_retry_context(task_state)
+                task_state.status = TaskStatus.REPLANNED
+                task_state.edit_input_budget_overflow_count = 0
+                session.current_task_id = None
+                session.phase = SessionPhase.PLANNING
+                decision = self._build_edit_input_budget_replan_decision(
+                    state=state,
+                    task_id=current_task_id,
+                    overflow_error=overflow_retry,
+                )
+            else:
+                task_state.latest_execute_checkpoint = "retry"
+                task_state.status = TaskStatus.RUNNING
+                session.current_task_id = current_task_id
+                session.phase = SessionPhase.EXECUTING
+                decision = self._build_edit_input_budget_retry_decision(
+                    state=state,
+                    task_id=current_task_id,
+                    overflow_error=overflow_retry,
+                    base_image_ref=previous_latest_refs[-1] if previous_latest_refs else last_base_image_ref,
+                )
+                self._apply_execute_retry_context(
+                    state=state,
+                    task_id=current_task_id,
+                    task_retry=decision.task_retry,
+                )
+            state["decision"] = decision
+            session.latest_decision_id = decision.id
+        elif latest_refs:
+            task_state.latest_artifact_ids = latest_refs
             task_state.latest_execution_outcome = ExecutionOutcome.SUCCESS
             task_state.latest_execute_checkpoint = "passed"
+            task_state.edit_input_budget_overflow_count = 0
             task_state.status = TaskStatus.WAITING_EVALUATION
             session.phase = SessionPhase.EVALUATING
         else:
+            task_state.latest_artifact_ids = latest_refs
             task_state.latest_execution_outcome = ExecutionOutcome.FAILURE
             task_state.latest_execute_checkpoint = "failed"
+            task_state.edit_input_budget_overflow_count = 0
             self._clear_retry_context(task_state)
             task_state.status = TaskStatus.REPLANNED
             session.current_task_id = None
@@ -234,7 +333,15 @@ class ExecuteAgent:
                     f"Act executed {selected_tool.value} and produced "
                     f"{len(execution.artifacts)} artifact(s)."
                 ),
-                artifact_summaries=[],
+                artifact_summaries=[
+                    {
+                        "artifact_id": artifact.id,
+                        "summary": artifact.summary
+                        or f"{selected_tool.value} produced {artifact.kind} {artifact.id}",
+                        "role": artifact.role or artifact.kind,
+                    }
+                    for artifact in execution.artifacts
+                ],
             )
         image_paths = self._resolve_observe_image_paths(execution.artifacts)
         source_lines = []
@@ -292,13 +399,17 @@ class ExecuteAgent:
         return image_paths
 
     def _apply_observe_artifact_summaries(self, artifacts, observe_result: ObserveLLMOutput) -> None:
-        summary_by_id = {
-            item.artifact_id: item.summary
+        annotations_by_id = {
+            item.artifact_id: item
             for item in observe_result.artifact_summaries
         }
         for artifact in artifacts:
-            if artifact.id in summary_by_id:
-                artifact.summary = summary_by_id[artifact.id]
+            annotation = annotations_by_id.get(artifact.id)
+            if annotation is None:
+                continue
+            artifact.summary = annotation.summary
+            if annotation.role:
+                artifact.role = annotation.role
 
     def _build_execute_failure_replan_decision(
         self,
@@ -357,7 +468,87 @@ class ExecuteAgent:
             replan=ReplanRequest(
                 mode=self._fallback_replan_mode(task.type),
                 reason=failure_reason,
-                preserve_artifact_ids=list(task_state.task_artifact_ids[-6:]),
+                preserve_artifact_ids=preserve_from_task_working_set(state, task_id),
+            ),
+        )
+
+    def _build_edit_input_budget_retry_decision(
+        self,
+        *,
+        state: RuntimeState,
+        task_id: str,
+        overflow_error: EditInputBudgetExceeded,
+        base_image_ref: str | None,
+    ) -> Decision:
+        task_state = state["session"].task_states[task_id]
+        task_retry = TaskRetryAdvice(
+            reason=(
+                "The planned edit step required more than 3 input images. "
+                "Shrink the next edit goal and continue the same task with a smaller step."
+            ),
+            base_candidate_artifact_id=base_image_ref,
+            reuse_artifact_ids=[],
+            fix_focuses=[
+                "Reduce the next edit round so it uses at most 3 image inputs.",
+                "Do not try to satisfy all references in one edit call.",
+            ],
+            avoid_changes=[
+                "Do not silently drop reference images.",
+                "Do not expand the edit goal before the input budget fits.",
+            ],
+        )
+        return Decision(
+            id=f"dec_exec_retry_{task_id}_{task_state.loop_count + 1:03d}",
+            route=DecisionRoute.CONTINUE_EXECUTE,
+            task_id=task_id,
+            plan_id=state["session"].current_plan_id,
+            source_execution_outcome=ExecutionOutcome.FAILURE,
+            candidate_artifact_ids=list(task_state.latest_artifact_ids),
+            summary=(
+                f"planned edit step exceeded the {EDIT_IMAGE_INPUT_LIMIT}-image input "
+                f"budget with {overflow_error.attempted_count} refs"
+            ),
+            issues=[
+                "edit_input_budget_exceeded",
+                f"attempted_count={overflow_error.attempted_count}",
+                f"attempted_refs={overflow_error.attempted_refs}",
+            ],
+            task_retry=task_retry,
+        )
+
+    def _build_edit_input_budget_replan_decision(
+        self,
+        *,
+        state: RuntimeState,
+        task_id: str,
+        overflow_error: EditInputBudgetExceeded,
+    ) -> Decision:
+        task = state["tasks"][task_id]
+        task_state = state["session"].task_states[task_id]
+        return Decision(
+            id=f"dec_exec_fail_{task_id}_{task_state.loop_count + 1:03d}",
+            route=DecisionRoute.REPLAN,
+            task_id=task_id,
+            plan_id=state["session"].current_plan_id,
+            source_execution_outcome=ExecutionOutcome.FAILURE,
+            candidate_artifact_ids=list(task_state.latest_artifact_ids),
+            summary=(
+                "the same task repeatedly planned edit steps that exceeded the "
+                f"{EDIT_IMAGE_INPUT_LIMIT}-image input budget"
+            ),
+            issues=[
+                "edit_input_budget_exceeded",
+                "edit_input_budget_retry_limit_exceeded",
+                f"attempted_count={overflow_error.attempted_count}",
+                f"attempted_refs={overflow_error.attempted_refs}",
+            ],
+            replan=ReplanRequest(
+                mode=self._fallback_replan_mode(task.type),
+                reason=(
+                    "the task repeatedly required more than 3 images in a single "
+                    "edit step, so it should be replanned into smaller edit goals"
+                ),
+                preserve_artifact_ids=preserve_from_task_working_set(state, task_id),
             ),
         )
 
@@ -376,6 +567,7 @@ class ExecuteAgent:
             1
             for operation in state.get("operations", [])
             if operation.status == "failed"
+            and (operation.error or {}).get("type") != "EditInputBudgetExceeded"
         )
 
     def _build_failed_tool_invocation(
@@ -387,6 +579,19 @@ class ExecuteAgent:
         tool_name: ToolName,
         error: Exception,
     ) -> ToolInvocationRecord:
+        if isinstance(error, EditInputBudgetExceeded):
+            error_payload = {
+                "type": "EditInputBudgetExceeded",
+                "message": str(error),
+                "attempted_refs": list(error.attempted_refs),
+                "attempted_count": error.attempted_count,
+                "limit": EDIT_IMAGE_INPUT_LIMIT,
+            }
+        else:
+            error_payload = {
+                "type": type(error).__name__,
+                "message": str(error),
+            }
         return ToolInvocationRecord(
             id=f"op_{tool_name.value}_{len(state.get('operations', [])) + 1:03d}",
             task_id=task_id,
@@ -395,10 +600,7 @@ class ExecuteAgent:
             args={},
             status="failed",
             output_refs=[],
-            error={
-                "type": type(error).__name__,
-                "message": str(error),
-            },
+            error=error_payload,
         )
 
     def _fallback_replan_mode(self, task_type: str) -> ReplanMode:
@@ -503,7 +705,7 @@ class ExecuteAgent:
     def _is_evaluable_candidate_artifact(self, artifact) -> bool:
         if artifact.kind != ArtifactKind.IMAGE:
             return False
-        return artifact.created_by == ToolName.EDIT.value or artifact.payload.get("role") == "candidate_image"
+        return artifact.created_by == ToolName.EDIT.value or artifact.role == "candidate_image"
 
     def _is_image_artifact(self, state: RuntimeState, artifact_id: str) -> bool:
         artifact = self._get_artifact(state, artifact_id)
@@ -585,7 +787,7 @@ class ExecuteAgent:
         retry_context = state["session"].task_states[task_id].retry_context_text
         if retry_context:
             return (
-                "This is an evaluator-guided retry for the same task. "
+                "This is a retry for the same task. "
                 f"Use the retry context below to decide the next single tool.\n{retry_context}"
             )
         if task.type == "local_edit":
@@ -715,7 +917,7 @@ class ExecuteAgent:
             if (
                 artifact is not None
                 and artifact.kind == "image"
-                and artifact.payload.get("role") == "cropped_preview"
+                and artifact.role == "cropped_preview"
             ):
                 return artifact_id
         return None
@@ -726,7 +928,7 @@ class ExecuteAgent:
             if (
                 artifact is not None
                 and artifact.kind == "image"
-                and artifact.payload.get("role") == "collage_reference"
+                and artifact.role == "collage_reference"
             ):
                 return artifact_id
         return None
@@ -755,12 +957,12 @@ class ExecuteAgent:
         append_image_ref(runtime_ctx["crop_ref"])
         for artifact_id in runtime_ctx["reference_refs"]:
             append_image_ref(artifact_id)
-            if len(image_refs) >= 3:
-                break
 
         if not image_refs:
             raise ValueError("edit requires at least one image input")
-        return image_refs[:3]
+        if len(image_refs) > EDIT_IMAGE_INPUT_LIMIT:
+            raise EditInputBudgetExceeded(image_refs)
+        return image_refs
 
     def _has_understanding_for_image(
         self,
@@ -802,11 +1004,15 @@ class ExecuteAgent:
                 resolved_image_summaries=self._build_resolved_image_summaries(state, task.id, resolved_ids),
                 retry_context=state["session"].task_states[task.id].retry_context_text,
                 active_instruction=self._resolve_active_instruction_text_from_artifacts(state, task.id),
+                task_working_set_summary=self._build_task_working_set_context(state, task.id),
                 task_artifact_context=self._build_task_artifact_context(state, task.id),
                 latest_candidate_refs=state["session"].task_states[task.id].latest_artifact_ids,
             ),
             output_schema=ExecuteLLMOutput,
         )
+
+    def _build_task_working_set_context(self, state: RuntimeState, task_id: str) -> str:
+        return build_task_working_set_summary(state, task_id)
 
     def _build_task_artifact_context(self, state: RuntimeState, task_id: str) -> str:
         lines: list[str] = []
@@ -815,7 +1021,7 @@ class ExecuteAgent:
             if artifact is None:
                 continue
             if artifact.kind == "image":
-                role = artifact.payload.get("role", "image")
+                role = artifact.role or artifact.payload.get("role", "image")
                 if role == "collage_reference":
                     block_ids = artifact.payload.get("block_artifact_ids", [])
                     lines.append(f"[{artifact_id}] image role={role} summary={artifact.summary or ''} blocks={block_ids}")
@@ -899,6 +1105,60 @@ class ExecuteAgent:
         task_state.retry_input_artifact_ids = []
         task_state.retry_context_text = None
 
+    def _apply_execute_retry_context(
+        self,
+        *,
+        state: RuntimeState,
+        task_id: str,
+        task_retry: TaskRetryAdvice | None,
+    ) -> None:
+        if task_retry is None:
+            return
+        task_state = state["session"].task_states[task_id]
+        retry_ids = list(task_state.resolved_input_artifact_ids)
+        if task_retry.base_candidate_artifact_id and task_retry.base_candidate_artifact_id in state["artifacts"]:
+            if task_retry.base_candidate_artifact_id not in retry_ids:
+                retry_ids.append(task_retry.base_candidate_artifact_id)
+        latest_instruction_id = self._find_latest_instruction_artifact_id(state, task_id)
+        if latest_instruction_id and latest_instruction_id not in retry_ids:
+            retry_ids.append(latest_instruction_id)
+        for artifact_id in task_retry.reuse_artifact_ids:
+            if artifact_id in state["artifacts"] and artifact_id not in retry_ids:
+                retry_ids.append(artifact_id)
+        task_state.retry_input_artifact_ids = retry_ids
+        task_state.retry_context_text = self._build_retry_context_text(task_retry)
+        task_state.task_working_set = []
+        task_state.resolved_input_artifact_ids = []
+        task_state.input_selection_reasoning = None
+        task_state.input_validation_summary = None
+
+    def _find_latest_instruction_artifact_id(
+        self,
+        state: RuntimeState,
+        task_id: str,
+    ) -> str | None:
+        artifact = resolve_active_instruction_artifact(state, task_id)
+        return artifact.id if artifact is not None else None
+
+    def _build_retry_context_text(self, task_retry: TaskRetryAdvice) -> str:
+        lines = [
+            "Retry feedback:",
+            f"- Reason: {task_retry.reason}",
+        ]
+        if task_retry.base_candidate_artifact_id:
+            lines.append(f"- Base candidate: {task_retry.base_candidate_artifact_id}")
+        if task_retry.reuse_artifact_ids:
+            lines.append(f"- Reuse artifacts: {', '.join(task_retry.reuse_artifact_ids)}")
+        if task_retry.fix_focuses:
+            lines.append("- Fix focuses:")
+            for index, item in enumerate(task_retry.fix_focuses, start=1):
+                lines.append(f"  {index}. {item}")
+        if task_retry.avoid_changes:
+            lines.append("- Avoid changes:")
+            for index, item in enumerate(task_retry.avoid_changes, start=1):
+                lines.append(f"  {index}. {item}")
+        return "\n".join(lines)
+
     def _has_reconstructed_instruction(self, state: RuntimeState, task_id: str) -> bool:
         for artifact_id in reversed(state["session"].task_states[task_id].task_artifact_ids):
             artifact = self._get_artifact(state, artifact_id)
@@ -914,13 +1174,7 @@ class ExecuteAgent:
         state: RuntimeState,
         task_id: str,
     ) -> str:
-        for artifact_id in reversed(state["session"].task_states[task_id].task_artifact_ids):
-            artifact = self._get_artifact(state, artifact_id)
-            if isinstance(artifact, InstructionArtifact):
-                text = artifact.get_instruction_text()
-                if text:
-                    return text
-        return state["tasks"][task_id].instruction
+        return resolve_active_instruction_text(state, task_id)
 
     def _build_prompt_reconstruct_context(
         self,

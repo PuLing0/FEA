@@ -38,6 +38,7 @@ from .runtime import (
     TaskLoop,
     TaskRetryAdvice,
     TaskState,
+    WorkingSetEntry,
 )
 from .tools import (
     CollageArgs,
@@ -105,4 +106,5 @@ __all__ = [
     "ToolName",
     "UnderstandArgs",
     "UnderstandingArtifact",
+    "WorkingSetEntry",
 ]

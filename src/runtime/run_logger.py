@@ -11,6 +11,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from runtime.instruction_resolver import (
+    resolve_active_instruction_artifact,
+    resolve_active_instruction_text,
+)
 from schema import ArtifactKind
 
 
@@ -162,7 +166,7 @@ def summarize_artifact(artifact: Any) -> dict[str, Any]:
         "uri": artifact.uri,
         "created_by": artifact.created_by,
         "source_ids": list(artifact.source_ids),
-        "role": artifact.payload.get("role") if isinstance(artifact.payload, dict) else None,
+        "role": getattr(artifact, "role", None),
     }
 
 
@@ -180,18 +184,34 @@ def summarize_decision(decision: Any | None) -> dict[str, Any] | None:
     }
 
 
-def summarize_task_state(task_state: Any | None) -> dict[str, Any] | None:
+def summarize_task_state(
+    task_state: Any | None,
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     if task_state is None:
         return None
-    return {
+    summary = {
         "task_id": task_state.task_id,
         "status": getattr(task_state.status, "value", task_state.status),
         "latest_artifact_ids": list(task_state.latest_artifact_ids),
+        "task_working_set_ids": [entry.artifact_id for entry in getattr(task_state, "task_working_set", [])],
         "latest_execute_checkpoint": task_state.latest_execute_checkpoint,
         "latest_evaluate_checkpoint": task_state.latest_evaluate_checkpoint,
         "loop_count": task_state.loop_count,
         "evaluator_checkpoint_count": task_state.evaluator_checkpoint_count,
+        "edit_input_budget_overflow_count": getattr(task_state, "edit_input_budget_overflow_count", 0),
     }
+    if state is not None:
+        artifact = resolve_active_instruction_artifact(state, task_state.task_id)
+        active_instruction = (
+            artifact.get_instruction_text()
+            if artifact is not None
+            else resolve_active_instruction_text(state, task_state.task_id)
+        )
+        summary["active_instruction_artifact_id"] = artifact.id if artifact is not None else None
+        summary["active_instruction_role"] = artifact.role if artifact is not None else None
+        summary["active_instruction_preview"] = active_instruction[:120]
+    return summary
 
 
 def summarize_image_index(state: dict[str, Any]) -> list[str]:

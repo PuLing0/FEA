@@ -29,6 +29,7 @@ load_dotenv(REPO_ROOT / ".env")
 
 from agent import create_agent  # noqa: E402
 from llm import load_llm_config  # noqa: E402
+from runtime.config import default_max_execute_acts  # noqa: E402
 from runtime.prompts import REAL_AGENT_SMOKE_DEFAULT_INSTRUCTION  # noqa: E402
 from schema import ArtifactKind, SessionPhase, ToolName  # noqa: E402
 from vision_backends.firered_edit_backend import unload_pipeline  # noqa: E402
@@ -177,7 +178,12 @@ def main() -> int:
             "use_llm": True,
         },
         "max_task_loops": int(os.getenv("REAL_AGENT_SMOKE_MAX_TASK_LOOPS", "2")),
-        "max_execute_acts": int(os.getenv("REAL_AGENT_SMOKE_MAX_EXECUTE_ACTS", "1")),
+        "max_execute_acts": int(
+            os.getenv(
+                "REAL_AGENT_SMOKE_MAX_EXECUTE_ACTS",
+                str(default_max_execute_acts()),
+            )
+        ),
         "max_evaluator_checkpoints": int(os.getenv("REAL_AGENT_SMOKE_MAX_EVALUATOR_CHECKPOINTS", "1")),
         "max_tool_failures": int(os.getenv("REAL_AGENT_SMOKE_MAX_TOOL_FAILURES", "1")),
     }

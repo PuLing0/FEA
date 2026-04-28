@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 from langgraph.graph.state import CompiledStateGraph
 
 from runtime.graph import build_runtime_graph
+from runtime.config import default_max_execute_acts
 from schema import ArtifactKind, SessionPhase, ToolName
 from vision_backends.firered_edit_backend import unload_pipeline
 
@@ -187,7 +188,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional target route for deterministic/fallback evaluators.",
     )
     parser.add_argument("--max-task-loops", type=_positive_int, default=2, help="Maximum execute/evaluate loops per task.")
-    parser.add_argument("--max-execute-acts", type=_positive_int, default=1, help="Maximum tool acts per execute node.")
+    parser.add_argument(
+        "--max-execute-acts",
+        type=_positive_int,
+        default=default_max_execute_acts(),
+        help="Maximum thinking-act-observe rounds per execute node.",
+    )
     parser.add_argument(
         "--max-evaluator-checkpoints",
         type=_positive_int,

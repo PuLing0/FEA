@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from .base import ArtifactKind, ArtifactStage, StrictModel
 
@@ -19,8 +19,19 @@ class ArtifactBase(StrictModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     source_ids: list[str] = Field(default_factory=list)
     created_by: str | None = None
+    role: str | None = None
     scope: Literal["session", "task"] = "task"
     stage: ArtifactStage = ArtifactStage.WORKING
+
+    @model_validator(mode="after")
+    def sync_role_with_payload(self) -> "ArtifactBase":
+        if isinstance(self.payload, dict):
+            payload_role = self.payload.get("role")
+            if self.role is None and isinstance(payload_role, str) and payload_role.strip():
+                self.role = payload_role.strip()
+            elif self.role is not None and "role" not in self.payload:
+                self.payload["role"] = self.role
+        return self
 
 
 class ImageArtifact(ArtifactBase):

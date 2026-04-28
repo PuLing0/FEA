@@ -141,7 +141,8 @@ Optional overrides:
 - `REAL_AGENT_SMOKE_IMAGES` is a comma-separated image list; by default the script uses `examples/fig1.jpg` through `examples/fig4.jpg`.
 - `REAL_AGENT_SMOKE_IMAGE` points to a single input image when `REAL_AGENT_SMOKE_IMAGES` is not set.
 - `REAL_AGENT_SMOKE_INSTRUCTION` overrides the edit instruction.
-- `REAL_AGENT_SMOKE_MAX_EXECUTE_ACTS` limits execute-loop tool calls; the default is `1` for a fast real edit smoke.
+- `AGENT_MAX_EXECUTE_ACTS` sets the default execute-loop tool-call budget for the runtime.
+- `REAL_AGENT_SMOKE_MAX_EXECUTE_ACTS` overrides that budget for the smoke script only; if unset, the smoke script falls back to `AGENT_MAX_EXECUTE_ACTS`.
 - `REAL_AGENT_SMOKE_STOP_AFTER_FIRST_EDIT` defaults to `true`; the smoke exits after the first real FireRed candidate instead of waiting for all evaluator retries. Set it to `false` for a full terminal graph run.
 - `REAL_AGENT_SMOKE_MAX_EVALUATOR_CHECKPOINTS` limits evaluator retries.
 
