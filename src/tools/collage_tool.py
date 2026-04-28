@@ -84,9 +84,13 @@ class CollageTool:
             self._resolve_source_image(state, artifact_id)
             for artifact_id in args.block_artifact_ids
         ]
-        layout = self._plan_layout(
+        planned_layout = self._plan_layout(
             task_instruction=task_instruction,
             args=args,
+            source_images=source_images,
+        )
+        layout = self._expand_canvas_to_fit(
+            layout=planned_layout,
             source_images=source_images,
         )
         self._validate_layout(layout=layout, input_ids=args.block_artifact_ids)
@@ -117,6 +121,15 @@ class CollageTool:
             created_by=self.name.value,
             scope="task",
         )
+        if (
+            layout.canvas_width != planned_layout.canvas_width
+            or layout.canvas_height != planned_layout.canvas_height
+        ):
+            artifact.payload["canvas_auto_expanded"] = True
+            artifact.payload["planned_canvas"] = {
+                "width": planned_layout.canvas_width,
+                "height": planned_layout.canvas_height,
+            }
         invocation = ToolInvocationRecord(
             id=next_operation_id(state, self.name),
             task_id=task_id,
@@ -160,7 +173,7 @@ class CollageTool:
             width=width,
             height=height,
             summary=artifact.summary or artifact.payload.get("summary"),
-            role=artifact.payload.get("role"),
+            role=artifact.role,
             description=artifact.payload.get("description"),
         )
 
@@ -227,6 +240,68 @@ class CollageTool:
                     f"canvas=({layout.canvas_width}, {layout.canvas_height})"
                 )
 
+    @classmethod
+    def _expand_canvas_to_fit(
+        cls,
+        *,
+        layout: CollageLayoutResult,
+        source_images: list[SourceImage],
+    ) -> CollageLayoutResult:
+        required_width = layout.canvas_width
+        required_height = layout.canvas_height
+        source_by_id = {source_image.artifact_id: source_image for source_image in source_images}
+
+        for item in layout.items:
+            required_width = max(required_width, item.x + item.width)
+            required_height = max(required_height, item.y + item.height)
+            source_image = source_by_id.get(item.artifact_id)
+            if source_image is None:
+                continue
+            layer = cls._build_layer_image(source_image=source_image, item=item)
+            required_width = max(required_width, item.x + layer.width)
+            required_height = max(required_height, item.y + layer.height)
+
+        if (
+            required_width == layout.canvas_width
+            and required_height == layout.canvas_height
+        ):
+            return layout
+        if required_width > MAX_CANVAS_WIDTH or required_height > MAX_CANVAS_HEIGHT:
+            raise ValueError(
+                "Collage layout requires a larger canvas than allowed: "
+                f"required=({required_width}, {required_height}), "
+                f"max=({MAX_CANVAS_WIDTH}, {MAX_CANVAS_HEIGHT})"
+            )
+        if required_width * required_height > MAX_CANVAS_PIXELS:
+            raise ValueError(
+                "Collage layout requires too many pixels after auto-expansion: "
+                f"required={required_width * required_height}, max={MAX_CANVAS_PIXELS}"
+            )
+        return CollageLayoutResult(
+            canvas_width=required_width,
+            canvas_height=required_height,
+            background=layout.background,
+            items=[item.model_copy() for item in layout.items],
+        )
+
+    @staticmethod
+    def _build_layer_image(*, source_image: SourceImage, item: CollageLayoutItem) -> Image.Image:
+        with Image.open(source_image.path) as image:
+            layer = image.convert("RGBA").resize(
+                (item.width, item.height),
+                Image.Resampling.LANCZOS,
+            )
+        if item.rotation_degrees:
+            layer = layer.rotate(
+                item.rotation_degrees,
+                expand=True,
+                resample=Image.Resampling.BICUBIC,
+            )
+        if item.opacity < 1.0:
+            alpha = layer.getchannel("A").point(lambda value: int(value * item.opacity))
+            layer.putalpha(alpha)
+        return layer
+
     @staticmethod
     def _render_collage(
         *,
@@ -237,13 +312,7 @@ class CollageTool:
         source_by_id = {source_image.artifact_id: source_image for source_image in source_images}
         for item in sorted(layout.items, key=lambda candidate: candidate.z_index):
             source_image = source_by_id[item.artifact_id]
-            with Image.open(source_image.path) as image:
-                layer = image.convert("RGBA").resize((item.width, item.height), Image.Resampling.LANCZOS)
-            if item.rotation_degrees:
-                layer = layer.rotate(item.rotation_degrees, expand=True, resample=Image.Resampling.BICUBIC)
-            if item.opacity < 1.0:
-                alpha = layer.getchannel("A").point(lambda value: int(value * item.opacity))
-                layer.putalpha(alpha)
+            layer = CollageTool._build_layer_image(source_image=source_image, item=item)
             if item.x + layer.width > layout.canvas_width or item.y + layer.height > layout.canvas_height:
                 raise ValueError(
                     f"Collage item '{item.artifact_id}' exceeds the canvas bounds after rotation: "

@@ -344,7 +344,7 @@ def test_collage_tool_rejects_layout_with_unknown_artifact(mocker, tmp_path) -> 
         )
 
 
-def test_collage_tool_rejects_layout_outside_canvas(mocker, tmp_path) -> None:
+def test_collage_tool_auto_expands_canvas_for_layout_outside_canvas(mocker, tmp_path) -> None:
     face_path = tmp_path / "face.png"
     cloth_path = tmp_path / "cloth.png"
     _write_image(face_path, size=(16, 16), color=(255, 0, 0, 255))
@@ -379,7 +379,64 @@ def test_collage_tool_rejects_layout_outside_canvas(mocker, tmp_path) -> None:
         }
     )
 
-    with pytest.raises(ValueError, match="exceeds the canvas bounds"):
+    result = CollageTool().run(
+        state,
+        task_id="task_001",
+        loop_index=1,
+        args=CollageArgs(
+            block_artifact_ids=["art_face_001", "art_cloth_001"],
+            layout_goal="make a reference board",
+        ),
+    )
+
+    artifact = result.artifacts[0]
+    assert artifact.payload["canvas"] == {
+        "width": 40,
+        "height": 16,
+        "background": "transparent",
+    }
+    assert artifact.payload["canvas_auto_expanded"] is True
+    assert artifact.payload["planned_canvas"] == {"width": 32, "height": 16}
+    with Image.open(artifact.uri) as output_image:
+        assert output_image.size == (40, 16)
+
+
+def test_collage_tool_rejects_layout_that_exceeds_max_canvas_after_auto_expand(mocker, tmp_path) -> None:
+    face_path = tmp_path / "face.png"
+    cloth_path = tmp_path / "cloth.png"
+    _write_image(face_path, size=(16, 16), color=(255, 0, 0, 255))
+    _write_image(cloth_path, size=(16, 16), color=(0, 255, 0, 255))
+    mocker.patch(
+        "tools.collage_tool.invoke_structured_multimodal_llm",
+        return_value=CollageLayoutResult(
+            canvas_width=4096,
+            canvas_height=32,
+            items=[
+                CollageLayoutItem(
+                    artifact_id="art_face_001",
+                    x=0,
+                    y=0,
+                    width=16,
+                    height=16,
+                ),
+                CollageLayoutItem(
+                    artifact_id="art_cloth_001",
+                    x=4090,
+                    y=0,
+                    width=16,
+                    height=16,
+                ),
+            ],
+        ),
+    )
+    state = _make_state(
+        artifacts={
+            "art_face_001": ImageArtifact(id="art_face_001", uri=str(face_path)),
+            "art_cloth_001": ImageArtifact(id="art_cloth_001", uri=str(cloth_path)),
+        }
+    )
+
+    with pytest.raises(ValueError, match="requires a larger canvas than allowed"):
         CollageTool().run(
             state,
             task_id="task_001",
