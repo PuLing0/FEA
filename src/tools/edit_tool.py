@@ -25,12 +25,15 @@ from vision_backends.remote_client import (
     resolve_edit_backend,
 )
 
-from .base import ToolExecutionResult
+from .base import BaseTool, ToolExecutionResult
 from .utils import next_artifact_id, next_operation_id
 
 
-class EditTool:
+class EditTool(BaseTool):
     name = ToolName.EDIT
+    args_schema = EditArgs
+    is_expensive = True
+    requires_backend = True
 
     def _resolve_image_artifact(self, state, image_ref: str):
         artifact = state["artifacts"].get(image_ref)
@@ -69,7 +72,7 @@ class EditTool:
         output_dir.mkdir(parents=True, exist_ok=True)
         return str(output_dir / f"{task_id}_{loop_index:03d}.png")
 
-    def run(
+    def execute(
         self,
         state,
         *,

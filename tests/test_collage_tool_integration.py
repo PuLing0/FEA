@@ -18,7 +18,9 @@ from schema import (
     TaskStatus,
     ToolName,
 )
+from runtime.tool_runner import ToolRunner
 from tools.collage_tool import CollageTool
+from tools.registry import ToolRegistry
 
 
 def test_collage_tool_real_llm_returns_layout_and_renders_image() -> None:
@@ -78,8 +80,10 @@ def test_collage_tool_real_llm_returns_layout_and_renders_image() -> None:
         "task_act_records": [],
     }
 
-    result = CollageTool().run(
+    tool = CollageTool()
+    result = ToolRunner(ToolRegistry({tool.name: tool})).run(
         state,
+        tool.name,
         task_id="task_001",
         loop_index=1,
         args=CollageArgs(

@@ -36,14 +36,15 @@ from .run_logger import (
     summarize_task_state,
 )
 from .state import RuntimeState
+from .tool_runner import ToolRunner
 from tools.registry import build_default_tool_registry
-from tools.utils import register_artifacts
 
 
 PLAN_AGENT = PlanAgent()
 EXECUTE_AGENT = ExecuteAgent()
 EVALUATOR_AGENT = EvaluatorAgent()
 TOOL_REGISTRY = build_default_tool_registry()
+TOOL_RUNNER = ToolRunner(TOOL_REGISTRY)
 
 
 def _initial_session(session_id: str) -> SessionState:
@@ -165,8 +166,9 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
             log_event(state, "artifact_created", **summarize_artifact(understanding))
             continue
 
-        understand_execution = TOOL_REGISTRY.get(ToolName.UNDERSTAND).run(
+        understand_execution = TOOL_RUNNER.run(
             state,
+            ToolName.UNDERSTAND,
             task_id="bootstrap",
             loop_index=0,
             args=UnderstandArgs(
@@ -175,7 +177,8 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
             ),
         )
         state["operations"].append(understand_execution.invocation)
-        log_event(state, "operation_succeeded", **summarize_operation(understand_execution.invocation))
+        event = "operation_failed" if understand_execution.invocation.status == "failed" else "operation_succeeded"
+        log_event(state, event, **summarize_operation(understand_execution.invocation))
         for artifact in understand_execution.artifacts:
             register_artifact_in_session_pool(state, artifact)
             if artifact.payload.get("summary"):

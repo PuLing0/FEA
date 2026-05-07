@@ -17,16 +17,18 @@ from schema import (
     ToolName,
 )
 from agents import EvaluatorAgent
-from tools.base import ToolExecutionResult
+from schema import EvaluateArgs
+from tools.base import BaseTool, ToolExecutionResult
 
 
-class FakeEvaluateTool:
+class FakeEvaluateTool(BaseTool):
     name = ToolName.EVALUATE
+    args_schema = EvaluateArgs
 
     def __init__(self, verdict: str) -> None:
         self.verdict = verdict
 
-    def run(self, state, *, task_id: str, loop_index: int, args) -> ToolExecutionResult:
+    def execute(self, state, *, task_id: str, loop_index: int, args: EvaluateArgs) -> ToolExecutionResult:
         artifact = EvaluationArtifact(
             id=f"art_eval_{self.verdict}",
             payload={

@@ -16,7 +16,9 @@ from schema import (
     TaskState,
     TaskStatus,
 )
+from runtime.tool_runner import ToolRunner
 from tools.segment_tool import SegmentTool
+from tools.registry import ToolRegistry
 from vision_backends import sam3_point_backend
 from vision_backends.config import settings
 
@@ -105,8 +107,10 @@ def test_segment_tool_runs_with_real_sam31_text_prompt() -> None:
     checkpoint_path, image_path, repo_root = _require_real_sam31_assets()
     _configure_real_sam31_backend(checkpoint_path, repo_root)
 
-    execution = SegmentTool().run(
+    tool = SegmentTool()
+    execution = ToolRunner(ToolRegistry({tool.name: tool})).run(
         _build_segment_state(image_path),
+        tool.name,
         task_id="task_sam31",
         loop_index=1,
         args=SegmentArgs(

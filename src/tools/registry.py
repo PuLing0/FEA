@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from schema import ToolName
+from .base import BaseTool
 
 from .crop_tool import CropTool
 from .collage_tool import CollageTool
@@ -15,15 +14,11 @@ from .prompt_reconstruct_tool import PromptReconstructTool
 from .segment_tool import SegmentTool
 from .understand_tool import UnderstandTool
 
-if TYPE_CHECKING:
-    from .base import ToolExecutionResult
-
-
 class ToolRegistry:
     """Name-to-tool registry."""
 
-    def __init__(self) -> None:
-        self._tools = {
+    def __init__(self, tools: dict[ToolName, BaseTool] | None = None) -> None:
+        self._tools: dict[ToolName, BaseTool] = tools if tools is not None else {
             ToolName.UNDERSTAND: UnderstandTool(),
             ToolName.GROUNDING: GroundingTool(),
             ToolName.SEGMENT: SegmentTool(),
@@ -34,7 +29,9 @@ class ToolRegistry:
             ToolName.EVALUATE: EvaluateTool(),
         }
 
-    def get(self, name: ToolName):
+    def get(self, name: ToolName) -> BaseTool:
+        if name not in self._tools:
+            raise KeyError(f"tool is not registered: {name}")
         return self._tools[name]
 
 

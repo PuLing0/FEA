@@ -9,12 +9,13 @@ from PIL import Image
 from runtime.instruction_resolver import resolve_active_instruction_text
 from schema import ArtifactKind, CropArgs, ImageArtifact, ToolInvocationRecord, ToolName
 
-from .base import ToolExecutionResult
+from .base import BaseTool, ToolExecutionResult
 from .utils import next_artifact_id, next_operation_id
 
 
-class CropTool:
+class CropTool(BaseTool):
     name = ToolName.CROP
+    args_schema = CropArgs
 
     def _resolve_local_image_path(self, state, image_ref: str) -> str:
         artifact = state["artifacts"].get(image_ref)
@@ -119,7 +120,7 @@ class CropTool:
         image.save(output_path)
         return str(output_path)
 
-    def run(
+    def execute(
         self,
         state,
         *,

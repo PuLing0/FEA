@@ -28,6 +28,7 @@ from runtime.prompts import (
     build_task_working_set_selector_user_prompt,
 )
 from runtime.state import RuntimeState
+from runtime.tool_runner import ToolRunner
 from schema import (
     ArtifactKind,
     StrictModel,
@@ -39,6 +40,7 @@ from tools.registry import build_default_tool_registry
 
 
 TOOL_REGISTRY = build_default_tool_registry()
+TOOL_RUNNER = ToolRunner(TOOL_REGISTRY)
 
 
 class TaskInputSelectionOutput(StrictModel):
@@ -278,8 +280,9 @@ def ensure_understanding_for_images(state: RuntimeState, image_ids: list[str], *
     for image_id in image_ids:
         if image_id in understood_ids:
             continue
-        understand_execution = TOOL_REGISTRY.get(ToolName.UNDERSTAND).run(
+        understand_execution = TOOL_RUNNER.run(
             state,
+            ToolName.UNDERSTAND,
             task_id=task_id,
             loop_index=0,
             args=UnderstandArgs(

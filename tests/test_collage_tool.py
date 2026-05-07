@@ -18,7 +18,9 @@ from schema import (
     TaskStatus,
     ToolName,
 )
+from runtime.tool_runner import ToolRunner
 from tools.collage_tool import CollageLayoutItem, CollageLayoutResult, CollageTool
+from tools.registry import ToolRegistry
 
 
 def _make_state(*, artifacts: dict[str, object]) -> dict:
@@ -52,6 +54,24 @@ def _make_state(*, artifacts: dict[str, object]) -> dict:
 
 def _write_image(path: Path, *, size: tuple[int, int], color: tuple[int, int, int, int]) -> None:
     Image.new("RGBA", size, color=color).save(path)
+
+
+def _run_collage_tool(state: dict, *, args: CollageArgs, loop_index: int = 1):
+    tool = CollageTool()
+    return ToolRunner(ToolRegistry({tool.name: tool})).run(
+        state,
+        ToolName.COLLAGE,
+        task_id="task_001",
+        loop_index=loop_index,
+        args=args,
+    )
+
+
+def _assert_failed(result, *, error_type: str, message: str) -> None:
+    assert result.invocation.status == "failed"
+    assert result.invocation.error is not None
+    assert result.invocation.error["type"] == error_type
+    assert message in result.invocation.error["message"]
 
 
 def _layout_for_two_images() -> CollageLayoutResult:
@@ -105,10 +125,8 @@ def test_collage_tool_renders_local_image_and_records_layout(mocker, tmp_path) -
         }
     )
 
-    result = CollageTool().run(
+    result = _run_collage_tool(
         state,
-        task_id="task_001",
-        loop_index=1,
         args=CollageArgs(
             block_artifact_ids=["art_face_001", "art_cloth_001"],
             layout_goal="identity on the left, clothing on the right",
@@ -156,16 +174,15 @@ def test_collage_tool_rejects_unknown_artifact(tmp_path) -> None:
         }
     )
 
-    with pytest.raises(ValueError, match="Unknown image artifact ref"):
-        CollageTool().run(
-            state,
-            task_id="task_001",
-            loop_index=1,
-            args=CollageArgs(
-                block_artifact_ids=["art_face_001", "art_missing_001"],
-                layout_goal="make a reference board",
-            ),
-        )
+    result = _run_collage_tool(
+        state,
+        args=CollageArgs(
+            block_artifact_ids=["art_face_001", "art_missing_001"],
+            layout_goal="make a reference board",
+        ),
+    )
+
+    _assert_failed(result, error_type="ValueError", message="Unknown image artifact ref")
 
 
 def test_collage_tool_rejects_non_image_artifact(tmp_path) -> None:
@@ -185,16 +202,15 @@ def test_collage_tool_rejects_non_image_artifact(tmp_path) -> None:
         }
     )
 
-    with pytest.raises(ValueError, match="Artifact is not an image"):
-        CollageTool().run(
-            state,
-            task_id="task_001",
-            loop_index=1,
-            args=CollageArgs(
-                block_artifact_ids=["art_face_001", "art_geo_001"],
-                layout_goal="make a reference board",
-            ),
-        )
+    result = _run_collage_tool(
+        state,
+        args=CollageArgs(
+            block_artifact_ids=["art_face_001", "art_geo_001"],
+            layout_goal="make a reference board",
+        ),
+    )
+
+    _assert_failed(result, error_type="ValueError", message="Artifact is not an image")
 
 
 def test_collage_tool_rejects_non_local_image_uri(tmp_path) -> None:
@@ -215,16 +231,15 @@ def test_collage_tool_rejects_non_local_image_uri(tmp_path) -> None:
         }
     )
 
-    with pytest.raises(ValueError, match="not a local file path"):
-        CollageTool().run(
-            state,
-            task_id="task_001",
-            loop_index=1,
-            args=CollageArgs(
-                block_artifact_ids=["art_face_001", "art_cloth_001"],
-                layout_goal="make a reference board",
-            ),
-        )
+    result = _run_collage_tool(
+        state,
+        args=CollageArgs(
+            block_artifact_ids=["art_face_001", "art_cloth_001"],
+            layout_goal="make a reference board",
+        ),
+    )
+
+    _assert_failed(result, error_type="ValueError", message="not a local file path")
 
 
 def test_collage_tool_rejects_missing_image_file(tmp_path) -> None:
@@ -245,16 +260,15 @@ def test_collage_tool_rejects_missing_image_file(tmp_path) -> None:
         }
     )
 
-    with pytest.raises(FileNotFoundError, match="Image path does not exist"):
-        CollageTool().run(
-            state,
-            task_id="task_001",
-            loop_index=1,
-            args=CollageArgs(
-                block_artifact_ids=["art_face_001", "art_cloth_001"],
-                layout_goal="make a reference board",
-            ),
-        )
+    result = _run_collage_tool(
+        state,
+        args=CollageArgs(
+            block_artifact_ids=["art_face_001", "art_cloth_001"],
+            layout_goal="make a reference board",
+        ),
+    )
+
+    _assert_failed(result, error_type="FileNotFoundError", message="Image path does not exist")
 
 
 def test_collage_tool_rejects_layout_that_omits_input(mocker, tmp_path) -> None:
@@ -285,16 +299,15 @@ def test_collage_tool_rejects_layout_that_omits_input(mocker, tmp_path) -> None:
         }
     )
 
-    with pytest.raises(ValueError, match="omitted required artifact ids"):
-        CollageTool().run(
-            state,
-            task_id="task_001",
-            loop_index=1,
-            args=CollageArgs(
-                block_artifact_ids=["art_face_001", "art_cloth_001"],
-                layout_goal="make a reference board",
-            ),
-        )
+    result = _run_collage_tool(
+        state,
+        args=CollageArgs(
+            block_artifact_ids=["art_face_001", "art_cloth_001"],
+            layout_goal="make a reference board",
+        ),
+    )
+
+    _assert_failed(result, error_type="ValueError", message="omitted required artifact ids")
 
 
 def test_collage_tool_rejects_layout_with_unknown_artifact(mocker, tmp_path) -> None:
@@ -332,16 +345,15 @@ def test_collage_tool_rejects_layout_with_unknown_artifact(mocker, tmp_path) -> 
         }
     )
 
-    with pytest.raises(ValueError, match="referenced unknown artifact ids"):
-        CollageTool().run(
-            state,
-            task_id="task_001",
-            loop_index=1,
-            args=CollageArgs(
-                block_artifact_ids=["art_face_001", "art_cloth_001"],
-                layout_goal="make a reference board",
-            ),
-        )
+    result = _run_collage_tool(
+        state,
+        args=CollageArgs(
+            block_artifact_ids=["art_face_001", "art_cloth_001"],
+            layout_goal="make a reference board",
+        ),
+    )
+
+    _assert_failed(result, error_type="ValueError", message="referenced unknown artifact ids")
 
 
 def test_collage_tool_auto_expands_canvas_for_layout_outside_canvas(mocker, tmp_path) -> None:
@@ -379,10 +391,8 @@ def test_collage_tool_auto_expands_canvas_for_layout_outside_canvas(mocker, tmp_
         }
     )
 
-    result = CollageTool().run(
+    result = _run_collage_tool(
         state,
-        task_id="task_001",
-        loop_index=1,
         args=CollageArgs(
             block_artifact_ids=["art_face_001", "art_cloth_001"],
             layout_goal="make a reference board",
@@ -436,13 +446,12 @@ def test_collage_tool_rejects_layout_that_exceeds_max_canvas_after_auto_expand(m
         }
     )
 
-    with pytest.raises(ValueError, match="requires a larger canvas than allowed"):
-        CollageTool().run(
-            state,
-            task_id="task_001",
-            loop_index=1,
-            args=CollageArgs(
-                block_artifact_ids=["art_face_001", "art_cloth_001"],
-                layout_goal="make a reference board",
-            ),
-        )
+    result = _run_collage_tool(
+        state,
+        args=CollageArgs(
+            block_artifact_ids=["art_face_001", "art_cloth_001"],
+            layout_goal="make a reference board",
+        ),
+    )
+
+    _assert_failed(result, error_type="ValueError", message="requires a larger canvas than allowed")

@@ -20,7 +20,7 @@ from schema import (
     ToolName,
 )
 
-from .base import ToolExecutionResult
+from .base import BaseTool, ToolExecutionResult
 from .utils import next_artifact_id, next_operation_id
 
 
@@ -33,8 +33,10 @@ SCORE_RUBRIC = EVALUATE_SCORE_RUBRIC
 
 
 
-class EvaluateTool:
+class EvaluateTool(BaseTool):
     name = ToolName.EVALUATE
+    args_schema = EvaluateArgs
+    is_expensive = True
 
     def _resolve_image_artifact(self, state, artifact_ref: str, *, label: str):
         artifact = state["artifacts"].get(artifact_ref)
@@ -226,7 +228,7 @@ class EvaluateTool:
             ]
         return []
 
-    def run(
+    def execute(
         self,
         state,
         *,

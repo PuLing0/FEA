@@ -12,14 +12,15 @@ from schema import (
     ToolName,
 )
 
-from .base import ToolExecutionResult
+from .base import BaseTool, ToolExecutionResult
 from .utils import next_artifact_id, next_operation_id
 
 
-class PromptReconstructTool:
+class PromptReconstructTool(BaseTool):
     name = ToolName.PROMPT_RECONSTRUCT
+    args_schema = PromptReconstructArgs
 
-    def run(
+    def execute(
         self,
         state,
         *,

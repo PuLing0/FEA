@@ -11,6 +11,7 @@ from runtime.artifact_context import (
 from runtime.instruction_resolver import resolve_active_instruction_artifact
 from runtime.scheduler import select_next_runnable_task
 from runtime.state import RuntimeState
+from runtime.tool_runner import ToolRunner
 from schema import (
     ArtifactKind,
     Decision,
@@ -32,6 +33,7 @@ class EvaluatorAgent:
 
     def __init__(self, registry: ToolRegistry | None = None) -> None:
         self._registry = registry or build_default_tool_registry()
+        self._tool_runner = ToolRunner(self._registry)
 
     def run(self, state: RuntimeState) -> RuntimeState:
         session = state["session"]
@@ -61,8 +63,9 @@ class EvaluatorAgent:
 
         task_state.evaluator_checkpoint_count += 1
         latest_edit_instruction = self._find_latest_edit_instruction(state, current_task_id)
-        evaluate_execution = self._registry.get(ToolName.EVALUATE).run(
+        evaluate_execution = self._tool_runner.run(
             state,
+            ToolName.EVALUATE,
             task_id=current_task_id,
             loop_index=task_state.loop_count,
             args=EvaluateArgs(
@@ -74,6 +77,21 @@ class EvaluatorAgent:
             ),
         )
         state["operations"].append(evaluate_execution.invocation)
+        if evaluate_execution.invocation.status == "failed":
+            decision = self._build_evaluate_failure_replan_decision(
+                state=state,
+                task_id=current_task_id,
+                error=evaluate_execution.invocation.error or {},
+            )
+            task_state.latest_evaluate_checkpoint = "failed"
+            self._clear_task_retry_context(task_state)
+            task_state.status = TaskStatus.REPLANNED
+            session.current_task_id = None
+            session.phase = SessionPhase.PLANNING
+            session.latest_decision_id = decision.id
+            state["decision"] = decision
+            state["session"] = session
+            return state
         for artifact in evaluate_execution.artifacts:
             register_task_artifact(
                 state,
@@ -189,6 +207,36 @@ class EvaluatorAgent:
         state["decision"] = decision
         state["session"] = session
         return state
+
+    def _build_evaluate_failure_replan_decision(
+        self,
+        *,
+        state: RuntimeState,
+        task_id: str,
+        error: dict,
+    ) -> Decision:
+        task = state["tasks"][task_id]
+        task_state = state["session"].task_states[task_id]
+        error_type = str(error.get("type", "unknown"))
+        error_message = str(error.get("message", "evaluate tool failed"))
+        return Decision(
+            id=f"dec_eval_fail_{task_id}_{task_state.evaluator_checkpoint_count:03d}",
+            route=DecisionRoute.REPLAN,
+            task_id=task_id,
+            plan_id=state["session"].current_plan_id,
+            source_execution_outcome=task_state.latest_execution_outcome or ExecutionOutcome.FAILURE,
+            candidate_artifact_ids=list(task_state.latest_artifact_ids),
+            summary=f"evaluate tool failed: {error_message}",
+            issues=[
+                "evaluate_tool_failed",
+                f"error_type={error_type}",
+            ],
+            replan=ReplanRequest(
+                mode=self._fallback_replan_mode(task.type),
+                reason=f"evaluate tool failed before producing usable feedback: {error_message}",
+                preserve_artifact_ids=preserve_from_task_working_set(state, task_id),
+            ),
+        )
 
     def _is_evaluable_candidate_ref(self, state: RuntimeState, artifact_id: str) -> bool:
         artifact = state["artifacts"].get(artifact_id)

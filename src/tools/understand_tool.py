@@ -9,12 +9,14 @@ from runtime.instruction_resolver import resolve_active_instruction_text
 from runtime.prompts import UNDERSTAND_SYSTEM_PROMPT, build_understand_user_prompt
 from schema import ArtifactKind, ToolInvocationRecord, ToolName, UnderstandArgs, UnderstandingArtifact
 
-from .base import ToolExecutionResult
+from .base import BaseTool, ToolExecutionResult
 from .utils import next_artifact_id, next_operation_id
 
 
-class UnderstandTool:
+class UnderstandTool(BaseTool):
     name = ToolName.UNDERSTAND
+    args_schema = UnderstandArgs
+    is_expensive = True
 
     def _resolve_local_image_path(self, state, image_ref: str) -> str:
         artifact = state["artifacts"].get(image_ref)
@@ -33,7 +35,7 @@ class UnderstandTool:
             raise FileNotFoundError(f"Image path does not exist: {artifact.uri}")
         return str(path)
 
-    def run(
+    def execute(
         self,
         state,
         *,

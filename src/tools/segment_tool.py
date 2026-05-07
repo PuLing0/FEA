@@ -21,7 +21,7 @@ from vision_backends.remote_client import (
     resolve_segment_backend,
 )
 
-from .base import ToolExecutionResult
+from .base import BaseTool, ToolExecutionResult
 from .utils import next_artifact_id, next_operation_id
 
 
@@ -35,8 +35,11 @@ class SegmentCandidate:
     metrics: dict[str, float] = field(default_factory=dict)
 
 
-class SegmentTool:
+class SegmentTool(BaseTool):
     name = ToolName.SEGMENT
+    args_schema = SegmentArgs
+    is_expensive = True
+    requires_backend = True
 
     _SEGMENT_PROMPT_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("person", ("person", "face", "woman", "man", "girl", "boy", "subject", "model", "identity")),
@@ -291,7 +294,7 @@ class SegmentTool:
             or "text_prompt must be non-empty" in normalized
         )
 
-    def run(
+    def execute(
         self,
         state,
         *,

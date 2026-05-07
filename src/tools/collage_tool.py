@@ -20,7 +20,7 @@ from schema import (
     ToolName,
 )
 
-from .base import ToolExecutionResult
+from .base import BaseTool, ToolExecutionResult
 from .utils import next_artifact_id, next_operation_id
 
 
@@ -68,10 +68,12 @@ class SourceImage:
     description: str | None
 
 
-class CollageTool:
+class CollageTool(BaseTool):
     name = ToolName.COLLAGE
+    args_schema = CollageArgs
+    is_expensive = True
 
-    def run(
+    def execute(
         self,
         state,
         *,

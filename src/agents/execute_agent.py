@@ -34,6 +34,7 @@ from runtime.prompts import (
 )
 from runtime.config import default_max_execute_acts
 from runtime.state import RuntimeState
+from runtime.tool_runner import ToolRunner
 from schema import (
     ArtifactKind,
     CollageArgs,
@@ -55,8 +56,8 @@ from schema import (
     TaskLoop,
     TaskRetryAdvice,
     TaskStatus,
-    ToolName,
     ToolInvocationRecord,
+    ToolName,
     UnderstandArgs,
 )
 from tools.registry import ToolRegistry, build_default_tool_registry
@@ -83,6 +84,7 @@ class ExecuteAgent:
 
     def __init__(self, registry: ToolRegistry | None = None) -> None:
         self._registry = registry or build_default_tool_registry()
+        self._tool_runner = ToolRunner(self._registry)
 
     def run(self, state: RuntimeState) -> RuntimeState:
         session = state["session"]
@@ -128,54 +130,31 @@ class ExecuteAgent:
                 strategy=strategy,
             )
             last_base_image_ref = base_image_ref
-            try:
-                execution = self._select_and_run_tool(
-                    state=state,
-                    task=task,
-                    task_id=current_task_id,
-                    loop_index=loop_index,
-                    selected_tool=selected_tool,
-                    resolved_inputs=resolved_inputs,
-                    base_image_ref=base_image_ref,
-                )
-            except EditInputBudgetExceeded as exc:
-                failed_invocation = self._build_failed_tool_invocation(
-                    state=state,
-                    task_id=current_task_id,
-                    loop_index=loop_index,
-                    tool_name=selected_tool,
-                    error=exc,
-                )
-                state["operations"].append(failed_invocation)
-                observation = (
-                    "Planned edit step exceeded the 3-image input budget: "
-                    f"{exc}. Narrow the next edit goal."
-                )
-                act_records.append((thinking, observation))
-                state["task_act_records"].append(
-                    TaskActRecord(
-                        task_id=current_task_id,
-                        loop_index=loop_index,
-                        act_index=act_index,
-                        thinking_text=thinking,
-                        tool_name=selected_tool.value,
-                        tool_args={},
-                        output_artifact_ids=[],
-                        observation_text=observation,
+            execution = self._select_and_run_tool(
+                state=state,
+                task=task,
+                task_id=current_task_id,
+                loop_index=loop_index,
+                selected_tool=selected_tool,
+                resolved_inputs=resolved_inputs,
+                base_image_ref=base_image_ref,
+            )
+            if execution.invocation.status == "failed":
+                state["operations"].append(execution.invocation)
+                error = execution.invocation.error or {}
+                if error.get("type") == "EditInputBudgetExceeded":
+                    observation = (
+                        "Planned edit step exceeded the 3-image input budget: "
+                        f"{error.get('message', '')}. Narrow the next edit goal."
                     )
-                )
-                overflow_retry = exc
-                break
-            except Exception as exc:
-                failed_invocation = self._build_failed_tool_invocation(
-                    state=state,
-                    task_id=current_task_id,
-                    loop_index=loop_index,
-                    tool_name=selected_tool,
-                    error=exc,
-                )
-                state["operations"].append(failed_invocation)
-                observation = f"Tool {selected_tool.value} failed: {exc}"
+                    overflow_retry = EditInputBudgetExceeded(
+                        list(error.get("attempted_refs", []))
+                    )
+                else:
+                    observation = (
+                        f"Tool {selected_tool.value} failed: "
+                        f"{error.get('message', 'unknown error')}"
+                    )
                 act_records.append((thinking, observation))
                 state["task_act_records"].append(
                     TaskActRecord(
@@ -570,39 +549,6 @@ class ExecuteAgent:
             and (operation.error or {}).get("type") != "EditInputBudgetExceeded"
         )
 
-    def _build_failed_tool_invocation(
-        self,
-        *,
-        state: RuntimeState,
-        task_id: str,
-        loop_index: int,
-        tool_name: ToolName,
-        error: Exception,
-    ) -> ToolInvocationRecord:
-        if isinstance(error, EditInputBudgetExceeded):
-            error_payload = {
-                "type": "EditInputBudgetExceeded",
-                "message": str(error),
-                "attempted_refs": list(error.attempted_refs),
-                "attempted_count": error.attempted_count,
-                "limit": EDIT_IMAGE_INPUT_LIMIT,
-            }
-        else:
-            error_payload = {
-                "type": type(error).__name__,
-                "message": str(error),
-            }
-        return ToolInvocationRecord(
-            id=f"op_{tool_name.value}_{len(state.get('operations', [])) + 1:03d}",
-            task_id=task_id,
-            loop_index=loop_index,
-            tool_name=tool_name,
-            args={},
-            status="failed",
-            output_refs=[],
-            error=error_payload,
-        )
-
     def _fallback_replan_mode(self, task_type: str) -> ReplanMode:
         if task_type in {"local_edit", "compose_subject", "reference_edit"}:
             return ReplanMode.SPLIT_TASK
@@ -623,8 +569,9 @@ class ExecuteAgent:
             state["_prompt_reconstruct_context"] = self._build_prompt_reconstruct_context(
                 state, task_id
             )
-            return self._registry.get(ToolName.PROMPT_RECONSTRUCT).run(
+            return self._tool_runner.run(
                 state,
+                ToolName.PROMPT_RECONSTRUCT,
                 task_id=task_id,
                 loop_index=loop_index,
                 args=PromptReconstructArgs(
@@ -810,8 +757,9 @@ class ExecuteAgent:
         runtime_ctx: dict[str, Any],
     ):
         if tool_name == ToolName.GROUNDING:
-            return self._registry.get(ToolName.GROUNDING).run(
+            return self._tool_runner.run(
                 state,
+                ToolName.GROUNDING,
                 task_id=task_id,
                 loop_index=loop_index,
                 args=GroundingArgs(
@@ -822,8 +770,9 @@ class ExecuteAgent:
             )
 
         if tool_name == ToolName.SEGMENT:
-            return self._registry.get(ToolName.SEGMENT).run(
+            return self._tool_runner.run(
                 state,
+                ToolName.SEGMENT,
                 task_id=task_id,
                 loop_index=loop_index,
                 args=SegmentArgs(
@@ -836,9 +785,17 @@ class ExecuteAgent:
             mask_ref = runtime_ctx["mask_ref"]
             grounding_ref = runtime_ctx["grounding_ref"]
             if mask_ref is None and grounding_ref is None:
-                raise ValueError("crop requires mask_ref or grounding_ref from earlier task-local results")
-            return self._registry.get(ToolName.CROP).run(
+                return self._tool_runner.failure_result(
+                    state,
+                    ToolName.CROP,
+                    task_id=task_id,
+                    loop_index=loop_index,
+                    args={},
+                    error=ValueError("crop requires mask_ref or grounding_ref from earlier task-local results"),
+                )
+            return self._tool_runner.run(
                 state,
+                ToolName.CROP,
                 task_id=task_id,
                 loop_index=loop_index,
                 args=CropArgs(
@@ -850,8 +807,9 @@ class ExecuteAgent:
 
         if tool_name == ToolName.UNDERSTAND:
             image_ref = runtime_ctx["crop_ref"] or runtime_ctx["base_image_ref"]
-            return self._registry.get(ToolName.UNDERSTAND).run(
+            return self._tool_runner.run(
                 state,
+                ToolName.UNDERSTAND,
                 task_id=task_id,
                 loop_index=loop_index,
                 args=UnderstandArgs(
@@ -867,9 +825,17 @@ class ExecuteAgent:
                 runtime_ctx["reference_refs"],
             )
             if len(block_artifact_ids) < 2:
-                raise ValueError("collage requires at least two image references")
-            return self._registry.get(ToolName.COLLAGE).run(
+                return self._tool_runner.failure_result(
+                    state,
+                    ToolName.COLLAGE,
+                    task_id=task_id,
+                    loop_index=loop_index,
+                    args={},
+                    error=ValueError("collage requires at least two image references"),
+                )
+            return self._tool_runner.run(
                 state,
+                ToolName.COLLAGE,
                 task_id=task_id,
                 loop_index=loop_index,
                 args=CollageArgs(
@@ -879,11 +845,8 @@ class ExecuteAgent:
             )
 
         if tool_name == ToolName.EDIT:
-            return self._registry.get(ToolName.EDIT).run(
-                state,
-                task_id=task_id,
-                loop_index=loop_index,
-                args=EditArgs(
+            try:
+                edit_args = EditArgs(
                     instruction=self._resolve_active_instruction_text_from_artifacts(
                         state, task_id
                     ),
@@ -892,10 +855,32 @@ class ExecuteAgent:
                         task_id=task_id,
                         runtime_ctx=runtime_ctx,
                     ),
-                ),
+                )
+            except Exception as exc:
+                return self._tool_runner.failure_result(
+                    state,
+                    ToolName.EDIT,
+                    task_id=task_id,
+                    loop_index=loop_index,
+                    args={},
+                    error=exc,
+                )
+            return self._tool_runner.run(
+                state,
+                ToolName.EDIT,
+                task_id=task_id,
+                loop_index=loop_index,
+                args=edit_args,
             )
 
-        raise ValueError(f"Unsupported tool in execute loop: {tool_name}")
+        return self._tool_runner.failure_result(
+            state,
+            tool_name,
+            task_id=task_id,
+            loop_index=loop_index,
+            args={},
+            error=ValueError(f"Unsupported tool in execute loop: {tool_name}"),
+        )
 
     def _find_latest_mask_ref(self, state: RuntimeState, task_id: str) -> str | None:
         for artifact_id in reversed(state["session"].task_states[task_id].task_artifact_ids):

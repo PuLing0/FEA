@@ -16,8 +16,10 @@ from schema import (
     TaskState,
     TaskStatus,
 )
+from runtime.tool_runner import ToolRunner
 from schema.tools import EditArgs
 from tools.edit_tool import EditTool
+from tools.registry import ToolRegistry
 from vision_backends.firered_edit_backend import (
     DEFAULT_LORA_PATH,
     DEFAULT_LORA_WEIGHT_NAME,
@@ -148,8 +150,10 @@ def test_edit_tool_runs_with_real_firered_backend(monkeypatch) -> None:
     monkeypatch.setenv("FIRERED_DISABLE_LORA", "true")
     load_pipeline.cache_clear()
 
-    execution = EditTool().run(
+    tool = EditTool()
+    execution = ToolRunner(ToolRegistry({tool.name: tool})).run(
         _build_edit_state(image_path),
+        tool.name,
         task_id="task_firered_edit",
         loop_index=1,
         args=EditArgs(
@@ -196,8 +200,10 @@ def test_edit_tool_runs_with_real_firered_lora_backend(monkeypatch) -> None:
     monkeypatch.setenv("FIRERED_FUSE_LORA", "false")
     load_pipeline.cache_clear()
 
-    execution = EditTool().run(
+    tool = EditTool()
+    execution = ToolRunner(ToolRegistry({tool.name: tool})).run(
         _build_edit_state(image_path),
+        tool.name,
         task_id="task_firered_edit",
         loop_index=2,
         args=EditArgs(

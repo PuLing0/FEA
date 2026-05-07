@@ -30,6 +30,7 @@ from runtime.input_selector import (
 )
 from runtime.run_logger import summarize_task_state
 from runtime.scheduler import select_next_runnable_task
+from runtime.tool_runner import ToolRunner
 from schema import (
     ArtifactIndex,
     ArtifactKind,
@@ -75,8 +76,9 @@ from schema import (
     UnderstandArgs,
     UnderstandingArtifact,
 )
-from tools import build_default_tool_registry
+from tools import BaseTool, ToolExecutionResult, build_default_tool_registry
 from tools.evaluate_tool import EvaluateTool
+from tools.registry import ToolRegistry
 
 
 REAL_TOOL_TESTS = {
@@ -109,6 +111,23 @@ def _evaluation_scores(score: int = 4, **overrides: int) -> EvaluationScores:
     }
     values.update(overrides)
     return EvaluationScores(**values)
+
+
+def _run_tool(tool: BaseTool, state: dict, *, task_id: str, loop_index: int, args):
+    return ToolRunner(ToolRegistry({tool.name: tool})).run(
+        state,
+        tool.name,
+        task_id=task_id,
+        loop_index=loop_index,
+        args=args,
+    )
+
+
+def _assert_tool_failed(result, *, error_type: str, message: str) -> None:
+    assert result.invocation.status == "failed"
+    assert result.invocation.error is not None
+    assert result.invocation.error["type"] == error_type
+    assert message in result.invocation.error["message"]
 
 
 def test_evaluate_tool_derive_verdict_passes_only_satisfied_high_scores() -> None:
@@ -183,7 +202,7 @@ def fake_model_tools_for_schema_tests(mocker, monkeypatch, request):
     from tools.segment_tool import SegmentTool
     from tools.understand_tool import UnderstandTool
 
-    def fake_edit_run(self, state, *, task_id, loop_index, args):
+    def fake_edit_execute(self, state, *, task_id, loop_index, args):
         invocation_args = args.model_dump()
         if len(args.image_refs) > 1:
             invocation_args["reference_refs"] = list(args.image_refs[1:])
@@ -222,7 +241,7 @@ def fake_model_tools_for_schema_tests(mocker, monkeypatch, request):
             },
         )()
 
-    def fake_crop_run(self, state, *, task_id, loop_index, args):
+    def fake_crop_execute(self, state, *, task_id, loop_index, args):
         artifact = ImageArtifact(
             id=f"art_crop_fake_{loop_index:03d}",
             uri=f"store://generated/{task_id}/fake_crop_{loop_index:03d}.png",
@@ -258,7 +277,7 @@ def fake_model_tools_for_schema_tests(mocker, monkeypatch, request):
             },
         )()
 
-    def fake_segment_run(self, state, *, task_id, loop_index, args):
+    def fake_segment_execute(self, state, *, task_id, loop_index, args):
         artifact = MaskArtifact(
             id=f"art_mask_fake_{loop_index:03d}",
             uri=f"store://generated/{task_id}/fake_mask_{loop_index:03d}.png",
@@ -289,7 +308,7 @@ def fake_model_tools_for_schema_tests(mocker, monkeypatch, request):
             },
         )()
 
-    def fake_understand_run(self, state, *, task_id, loop_index, args):
+    def fake_understand_execute(self, state, *, task_id, loop_index, args):
         artifact = UnderstandingArtifact(
             id=f"art_understanding_fake_{loop_index:03d}",
             payload={
@@ -318,7 +337,7 @@ def fake_model_tools_for_schema_tests(mocker, monkeypatch, request):
             },
         )()
 
-    def fake_evaluate_run(self, state, *, task_id, loop_index, args):
+    def fake_evaluate_execute(self, state, *, task_id, loop_index, args):
         desired_route = state.get("input", {}).get("desired_decision_route", "pass")
         if desired_route == "continue_execute":
             verdict = "replan" if state["session"].task_states[task_id].evaluator_checkpoint_count > 3 else "needs_revision"
@@ -376,11 +395,11 @@ def fake_model_tools_for_schema_tests(mocker, monkeypatch, request):
             },
         )()
 
-    mocker.patch.object(EditTool, "run", fake_edit_run)
-    mocker.patch.object(CropTool, "run", fake_crop_run)
-    mocker.patch.object(SegmentTool, "run", fake_segment_run)
-    mocker.patch.object(UnderstandTool, "run", fake_understand_run)
-    mocker.patch.object(EvaluateTool, "run", fake_evaluate_run)
+    mocker.patch.object(EditTool, "execute", fake_edit_execute)
+    mocker.patch.object(CropTool, "execute", fake_crop_execute)
+    mocker.patch.object(SegmentTool, "execute", fake_segment_execute)
+    mocker.patch.object(UnderstandTool, "execute", fake_understand_execute)
+    mocker.patch.object(EvaluateTool, "execute", fake_evaluate_execute)
 
 
 def test_public_imports_construct_minimal_objects() -> None:
@@ -1803,7 +1822,8 @@ def test_grounding_tool_returns_geometry_artifact() -> None:
             "tools.grounding_tool.invoke_structured_multimodal_llm",
             side_effect=fake_structured_multimodal,
         ):
-            execution = GroundingTool().run(
+            execution = _run_tool(
+                GroundingTool(),
                 state,
                 task_id="task_001",
                 loop_index=1,
@@ -1861,17 +1881,19 @@ def test_grounding_tool_rejects_non_local_image_uri() -> None:
         "task_act_records": [],
     }
 
-    with pytest.raises(ValueError, match="not a local file path"):
-        GroundingTool().run(
-            state,
-            task_id="task_001",
-            loop_index=1,
-            args=GroundingArgs(
-                image_ref="art_img_001",
-                grounding_query="Locate the person torso",
-                top_k=1,
-            ),
-        )
+    result = _run_tool(
+        GroundingTool(),
+        state,
+        task_id="task_001",
+        loop_index=1,
+        args=GroundingArgs(
+            image_ref="art_img_001",
+            grounding_query="Locate the person torso",
+            top_k=1,
+        ),
+    )
+
+    _assert_tool_failed(result, error_type="ValueError", message="not a local file path")
 
 
 def test_collage_tool_returns_image_artifact(mocker, tmp_path) -> None:
@@ -1950,7 +1972,8 @@ def test_collage_tool_returns_image_artifact(mocker, tmp_path) -> None:
         "task_act_records": [],
     }
 
-    execution = CollageTool().run(
+    execution = _run_tool(
+        CollageTool(),
         state,
         task_id="task_001",
         loop_index=1,
@@ -2019,7 +2042,8 @@ def test_crop_tool_uses_mask_cutout_branch(tmp_path) -> None:
         "task_act_records": [],
     }
 
-    execution = CropTool().run(
+    execution = _run_tool(
+        CropTool(),
         state,
         task_id="task_001",
         loop_index=1,
@@ -2089,7 +2113,8 @@ def test_segment_tool_uses_grounding_and_writes_mask_file(tmp_path, mocker) -> N
         ],
     )
 
-    execution = SegmentTool().run(
+    execution = _run_tool(
+        SegmentTool(),
         state,
         task_id="task_001",
         loop_index=1,
@@ -2159,7 +2184,8 @@ def test_segment_tool_uses_remote_backend_when_configured(tmp_path, mocker, monk
 
     remote_mock = mocker.patch("tools.segment_tool.request_sam31_segment", side_effect=fake_remote_segment)
 
-    execution = SegmentTool().run(
+    execution = _run_tool(
+        SegmentTool(),
         state,
         task_id="task_001",
         loop_index=1,
@@ -2232,7 +2258,8 @@ def test_segment_tool_remote_retries_with_shorter_prompt(tmp_path, mocker, monke
 
     mocker.patch("tools.segment_tool.request_sam31_segment", side_effect=fake_remote_segment)
 
-    execution = SegmentTool().run(
+    execution = _run_tool(
+        SegmentTool(),
         state,
         task_id="task_001",
         loop_index=1,
@@ -2293,7 +2320,8 @@ def test_segment_tool_remote_falls_back_to_full_image_mask_after_prompt_failures
         side_effect=RemoteBackendError("remote backend HTTP 400: SAM 3.1 found no acceptable mask candidate"),
     )
 
-    execution = SegmentTool().run(
+    execution = _run_tool(
+        SegmentTool(),
         state,
         task_id="task_001",
         loop_index=1,
@@ -2429,7 +2457,8 @@ def test_crop_tool_uses_grounding_preview_branch(tmp_path) -> None:
         "task_act_records": [],
     }
 
-    execution = CropTool().run(
+    execution = _run_tool(
+        CropTool(),
         state,
         task_id="task_001",
         loop_index=1,
@@ -2476,13 +2505,15 @@ def test_crop_tool_rejects_mismatched_mask_source(tmp_path) -> None:
         "task_act_records": [],
     }
 
-    with pytest.raises(ValueError, match="does not belong"):
-        CropTool().run(
-            state,
-            task_id="task_001",
-            loop_index=1,
-            args=CropArgs(image_ref="art_img_001", mask_ref="art_mask_001"),
-        )
+    result = _run_tool(
+        CropTool(),
+        state,
+        task_id="task_001",
+        loop_index=1,
+        args=CropArgs(image_ref="art_img_001", mask_ref="art_mask_001"),
+    )
+
+    _assert_tool_failed(result, error_type="ValueError", message="does not belong")
 
 
 def test_execute_agent_accepts_grounding_and_collage_strategy(mocker) -> None:
@@ -2610,11 +2641,12 @@ def test_execute_agent_accepts_grounding_and_collage_strategy(mocker) -> None:
         ),
     )
 
-    def fake_grounding_run(state, *, task_id, loop_index, args):
+    def fake_grounding_execute(state, *, task_id, loop_index, args):
         fake = mocker.Mock()
         fake.invocation = mocker.Mock()
         fake.invocation.tool_name = ToolName.GROUNDING
         fake.invocation.args = args.model_dump()
+        fake.invocation.status = "succeeded"
         fake.invocation.output_refs = ["art_geometry_001"]
         fake.artifacts = [
             GeometryArtifact(
@@ -2637,9 +2669,9 @@ def test_execute_agent_accepts_grounding_and_collage_strategy(mocker) -> None:
         ]
         return fake
 
-    mocker.patch.object(GroundingTool, "run", side_effect=fake_grounding_run)
+    mocker.patch.object(GroundingTool, "execute", side_effect=fake_grounding_execute)
 
-    def fake_edit_run(state, *, task_id, loop_index, args):
+    def fake_edit_execute(state, *, task_id, loop_index, args):
         fake = mocker.Mock()
         fake.invocation = ToolInvocationRecord(
             id="op_edit_001",
@@ -2660,7 +2692,7 @@ def test_execute_agent_accepts_grounding_and_collage_strategy(mocker) -> None:
         ]
         return fake
 
-    mocker.patch("tools.edit_tool.EditTool.run", side_effect=fake_edit_run)
+    mocker.patch("tools.edit_tool.EditTool.execute", side_effect=fake_edit_execute)
     mocker.patch.object(
         ExecuteAgent,
         "_observe_with_llm",
@@ -2693,12 +2725,13 @@ def test_execute_agent_crop_accepts_grounding_without_mask(mocker) -> None:
 
     captured = {}
 
-    def fake_crop_run(state, *, task_id, loop_index, args):
+    def fake_crop_execute(state, *, task_id, loop_index, args):
         captured["args"] = args
         fake = mocker.Mock()
         fake.invocation = mocker.Mock()
         fake.invocation.tool_name = ToolName.CROP
         fake.invocation.args = args.model_dump()
+        fake.invocation.status = "succeeded"
         fake.invocation.output_refs = ["art_image_crop_001"]
         fake.artifacts = [
             ImageArtifact(
@@ -2710,7 +2743,7 @@ def test_execute_agent_crop_accepts_grounding_without_mask(mocker) -> None:
         ]
         return fake
 
-    mocker.patch("tools.registry.CropTool.run", side_effect=fake_crop_run)
+    mocker.patch("tools.crop_tool.CropTool.execute", side_effect=fake_crop_execute)
 
     ExecuteAgent()._run_tool_step(
         state=state,
@@ -2756,12 +2789,13 @@ def test_execute_agent_segment_passes_grounding_ref(mocker) -> None:
 
     captured = {}
 
-    def fake_segment_run(state, *, task_id, loop_index, args):
+    def fake_segment_execute(state, *, task_id, loop_index, args):
         captured["args"] = args
         fake = mocker.Mock()
         fake.invocation = mocker.Mock()
         fake.invocation.tool_name = ToolName.SEGMENT
         fake.invocation.args = args.model_dump()
+        fake.invocation.status = "succeeded"
         fake.invocation.output_refs = ["art_mask_001"]
         fake.artifacts = [
             MaskArtifact(
@@ -2773,7 +2807,7 @@ def test_execute_agent_segment_passes_grounding_ref(mocker) -> None:
         ]
         return fake
 
-    mocker.patch.object(SegmentTool, "run", side_effect=fake_segment_run)
+    mocker.patch.object(SegmentTool, "execute", side_effect=fake_segment_execute)
 
     ExecuteAgent()._run_tool_step(
         state=state,
@@ -2832,7 +2866,8 @@ def test_edit_tool_prefers_instruction_artifact_human_text() -> None:
         "task_act_records": [],
     }
 
-    execution = EditTool().run(
+    execution = _run_tool(
+        EditTool(),
         state,
         task_id="task_001",
         loop_index=1,
@@ -3175,7 +3210,7 @@ def test_execute_agent_successful_edit_resets_budget_overflow_counter(mocker) ->
             scope="task",
         )
     ]
-    mocker.patch("tools.edit_tool.EditTool.run", return_value=fake_execution)
+    mocker.patch("tools.edit_tool.EditTool.execute", return_value=fake_execution)
 
     result = ExecuteAgent().run(state)
 
@@ -3428,34 +3463,30 @@ def test_execute_agent_edit_uses_task_local_instruction_instead_of_root(tmp_path
 
     captured: dict[str, object] = {}
 
-    class FakeEditTool:
-        def run(self, state, *, task_id: str, loop_index: int, args: EditArgs):
+    class FakeEditTool(BaseTool):
+        name = ToolName.EDIT
+        args_schema = EditArgs
+
+        def execute(self, state, *, task_id: str, loop_index: int, args: EditArgs):
             captured["instruction"] = args.instruction
             captured["image_refs"] = list(args.image_refs)
-            return type(
-                "FakeExecution",
-                (),
-                {
-                    "invocation": ToolInvocationRecord(
-                        id="op_edit_001",
-                        task_id=task_id,
-                        loop_index=loop_index,
-                        tool_name=ToolName.EDIT,
-                        args=args.model_dump(),
-                        status="succeeded",
-                        output_refs=["art_image_candidate_001"],
-                    ),
-                    "artifacts": [
-                        ImageArtifact(
-                            id="art_image_candidate_001",
-                            uri=str(source_path),
-                            payload={"role": "candidate_image"},
-                            created_by=ToolName.EDIT.value,
-                            scope="task",
-                        )
-                    ],
-                },
-            )()
+            artifact = ImageArtifact(
+                id="art_image_candidate_001",
+                uri=str(source_path),
+                payload={"role": "candidate_image"},
+                created_by=ToolName.EDIT.value,
+                scope="task",
+            )
+            invocation = ToolInvocationRecord(
+                id="op_edit_001",
+                task_id=task_id,
+                loop_index=loop_index,
+                tool_name=ToolName.EDIT,
+                args=args.model_dump(),
+                status="succeeded",
+                output_refs=[artifact.id],
+            )
+            return ToolExecutionResult(invocation=invocation, artifacts=[artifact])
 
     registry = build_default_tool_registry()
     registry._tools[ToolName.EDIT] = FakeEditTool()
@@ -3546,7 +3577,7 @@ def test_execute_agent_tool_failure_goes_directly_to_replan(mocker) -> None:
         "max_execute_acts": 3,
     }
 
-    mocker.patch("tools.edit_tool.EditTool.run", side_effect=RuntimeError("backend unavailable"))
+    mocker.patch("tools.edit_tool.EditTool.execute", side_effect=RuntimeError("backend unavailable"))
 
     result = ExecuteAgent().run(state)
 
@@ -4123,8 +4154,10 @@ def test_understand_tool_uses_multimodal_llm(mocker, tmp_path) -> None:
         return_value=mocker.Mock(content="图片中是一个站立的人物。"),
     )
 
-    result = build_default_tool_registry().get(ToolName.UNDERSTAND).run(
+    registry = build_default_tool_registry()
+    result = ToolRunner(registry).run(
         state,
+        ToolName.UNDERSTAND,
         task_id="bootstrap",
         loop_index=0,
         args=UnderstandArgs(image_ref="art_img_input_001", question="图里有什么"),
@@ -4189,8 +4222,10 @@ def test_evaluate_tool_uses_multimodal_llm(mocker, tmp_path) -> None:
         ),
     )
 
-    result = build_default_tool_registry().get(ToolName.EVALUATE).run(
+    registry = build_default_tool_registry()
+    result = ToolRunner(registry).run(
         state,
+        ToolName.EVALUATE,
         task_id="task_001",
         loop_index=1,
         args=EvaluateArgs(candidate_refs=["art_image_001"], checks=["人物在背景里"]),
@@ -4662,7 +4697,8 @@ def test_edit_tool_generates_local_candidate_image_with_unified_args(tmp_path, m
         return_value={"model_path": "mock-firered"},
     )
 
-    execution = EditTool().run(
+    execution = _run_tool(
+        EditTool(),
         state,
         task_id="task_001",
         loop_index=1,
@@ -4737,7 +4773,8 @@ def test_edit_tool_uses_remote_backend_when_configured(tmp_path, mocker, monkeyp
 
     remote_mock = mocker.patch("tools.edit_tool.request_firered_edit", side_effect=fake_remote_edit)
 
-    execution = EditTool().run(
+    execution = _run_tool(
+        EditTool(),
         state,
         task_id="task_001",
         loop_index=1,

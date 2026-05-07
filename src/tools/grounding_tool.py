@@ -20,12 +20,14 @@ from schema import (
     ToolName,
 )
 
-from .base import ToolExecutionResult
+from .base import BaseTool, ToolExecutionResult
 from .utils import next_artifact_id, next_operation_id
 
 
-class GroundingTool:
+class GroundingTool(BaseTool):
     name = ToolName.GROUNDING
+    args_schema = GroundingArgs
+    is_expensive = True
 
     def _resolve_local_image_path(self, state, image_ref: str) -> str:
         artifact = state["artifacts"].get(image_ref)
@@ -89,7 +91,7 @@ class GroundingTool:
             ],
         )
 
-    def run(
+    def execute(
         self,
         state,
         *,
