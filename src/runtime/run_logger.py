@@ -240,6 +240,19 @@ def summarize_decision(decision: Any | None) -> dict[str, Any] | None:
     }
 
 
+def summarize_task(task: Any | None) -> dict[str, Any] | None:
+    if task is None:
+        return None
+    return {
+        "id": getattr(task, "id", None),
+        "type": getattr(task, "type", None),
+        "instruction": getattr(task, "instruction", None),
+        "input_artifact_ids": list(getattr(task, "input_artifact_ids", [])),
+        "depends_on": list(getattr(task, "depends_on", [])),
+        "acceptance_criteria": list(getattr(task, "acceptance_criteria", [])),
+    }
+
+
 def summarize_task_state(
     task_state: Any | None,
     state: dict[str, Any] | None = None,
@@ -309,6 +322,12 @@ def _enrich_console_record(record: dict[str, Any], state: dict[str, Any] | None)
                 if "result_payload" not in payload:
                     payload["result_payload"] = getattr(operation, "result_payload", None)
                 break
+    current_task_id = record.get("current_task_id")
+    if current_task_id and "current_task" not in payload:
+        task = _as_dict(state.get("tasks")).get(current_task_id)
+        task_summary = summarize_task(task)
+        if task_summary is not None:
+            payload["current_task"] = task_summary
     enriched["payload"] = payload
     return enriched
 
@@ -317,10 +336,18 @@ def _format_console_context(record: dict[str, Any]) -> str:
     context = []
     phase = record.get("phase")
     task_id = record.get("current_task_id")
+    payload = _as_dict(record.get("payload"))
+    current_task = _as_dict(payload.get("current_task"))
     if phase:
         context.append(f"阶段={phase}")
     if task_id:
-        context.append(f"任务={task_id}")
+        task_instruction = _short_text(current_task.get("instruction"), limit=120)
+        task_type = _as_text(current_task.get("type"))
+        if task_instruction:
+            type_suffix = f" [{task_type}]" if task_type else ""
+            context.append(f"任务={task_id}{type_suffix}: {task_instruction}")
+        else:
+            context.append(f"任务={task_id}")
     if not context:
         return ""
     return f" ({'，'.join(context)})"
@@ -391,7 +418,27 @@ def _format_plan_created(payload: dict[str, Any]) -> str:
     plan_ids = _format_refs(payload.get("plan_ids"))
     task_ids = _format_refs(payload.get("task_ids"))
     current_task = payload.get("current_task_id") or "无"
-    return f"创建计划：计划={plan_ids}；任务={task_ids}；当前任务={current_task}"
+    task_summaries = [
+        task for task in (_as_dict(item) for item in payload.get("task_summaries") or []) if task
+    ]
+    pieces = [f"创建计划：计划={plan_ids}", f"任务={task_ids}", f"当前任务={current_task}"]
+    if task_summaries:
+        task_details = []
+        for task in task_summaries:
+            task_id = task.get("id") or "unknown_task"
+            task_type = _as_text(task.get("type"))
+            instruction = _short_text(task.get("instruction"), limit=140)
+            detail = f"{task_id}"
+            if task_type:
+                detail += f"[{task_type}]"
+            if instruction:
+                detail += f": {instruction}"
+            criteria = _format_refs(task.get("acceptance_criteria"), limit=2)
+            if criteria != "无":
+                detail += f"；验收={criteria}"
+            task_details.append(detail)
+        pieces.append("任务内容=" + " | ".join(task_details))
+    return "；".join(pieces)
 
 
 def _format_execute_checkpoint(payload: dict[str, Any]) -> str:

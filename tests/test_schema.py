@@ -5333,6 +5333,8 @@ def test_runtime_run_logger_writes_jsonl(tmp_path, monkeypatch, capsys) -> None:
     assert "读取输入图片" in captured.out
     assert "形成图片理解" in captured.out
     assert "创建计划" in captured.out
+    assert "任务内容=" in captured.out
+    assert "task_001[compose_subject]" in captured.out
     assert result["run_id"]
     assert result["run_log_uri"] is not None
 
@@ -5376,6 +5378,83 @@ def test_runtime_run_logger_formats_structured_events_for_humans() -> None:
     assert "形成图片理解" in line
     assert "art_img_input_001" in line
     assert "图片里是一名穿白色上衣的人" in line
+
+
+def test_runtime_run_logger_formats_plan_tasks_for_humans() -> None:
+    from runtime.run_logger import _format_console_line
+
+    record = {
+        "timestamp": "2026-05-07T01:02:03.000+00:00",
+        "run_id": "run123",
+        "session_id": "sess",
+        "event": "plan_created",
+        "phase": "executing",
+        "current_plan_id": "plan_001",
+        "current_task_id": "task_001",
+        "payload": {
+            "plan_ids": ["plan_001"],
+            "task_ids": ["task_001", "task_002"],
+            "current_task_id": "task_001",
+            "task_summaries": [
+                {
+                    "id": "task_001",
+                    "type": "prepare_subject_mask",
+                    "instruction": "分割人物主体并生成干净蒙版。",
+                    "input_artifact_ids": ["art_img_input_001"],
+                    "depends_on": [],
+                    "acceptance_criteria": ["人物主体完整", "背景不被误选"],
+                },
+                {
+                    "id": "task_002",
+                    "type": "edit_image",
+                    "instruction": "把人物换成蓝色外套。",
+                    "input_artifact_ids": ["art_img_input_001"],
+                    "depends_on": ["task_001"],
+                    "acceptance_criteria": ["外套颜色正确"],
+                },
+            ],
+        },
+    }
+
+    line = _format_console_line(record)
+
+    assert "创建计划" in line
+    assert "task_001[prepare_subject_mask]: 分割人物主体并生成干净蒙版" in line
+    assert "task_002[edit_image]: 把人物换成蓝色外套" in line
+    assert "验收=人物主体完整, 背景不被误选" in line
+
+
+def test_runtime_run_logger_context_includes_current_task_instruction() -> None:
+    from runtime.run_logger import _format_console_line
+    from schema import Task
+
+    record = {
+        "timestamp": "2026-05-07T01:02:03.000+00:00",
+        "run_id": "run123",
+        "session_id": "sess",
+        "event": "node_start",
+        "phase": "executing",
+        "current_plan_id": "plan_001",
+        "current_task_id": "task_001",
+        "payload": {"node": "execute"},
+    }
+    state = {
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="edit_image",
+                instruction="把人物换成蓝色外套，并保持背景不变。",
+                input_artifact_ids=["art_img_input_001"],
+                acceptance_criteria=["外套颜色正确"],
+            )
+        }
+    }
+
+    line = _format_console_line(record, state)
+
+    assert "进入节点：执行当前任务" in line
+    assert "任务=task_001 [edit_image]: 把人物换成蓝色外套，并保持背景不变" in line
 
 
 def test_runtime_run_logger_formats_failed_tool_event_for_humans() -> None:

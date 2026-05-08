@@ -6,6 +6,7 @@ import json
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import time
 from typing import Any, Callable
 
 from PIL import Image
@@ -57,6 +58,14 @@ def json_response(handler: BaseHTTPRequestHandler, status: HTTPStatus, payload: 
     handler.wfile.write(body)
 
 
+def log_service_event(service_name: str, message: str, **fields: Any) -> None:
+    field_text = " ".join(f"{key}={value!r}" for key, value in fields.items() if value is not None)
+    if field_text:
+        print(f"[{service_name}] {message} {field_text}", flush=True)
+    else:
+        print(f"[{service_name}] {message}", flush=True)
+
+
 def build_single_endpoint_handler(
     *,
     service_name: str,
@@ -69,11 +78,22 @@ def build_single_endpoint_handler(
 
         def do_GET(self) -> None:
             if self.path == "/health":
+                started_at = time.perf_counter()
                 json_response(self, HTTPStatus.OK, health_handler())
+                elapsed_ms = (time.perf_counter() - started_at) * 1000
+                log_service_event(
+                    service_name,
+                    "health check completed",
+                    status=HTTPStatus.OK.value,
+                    elapsed_ms=round(elapsed_ms, 2),
+                )
                 return
             json_response(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
+            log_service_event(service_name, "health check rejected", path=self.path, status=HTTPStatus.NOT_FOUND.value)
 
         def do_POST(self) -> None:
+            started_at = time.perf_counter()
+            status = HTTPStatus.OK
             try:
                 content_length = int(self.headers.get("Content-Length", "0"))
                 raw_body = self.rfile.read(content_length).decode("utf-8")
@@ -81,24 +101,66 @@ def build_single_endpoint_handler(
                 if not isinstance(payload, dict):
                     raise VisionBackendRequestError("request body must be a JSON object")
                 if self.path != post_path:
-                    json_response(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
+                    status = HTTPStatus.NOT_FOUND
+                    json_response(self, status, {"error": "not found"})
+                    log_service_event(
+                        service_name,
+                        "request rejected",
+                        path=self.path,
+                        status=status.value,
+                        elapsed_ms=round((time.perf_counter() - started_at) * 1000, 2),
+                    )
                     return
-                json_response(self, HTTPStatus.OK, post_handler(payload))
+                log_service_event(
+                    service_name,
+                    "request received",
+                    path=self.path,
+                    content_length=content_length,
+                )
+                response_payload = post_handler(payload)
+                json_response(self, status, response_payload)
+                log_service_event(
+                    service_name,
+                    "request completed",
+                    path=self.path,
+                    status=status.value,
+                    elapsed_ms=round((time.perf_counter() - started_at) * 1000, 2),
+                )
             except VisionBackendRequestError as exc:
+                status = HTTPStatus.BAD_REQUEST
                 json_response(
                     self,
-                    HTTPStatus.BAD_REQUEST,
+                    status,
                     {"error": {"error_type": type(exc).__name__, "message": str(exc), "retryable": False}},
                 )
+                log_service_event(
+                    service_name,
+                    "request failed",
+                    path=self.path,
+                    status=status.value,
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                    elapsed_ms=round((time.perf_counter() - started_at) * 1000, 2),
+                )
             except Exception as exc:
+                status = HTTPStatus.INTERNAL_SERVER_ERROR
                 json_response(
                     self,
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    status,
                     {"error": {"error_type": type(exc).__name__, "message": str(exc), "retryable": False}},
+                )
+                log_service_event(
+                    service_name,
+                    "request failed",
+                    path=self.path,
+                    status=status.value,
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                    elapsed_ms=round((time.perf_counter() - started_at) * 1000, 2),
                 )
 
         def log_message(self, format: str, *args: Any) -> None:
-            print(f"[{service_name}] {self.address_string()} - {format % args}")
+            print(f"[{service_name}] {self.address_string()} - {format % args}", flush=True)
 
     return SingleEndpointHandler
 
@@ -116,6 +178,7 @@ __all__ = [
     "build_single_endpoint_handler",
     "default_output_path",
     "json_response",
+    "log_service_event",
     "read_image",
     "resolve_output_path",
 ]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from typing import Any
 
 from .firered_edit_backend import (
@@ -17,11 +18,13 @@ from .server_utils import (
     VisionBackendRequestError,
     build_server,
     build_single_endpoint_handler,
+    log_service_event,
     read_image,
     resolve_output_path,
 )
 
 POST_PATH = "/v1/edit/firered"
+SERVICE_NAME = "FireRedEditBackend"
 
 
 def _get_bool(name: str, default: bool) -> bool:
@@ -34,20 +37,51 @@ def _get_bool(name: str, default: bool) -> bool:
 def preload_backend() -> None:
     """Load FireRed once during service startup so VRAM is occupied immediately."""
 
+    log_service_event(SERVICE_NAME, "preload started")
     load_pipeline()
+    log_service_event(SERVICE_NAME, "preload completed")
+
+
+def _preview_text(value: str, *, limit: int = 200) -> str:
+    normalized = " ".join(value.split())
+    if len(normalized) <= limit:
+        return normalized
+    return f"{normalized[:limit]}..."
 
 
 def handle_edit(payload: dict[str, Any]) -> dict[str, Any]:
+    started_at = time.perf_counter()
     image_paths = payload.get("image_paths")
     if not isinstance(image_paths, list) or not image_paths:
         raise VisionBackendRequestError("image_paths must be a non-empty list")
     instruction = payload.get("instruction")
     if not isinstance(instruction, str) or not instruction.strip():
         raise VisionBackendRequestError("instruction must be a non-empty string")
+    log_service_event(
+        SERVICE_NAME,
+        "edit request payload",
+        image_paths=image_paths,
+        instruction=_preview_text(instruction),
+        output_path=payload.get("output_path"),
+    )
+    log_service_event(SERVICE_NAME, "reading edit input images", count=len(image_paths))
     images = [read_image(path) for path in image_paths]
+    log_service_event(
+        SERVICE_NAME,
+        "running FireRed edit",
+        image_sizes=[image.size for image in images],
+        pipeline_cached=is_pipeline_loaded(),
+    )
     output = edit_images(images=images, instruction=instruction)
     output_path = resolve_output_path(payload.get("output_path"), kind="edit", suffix="png")
     output.save(output_path)
+    log_service_event(
+        SERVICE_NAME,
+        "edit output saved",
+        output_path=output_path,
+        output_size=output.size,
+        elapsed_ms=round((time.perf_counter() - started_at) * 1000, 2),
+    )
     return {
         "output_path": output_path,
         "backend_config": backend_config_snapshot(),
@@ -65,7 +99,7 @@ def health() -> dict[str, Any]:
 
 
 Handler = build_single_endpoint_handler(
-    service_name="FireRedEditBackend",
+    service_name=SERVICE_NAME,
     post_path=POST_PATH,
     post_handler=handle_edit,
     health_handler=health,
@@ -81,20 +115,20 @@ def main() -> int:
     preload_on_start = _get_bool("FIRERED_PRELOAD_ON_START", True)
     try:
         if preload_on_start:
-            print("Preloading FireRed pipeline on startup...")
+            print("Preloading FireRed pipeline on startup...", flush=True)
             preload_backend()
-            print("FireRed pipeline preloaded")
+            print("FireRed pipeline preloaded", flush=True)
         else:
-            print("FireRed startup preload disabled; first request will load the pipeline")
+            print("FireRed startup preload disabled; first request will load the pipeline", flush=True)
     except Exception:
         server.server_close()
         raise
-    print(f"FireRed edit backend listening on http://{args.host}:{args.port}")
-    print(f"endpoint: POST {POST_PATH}")
+    print(f"FireRed edit backend listening on http://{args.host}:{args.port}", flush=True)
+    print(f"endpoint: POST {POST_PATH}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("FireRed edit backend shutting down")
+        print("FireRed edit backend shutting down", flush=True)
     finally:
         server.server_close()
         unload_pipeline()

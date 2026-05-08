@@ -33,6 +33,7 @@ from .run_logger import (
     summarize_decision,
     summarize_image_index,
     summarize_operation,
+    summarize_task,
     summarize_task_state,
 )
 from .state import RuntimeState
@@ -202,6 +203,11 @@ def plan(state: RuntimeState) -> RuntimeState:
         "plan_created",
         plan_ids=new_plan_ids,
         task_ids=new_task_ids,
+        task_summaries=[
+            summary
+            for summary in (summarize_task(result.get("tasks", {}).get(task_id)) for task_id in new_task_ids)
+            if summary is not None
+        ],
         current_plan_id=result["session"].current_plan_id,
         current_task_id=result["session"].current_task_id,
     )

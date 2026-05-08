@@ -29,21 +29,37 @@ cleanup() {
     kill "${SAM31_PID}" 2>/dev/null || true
     wait "${SAM31_PID}" 2>/dev/null || true
   fi
+  if [[ -n "${FIRERED_LOG_STREAM_PID:-}" ]] && kill -0 "${FIRERED_LOG_STREAM_PID}" 2>/dev/null; then
+    wait "${FIRERED_LOG_STREAM_PID}" 2>/dev/null || true
+  fi
+  if [[ -n "${SAM31_LOG_STREAM_PID:-}" ]] && kill -0 "${SAM31_LOG_STREAM_PID}" 2>/dev/null; then
+    wait "${SAM31_LOG_STREAM_PID}" 2>/dev/null || true
+  fi
   exit "${exit_code}"
 }
 
 trap cleanup INT TERM EXIT
 
-./scripts/start_firered_edit_server.sh >"${FIRERED_LOG_PATH}" 2>&1 &
+: >"${FIRERED_LOG_PATH}"
+: >"${SAM31_LOG_PATH}"
+
+PYTHONUNBUFFERED=1 ./scripts/start_firered_edit_server.sh >"${FIRERED_LOG_PATH}" 2>&1 &
 FIRERED_PID=$!
 
-./scripts/start_sam31_segment_server.sh >"${SAM31_LOG_PATH}" 2>&1 &
+PYTHONUNBUFFERED=1 ./scripts/start_sam31_segment_server.sh >"${SAM31_LOG_PATH}" 2>&1 &
 SAM31_PID=$!
+
+bash -o pipefail -c 'tail --pid="$1" -n +1 -F "$2" 2>/dev/null | stdbuf -o0 tr "\r" "\n" | sed -u "/^$/d; s/^/[firered] /"' _ "${FIRERED_PID}" "${FIRERED_LOG_PATH}" &
+FIRERED_LOG_STREAM_PID=$!
+
+bash -o pipefail -c 'tail --pid="$1" -n +1 -F "$2" 2>/dev/null | stdbuf -o0 tr "\r" "\n" | sed -u "/^$/d; s/^/[sam31] /"' _ "${SAM31_PID}" "${SAM31_LOG_PATH}" &
+SAM31_LOG_STREAM_PID=$!
 
 echo "FireRed edit service PID: ${FIRERED_PID}"
 echo "FireRed edit log: ${FIRERED_LOG_PATH}"
 echo "SAM3.1 segment service PID: ${SAM31_PID}"
 echo "SAM3.1 segment log: ${SAM31_LOG_PATH}"
+echo "Streaming logs below with [firered] and [sam31] prefixes."
 echo "Press Ctrl+C to stop both services."
 
 wait -n "${FIRERED_PID}" "${SAM31_PID}"
