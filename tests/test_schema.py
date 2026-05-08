@@ -1276,11 +1276,14 @@ def test_agent_cli_runs_rule_based_fallback(mocker, monkeypatch: pytest.MonkeyPa
     )
 
     captured = capsys.readouterr()
-    summary = json.loads(captured.out)
     assert exit_code == 0
-    assert summary["stop_reason"] == "first_edit_candidate"
-    assert summary["final_artifact"]["kind"] == "image"
-    assert summary["operations"][-1]["tool_name"] == "edit"
+    assert "运行摘要" in captured.out
+    assert "已生成第一张编辑候选图后停止" in captured.out
+    assert "最终图片" in captured.out
+    assert "操作流水" in captured.out
+    assert "图像编辑 [succeeded]" in captured.out
+    assert "art_image_fake_edit" in captured.out
+    assert "store://generated/" in captured.out
     unload_mock.assert_called_once_with()
 
 
@@ -5326,7 +5329,10 @@ def test_runtime_run_logger_writes_jsonl(tmp_path, monkeypatch, capsys) -> None:
 
     captured = capsys.readouterr()
     assert "[agent:" in captured.out
-    assert "run_start" in captured.out
+    assert "开始运行" in captured.out
+    assert "读取输入图片" in captured.out
+    assert "形成图片理解" in captured.out
+    assert "创建计划" in captured.out
     assert result["run_id"]
     assert result["run_log_uri"] is not None
 
@@ -5337,6 +5343,66 @@ def test_runtime_run_logger_writes_jsonl(tmp_path, monkeypatch, capsys) -> None:
     assert any(record["event"] == "node_start" and record["payload"]["node"] == "plan" for record in records)
     assert any(record["event"] == "plan_created" for record in records)
     assert all(record["run_id"] == result["run_id"] for record in records)
+
+
+def test_runtime_run_logger_formats_structured_events_for_humans() -> None:
+    from runtime.run_logger import _format_console_line
+
+    record = {
+        "timestamp": "2026-05-07T01:02:03.000+00:00",
+        "run_id": "run123",
+        "session_id": "sess",
+        "event": "artifact_created",
+        "phase": "understanding",
+        "current_plan_id": None,
+        "current_task_id": "task_001",
+        "payload": {
+            "id": "art_understanding_001",
+            "kind": "understanding",
+            "uri": None,
+            "created_by": "understand",
+            "source_ids": ["art_img_input_001"],
+            "role": "image_understanding",
+            "summary": "图片里是一名穿白色上衣的人。",
+            "payload": {
+                "image_ref": "art_img_input_001",
+                "summary": "图片里是一名穿白色上衣的人。",
+            },
+        },
+    }
+
+    line = _format_console_line(record)
+
+    assert "形成图片理解" in line
+    assert "art_img_input_001" in line
+    assert "图片里是一名穿白色上衣的人" in line
+
+
+def test_runtime_run_logger_formats_failed_tool_event_for_humans() -> None:
+    from runtime.run_logger import _format_console_line
+
+    record = {
+        "timestamp": "2026-05-07T01:02:03.000+00:00",
+        "run_id": "run123",
+        "session_id": "sess",
+        "event": "operation_failed",
+        "phase": "executing",
+        "current_plan_id": "plan_001",
+        "current_task_id": "task_001",
+        "payload": {
+            "id": "op_edit_001",
+            "tool_name": "edit",
+            "status": "failed",
+            "args": {"image_refs": ["art_img_input_001"], "instruction": "换衣服"},
+            "output_refs": [],
+            "error": {"type": "RuntimeError", "message": "backend unavailable"},
+        },
+    }
+
+    line = _format_console_line(record)
+
+    assert "工具失败：图像编辑" in line
+    assert "RuntimeError: backend unavailable" in line
 
 
 def test_summarize_task_state_includes_active_instruction_fields() -> None:

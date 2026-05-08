@@ -236,7 +236,7 @@ Generated outputs are written under `generated/`, including:
 - `generated/segment/` — mask outputs.
 - `generated/agent_logs/` — JSONL agent run logs.
 
-The CLI prints a JSON summary containing `run_id`, `run_log_uri`, `final_artifact`, `operations`, and evaluator decision information.
+The CLI prints human-readable progress and a final summary with the run id, log path, final image, evaluator decision, and tool timeline. The complete structured records remain available as JSONL under `generated/agent_logs/`.
 
 ## Development Commands
 

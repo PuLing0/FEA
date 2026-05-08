@@ -21,6 +21,7 @@ from schema import ArtifactKind
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
 DEFAULT_LOG_DIR = "generated/agent_logs"
+MAX_CONSOLE_TEXT = 240
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -51,6 +52,61 @@ def _json_default(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     return str(value)
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        dumped = value.model_dump(mode="json")
+        return dumped if isinstance(dumped, dict) else {}
+    return {}
+
+
+def _as_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(getattr(value, "value", value))
+
+
+def _short_text(value: Any, *, limit: int = MAX_CONSOLE_TEXT) -> str:
+    text = " ".join(_as_text(value).split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _format_refs(values: Any, *, limit: int = 5) -> str:
+    if values is None:
+        return "无"
+    if isinstance(values, str):
+        items = [values]
+    else:
+        try:
+            items = [str(item) for item in values]
+        except TypeError:
+            items = [str(values)]
+    if not items:
+        return "无"
+    visible = items[:limit]
+    suffix = f" 等 {len(items)} 项" if len(items) > limit else ""
+    return ", ".join(visible) + suffix
+
+
+def _format_score(value: Any) -> str:
+    if value is None:
+        return "未知"
+    if isinstance(value, float):
+        return f"{value:.3g}"
+    return str(value)
+
+
+def _display_time(record: dict[str, Any]) -> str:
+    raw_timestamp = _as_text(record.get("timestamp"))
+    try:
+        return datetime.fromisoformat(raw_timestamp).astimezone().strftime("%H:%M:%S")
+    except ValueError:
+        return raw_timestamp or "-"
 
 
 @dataclass(frozen=True)
@@ -114,7 +170,7 @@ class RunLogger:
             with self.log_path.open("a", encoding="utf-8") as file:
                 file.write(json.dumps(record, ensure_ascii=False, default=_json_default) + "\n")
         if self.console:
-            print(_format_console_line(record), file=sys.stdout, flush=True)
+            print(_format_console_line(record, state), file=sys.stdout, flush=True)
 
 
 def create_run_logger(session_id: str) -> RunLogger:
@@ -221,15 +277,318 @@ def summarize_image_index(state: dict[str, Any]) -> list[str]:
     return list(session.artifact_index.by_type.get(ArtifactKind.IMAGE, []))
 
 
-def _format_console_line(record: dict[str, Any]) -> str:
-    phase = record.get("phase") or "-"
-    task_id = record.get("current_task_id") or "-"
-    payload = record.get("payload") or {}
+def _format_console_line(record: dict[str, Any], state: dict[str, Any] | None = None) -> str:
+    record = _enrich_console_record(record, state)
+    prefix = f"[agent:{record['run_id']} {_display_time(record)}]"
+    body = _format_console_body(record)
+    context = _format_console_context(record)
+    return f"{prefix} {body}{context}"
+
+
+def _enrich_console_record(record: dict[str, Any], state: dict[str, Any] | None) -> dict[str, Any]:
+    if state is None:
+        return record
+    enriched = dict(record)
+    payload = dict(_as_dict(record.get("payload")))
+    event = _as_text(record.get("event"))
+    if event == "run_start":
+        runtime_input = _as_dict(state.get("input"))
+        if "instruction_text" not in payload:
+            payload["instruction_text"] = runtime_input.get("instruction_text")
+    elif event == "artifact_created":
+        artifact = _as_dict(state.get("artifacts")).get(payload.get("id"))
+        if artifact is not None:
+            if "summary" not in payload:
+                payload["summary"] = getattr(artifact, "summary", None)
+            if "payload" not in payload:
+                payload["payload"] = getattr(artifact, "payload", {})
+    elif event in {"operation_succeeded", "operation_failed"}:
+        operation_id = payload.get("id")
+        for operation in state.get("operations", []):
+            if getattr(operation, "id", None) == operation_id:
+                if "result_payload" not in payload:
+                    payload["result_payload"] = getattr(operation, "result_payload", None)
+                break
+    enriched["payload"] = payload
+    return enriched
+
+
+def _format_console_context(record: dict[str, Any]) -> str:
+    context = []
+    phase = record.get("phase")
+    task_id = record.get("current_task_id")
+    if phase:
+        context.append(f"阶段={phase}")
+    if task_id:
+        context.append(f"任务={task_id}")
+    if not context:
+        return ""
+    return f" ({'，'.join(context)})"
+
+
+def _format_console_body(record: dict[str, Any]) -> str:
+    event = _as_text(record.get("event"))
+    payload = _as_dict(record.get("payload"))
+    if event == "run_start":
+        return _format_run_start(payload)
+    if event == "node_start":
+        return f"进入节点：{_node_label(payload.get('node'))}"
+    if event == "node_end":
+        return f"完成节点：{_node_label(payload.get('node'))}"
+    if event == "artifact_created":
+        return _format_artifact_created(payload)
+    if event == "operation_succeeded":
+        return _format_operation(payload, failed=False)
+    if event == "operation_failed":
+        return _format_operation(payload, failed=True)
+    if event == "plan_created":
+        return _format_plan_created(payload)
+    if event == "execute_checkpoint":
+        return _format_execute_checkpoint(payload)
+    if event == "evaluate_decision":
+        return _format_evaluate_decision(payload)
+    if event == "route_next":
+        return f"下一步：{_route_label(payload.get('route'))}"
+    if event == "run_end":
+        return f"运行结束：{_route_label(payload.get('route'))}"
+    return _format_generic_event(event, payload)
+
+
+def _format_run_start(payload: dict[str, Any]) -> str:
+    image_uris = payload.get("image_uris") or []
+    use_llm = "开启" if payload.get("use_llm") else "关闭"
+    log_uri = payload.get("log_uri") or "未写入文件"
+    instruction = _short_text(payload.get("instruction_text"))
+    pieces = [f"开始运行：收到 {len(image_uris)} 张图片", f"LLM={use_llm}", f"日志={log_uri}"]
+    if instruction:
+        pieces.append(f"指令：{instruction}")
+    return "；".join(pieces)
+
+
+def _node_label(node: Any) -> str:
+    labels = {
+        "register_and_understand": "注册输入并理解图片",
+        "plan": "规划任务",
+        "execute": "执行当前任务",
+        "evaluate": "评估候选结果",
+    }
+    node_text = _as_text(node)
+    return labels.get(node_text, node_text or "未知节点")
+
+
+def _route_label(route: Any) -> str:
+    labels = {
+        "plan": "回到规划",
+        "execute": "继续执行",
+        "evaluate": "进入评估",
+        "end": "结束",
+    }
+    route_text = _as_text(route)
+    return labels.get(route_text, route_text or "未知")
+
+
+def _format_plan_created(payload: dict[str, Any]) -> str:
+    plan_ids = _format_refs(payload.get("plan_ids"))
+    task_ids = _format_refs(payload.get("task_ids"))
+    current_task = payload.get("current_task_id") or "无"
+    return f"创建计划：计划={plan_ids}；任务={task_ids}；当前任务={current_task}"
+
+
+def _format_execute_checkpoint(payload: dict[str, Any]) -> str:
+    task_state = _as_dict(payload.get("task_state"))
+    if not task_state:
+        return "执行检查点：当前没有任务状态"
+    checkpoint = task_state.get("latest_execute_checkpoint") or "未知"
+    status = task_state.get("status") or "未知"
+    latest_refs = _format_refs(task_state.get("latest_artifact_ids"))
+    instruction = _short_text(task_state.get("active_instruction_preview"))
+    pieces = [
+        f"执行检查点：任务 {task_state.get('task_id')} 状态={status}",
+        f"结论={checkpoint}",
+        f"最新产物={latest_refs}",
+    ]
+    if instruction:
+        pieces.append(f"当前指令：{instruction}")
+    return "；".join(pieces)
+
+
+def _format_evaluate_decision(payload: dict[str, Any]) -> str:
+    decision = _as_dict(payload.get("decision"))
+    route = payload.get("decision_route") or decision.get("route") or "未知"
+    summary = _short_text(decision.get("summary"))
+    issues = _format_refs(decision.get("issues"))
+    pieces = [f"评估决策：{route}"]
+    if summary:
+        pieces.append(f"原因：{summary}")
+    if issues != "无":
+        pieces.append(f"问题：{issues}")
+    return "；".join(pieces)
+
+
+def _format_artifact_created(payload: dict[str, Any]) -> str:
+    artifact_id = payload.get("id") or "unknown_artifact"
+    kind = _as_text(payload.get("kind"))
+    role = payload.get("role") or _as_dict(payload.get("payload")).get("role")
+    created_by = _as_text(payload.get("created_by"))
+    uri = payload.get("uri")
+    artifact_payload = _as_dict(payload.get("payload"))
+    summary = payload.get("summary") or artifact_payload.get("summary")
+
+    if kind == "image" and role == "initial_input":
+        slot = artifact_payload.get("slot_index")
+        slot_text = f"第 {slot} 张" if slot else "一张"
+        return f"读取输入图片：{slot_text}图片 {artifact_id}，路径={uri}"
+    if kind == "understanding":
+        image_ref = artifact_payload.get("image_ref") or _format_refs(payload.get("source_ids"))
+        return f"形成图片理解：{artifact_id}，图片={image_ref}，理解={_short_text(summary) or '暂无摘要'}"
+    if kind == "instruction":
+        text = summary or artifact_payload.get("instruction_text") or artifact_payload.get("task_instruction")
+        return f"记录指令：{artifact_id}，内容={_short_text(text) or '暂无内容'}"
+    if kind == "geometry":
+        return _format_geometry_artifact(artifact_id, artifact_payload)
+    if kind == "mask":
+        return _format_mask_artifact(artifact_id, uri, artifact_payload)
+    if kind == "evaluation":
+        return _format_evaluation_artifact(artifact_id, artifact_payload, summary)
+    if kind == "image":
+        return _format_image_artifact(artifact_id, uri, role, created_by, artifact_payload, payload)
+    return f"创建产物：{artifact_id}，类型={kind or '未知'}，来源={created_by or '未知'}"
+
+
+def _format_geometry_artifact(artifact_id: str, artifact_payload: dict[str, Any]) -> str:
+    candidates = artifact_payload.get("candidates") or []
+    first = _as_dict(candidates[0]) if candidates else {}
+    bbox = first.get("bbox")
+    score = _format_score(first.get("score"))
+    query = _short_text(artifact_payload.get("grounding_query"))
+    image_ref = artifact_payload.get("image_artifact_id") or "未知图片"
+    details = f"bbox={bbox}, score={score}" if bbox else "暂无候选框"
+    return f"定位目标：{artifact_id}，图片={image_ref}，目标={query or '未命名'}，{details}"
+
+
+def _format_mask_artifact(artifact_id: str, uri: Any, artifact_payload: dict[str, Any]) -> str:
+    prompt = _short_text(artifact_payload.get("prompt") or artifact_payload.get("text_prompt"))
+    score = _format_score(artifact_payload.get("mask_score"))
+    image_ref = artifact_payload.get("image_ref") or "未知图片"
+    return f"生成分割蒙版：{artifact_id}，图片={image_ref}，提示={prompt or '无'}，score={score}，路径={uri}"
+
+
+def _format_evaluation_artifact(artifact_id: str, artifact_payload: dict[str, Any], summary: Any) -> str:
+    verdict = artifact_payload.get("verdict") or "未知"
+    scores = _as_dict(artifact_payload.get("scores"))
+    score_text = ""
+    if scores:
+        score_text = (
+            f"，weighted={_format_score(scores.get('weighted_score'))}, "
+            f"overall={_format_score(scores.get('overall_score'))}"
+        )
+    issues = _format_refs(artifact_payload.get("issues"))
+    issue_text = f"，问题={issues}" if issues != "无" else ""
+    reason = _short_text(summary or artifact_payload.get("reason"))
+    return f"完成视觉评估：{artifact_id}，结论={verdict}{score_text}{issue_text}，原因={reason or '暂无'}"
+
+
+def _format_image_artifact(
+    artifact_id: str,
+    uri: Any,
+    role: Any,
+    created_by: str,
+    artifact_payload: dict[str, Any],
+    payload: dict[str, Any],
+) -> str:
+    if role == "candidate_image" or created_by == "edit":
+        refs = artifact_payload.get("primary_image_ref") or _format_refs(payload.get("source_ids"))
+        instruction = _short_text(artifact_payload.get("task_instruction"))
+        pieces = [f"生成候选图片：{artifact_id}，路径={uri}", f"输入={refs}"]
+        if instruction:
+            pieces.append(f"任务={instruction}")
+        return "；".join(pieces)
+    if role == "cropped_preview" or created_by == "crop":
+        return (
+            f"生成裁剪预览：{artifact_id}，路径={uri}，"
+            f"bbox={artifact_payload.get('bbox')}，padding={artifact_payload.get('padding')}"
+        )
+    if role == "collage_reference" or created_by == "collage":
+        canvas = _as_dict(artifact_payload.get("canvas"))
+        canvas_text = f"{canvas.get('width')}x{canvas.get('height')}" if canvas else "未知尺寸"
+        blocks = _format_refs(artifact_payload.get("block_artifact_ids"))
+        return f"生成拼图参考图：{artifact_id}，路径={uri}，画布={canvas_text}，输入={blocks}"
+    source_ids = _format_refs(payload.get("source_ids"))
+    return f"生成图片产物：{artifact_id}，路径={uri}，来源工具={created_by or '未知'}，源={source_ids}"
+
+
+def _format_operation(payload: dict[str, Any], *, failed: bool) -> str:
+    tool_name = _as_text(payload.get("tool_name")) or "unknown_tool"
+    if failed:
+        error = _as_dict(payload.get("error"))
+        error_type = error.get("type") or "Error"
+        message = _short_text(error.get("message"))
+        return f"工具失败：{_tool_label(tool_name)}，错误={error_type}: {message or '未知错误'}"
+
+    args = _as_dict(payload.get("args"))
+    result_payload = _as_dict(payload.get("result_payload"))
+    output_refs = payload.get("output_refs")
+    if tool_name == "understand":
+        summary = _short_text(result_payload.get("summary"))
+        return (
+            f"工具完成：理解图片 {result_payload.get('image_ref') or args.get('image_ref')} "
+            f"-> {_format_refs(output_refs)}，理解={summary or '暂无摘要'}"
+        )
+    if tool_name == "grounding":
+        query = _short_text(result_payload.get("grounding_query") or args.get("grounding_query"))
+        return f"工具完成：定位目标，图片={result_payload.get('image_ref') or args.get('image_ref')}，目标={query}，输出={_format_refs(output_refs)}"
+    if tool_name == "segment":
+        prompt = _short_text(result_payload.get("prompt") or args.get("prompt"))
+        return (
+            f"工具完成：分割图片 {result_payload.get('image_ref') or args.get('image_ref')}，"
+            f"提示={prompt}，mask={result_payload.get('mask_ref') or _format_refs(output_refs)}，"
+            f"score={_format_score(result_payload.get('mask_score'))}"
+        )
+    if tool_name == "crop":
+        return (
+            f"工具完成：裁剪图片 {result_payload.get('image_ref') or args.get('image_ref')}，"
+            f"输出={result_payload.get('crop_ref') or _format_refs(output_refs)}"
+        )
+    if tool_name == "collage":
+        goal = _short_text(result_payload.get("layout_goal") or args.get("layout_goal"))
+        output_path = result_payload.get("output_path") or "见产物记录"
+        return f"工具完成：生成拼图参考图，目标={goal}，输出={result_payload.get('collage_artifact_id') or _format_refs(output_refs)}，路径={output_path}"
+    if tool_name == "prompt_reconstruct":
+        return f"工具完成：重写任务指令，输出={_format_refs(output_refs)}"
+    if tool_name == "edit":
+        instruction = _short_text(result_payload.get("instruction") or args.get("instruction"))
+        refs = _format_refs(result_payload.get("image_refs") or args.get("image_refs"))
+        return f"工具完成：生成编辑候选图，输入={refs}，输出={result_payload.get('output_image_ref') or _format_refs(output_refs)}，指令={instruction}"
+    if tool_name == "evaluate":
+        verdict = result_payload.get("verdict") or "未知"
+        reason = _short_text(result_payload.get("reason"))
+        candidate_ref = result_payload.get("candidate_ref") or args.get("candidate_ref")
+        return f"工具完成：评估候选图 {candidate_ref}，结论={verdict}，原因={reason or '暂无'}"
+    return f"工具完成：{_tool_label(tool_name)}，输出={_format_refs(output_refs)}"
+
+
+def _tool_label(tool_name: str) -> str:
+    labels = {
+        "understand": "图片理解",
+        "grounding": "目标定位",
+        "segment": "图像分割",
+        "crop": "裁剪预览",
+        "collage": "拼图参考",
+        "prompt_reconstruct": "指令重写",
+        "edit": "图像编辑",
+        "evaluate": "结果评估",
+    }
+    return labels.get(tool_name, tool_name)
+
+
+def _format_generic_event(event: str, payload: dict[str, Any]) -> str:
+    if not payload:
+        return f"事件：{event}"
     details = []
-    for key in ("node", "route", "tool_name", "status", "artifact_id", "decision_route", "log_uri"):
-        if key in payload and payload[key] is not None:
-            details.append(f"{key}={payload[key]}")
-    detail_text = " ".join(details)
-    if detail_text:
-        detail_text = " " + detail_text
-    return f"[agent:{record['run_id']}] {record['event']} phase={phase} task={task_id}{detail_text}"
+    for key, value in payload.items():
+        if value is None:
+            continue
+        details.append(f"{key}={_short_text(value, limit=80)}")
+        if len(details) >= 4:
+            break
+    return f"事件：{event}；" + "；".join(details)

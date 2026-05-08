@@ -13,7 +13,6 @@ directly.
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -28,6 +27,7 @@ from vision_backends.firered_edit_backend import unload_pipeline
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+MAX_SUMMARY_TEXT = 240
 
 
 def create_agent() -> CompiledStateGraph:
@@ -38,6 +38,56 @@ def create_agent() -> CompiledStateGraph:
 
 def _enum_value(value: Any) -> Any:
     return getattr(value, "value", value)
+
+
+def _short_text(value: Any, *, limit: int = MAX_SUMMARY_TEXT) -> str:
+    if value is None:
+        return ""
+    text = " ".join(str(value).split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _format_refs(values: Any, *, limit: int = 6) -> str:
+    if values is None:
+        return "无"
+    if isinstance(values, str):
+        items = [values]
+    else:
+        try:
+            items = [str(item) for item in values]
+        except TypeError:
+            items = [str(values)]
+    if not items:
+        return "无"
+    visible = items[:limit]
+    suffix = f" 等 {len(items)} 项" if len(items) > limit else ""
+    return ", ".join(visible) + suffix
+
+
+def _tool_label(tool_name: Any) -> str:
+    labels = {
+        "understand": "图片理解",
+        "grounding": "目标定位",
+        "segment": "图像分割",
+        "crop": "裁剪预览",
+        "collage": "拼图参考",
+        "prompt_reconstruct": "指令重写",
+        "edit": "图像编辑",
+        "evaluate": "结果评估",
+    }
+    tool_text = str(_enum_value(tool_name))
+    return labels.get(tool_text, tool_text)
+
+
+def _stop_reason_label(stop_reason: Any) -> str:
+    labels = {
+        "first_edit_candidate": "已生成第一张编辑候选图后停止",
+        "graph_terminal": "运行到图终止节点",
+    }
+    text = str(stop_reason)
+    return labels.get(text, text)
 
 
 def _positive_int(value: str) -> int:
@@ -176,6 +226,71 @@ def _build_summary(state: dict[str, Any], stop_reason: str) -> dict[str, Any]:
     }
 
 
+def format_final_summary(summary: dict[str, Any]) -> str:
+    lines = [
+        "",
+        "运行摘要",
+        f"- Run ID: {summary.get('run_id') or '未知'}",
+        f"- 日志文件: {summary.get('run_log_uri') or '未写入'}",
+        f"- 停止原因: {_stop_reason_label(summary.get('stop_reason'))}",
+        f"- 最终阶段: {summary.get('session_phase') or '未知'}",
+    ]
+
+    decision = summary.get("decision")
+    if decision:
+        lines.extend(
+            [
+                "",
+                "评估结论",
+                f"- 路由: {decision.get('route') or '未知'}",
+                f"- 说明: {_short_text(decision.get('summary')) or '暂无'}",
+                f"- 问题: {_format_refs(decision.get('issues'))}",
+            ]
+        )
+
+    final_artifact = summary.get("final_artifact")
+    lines.append("")
+    lines.append("最终图片")
+    if final_artifact:
+        payload = final_artifact.get("payload") or {}
+        lines.extend(
+            [
+                f"- Artifact: {final_artifact.get('id')}",
+                f"- 类型: {final_artifact.get('kind')}",
+                f"- 路径: {final_artifact.get('uri') or '无'}",
+                f"- 来源工具: {final_artifact.get('created_by') or '未知'}",
+                f"- 源产物: {_format_refs(final_artifact.get('source_ids'))}",
+            ]
+        )
+        role = payload.get("role")
+        instruction = payload.get("task_instruction")
+        if role:
+            lines.append(f"- 角色: {role}")
+        if instruction:
+            lines.append(f"- 对应任务: {_short_text(instruction)}")
+    else:
+        lines.append("- 未生成最终图片产物")
+
+    operations = summary.get("operations") or []
+    lines.append("")
+    lines.append("操作流水")
+    if not operations:
+        lines.append("- 无工具调用记录")
+    else:
+        for index, operation in enumerate(operations, start=1):
+            status = operation.get("status") or "unknown"
+            refs = _format_refs(operation.get("output_refs"))
+            line = (
+                f"- {index}. {_tool_label(operation.get('tool_name'))} "
+                f"[{status}] task={operation.get('task_id')} loop={operation.get('loop_index')} -> {refs}"
+            )
+            error = operation.get("error")
+            if error:
+                line += f"；错误={error.get('type')}: {_short_text(error.get('message'))}"
+            lines.append(line)
+    return "\n".join(lines)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the fig edit agent runtime.")
     parser.add_argument("--images", nargs="+", required=True, help="Input/reference image paths.")
@@ -224,7 +339,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             stop_after_first_edit=args.stop_after_first_edit,
         )
         summary = _build_summary(result, stop_reason)
-        print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
+        print(format_final_summary(summary))
 
         session = result["session"]
         if stop_reason == "graph_terminal" and session.phase == SessionPhase.FAILED:

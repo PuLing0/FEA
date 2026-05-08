@@ -12,7 +12,6 @@ Example:
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 from pathlib import Path
@@ -27,7 +26,7 @@ if str(SRC_ROOT) not in sys.path:
 
 load_dotenv(REPO_ROOT / ".env")
 
-from agent import create_agent  # noqa: E402
+from agent import create_agent, format_final_summary  # noqa: E402
 from llm import load_llm_config  # noqa: E402
 from runtime.config import default_max_execute_acts  # noqa: E402
 from runtime.prompts import REAL_AGENT_SMOKE_DEFAULT_INSTRUCTION  # noqa: E402
@@ -215,7 +214,7 @@ def main() -> int:
             "final_artifact": _summarize_artifact(result, final_artifact_id),
             "operations": _summarize_operations(result),
         }
-        print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
+        print(format_final_summary(summary))
 
         final_artifact = result.get("artifacts", {}).get(final_artifact_id) if final_artifact_id else None
         if stop_reason == "graph_terminal" and session.phase == SessionPhase.FAILED:
