@@ -1220,6 +1220,7 @@ def test_agent_cli_defaults_allow_multi_act_execute_loops(monkeypatch: pytest.Mo
     from agent import _build_parser
 
     monkeypatch.setenv("AGENT_MAX_EXECUTE_ACTS", "5")
+    monkeypatch.setenv("AGENT_MAX_TOOL_FAILURES", "4")
     args = _build_parser().parse_args(
         [
             "--images",
@@ -1230,9 +1231,10 @@ def test_agent_cli_defaults_allow_multi_act_execute_loops(monkeypatch: pytest.Mo
     )
 
     assert args.max_execute_acts == 5
+    assert args.max_tool_failures == 4
 
 
-def test_register_and_understand_reads_max_execute_acts_from_env(
+def test_register_and_understand_reads_runtime_budgets_from_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from runtime.graph import register_and_understand
@@ -1240,6 +1242,7 @@ def test_register_and_understand_reads_max_execute_acts_from_env(
     monkeypatch.setenv("AGENT_LOG_ENABLED", "false")
     monkeypatch.setenv("AGENT_LOG_CONSOLE", "false")
     monkeypatch.setenv("AGENT_MAX_EXECUTE_ACTS", "6")
+    monkeypatch.setenv("AGENT_MAX_TOOL_FAILURES", "5")
 
     result = register_and_understand(
         {
@@ -1255,6 +1258,7 @@ def test_register_and_understand_reads_max_execute_acts_from_env(
     )
 
     assert result["max_execute_acts"] == 6
+    assert result["max_tool_failures"] == 5
 
 
 def test_agent_cli_runs_rule_based_fallback(mocker, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -3536,7 +3540,7 @@ def test_execute_agent_prompt_reconstruct_context_uses_shared_active_instruction
     assert "Current active instruction: 使用任务局部指令" in context
 
 
-def test_execute_agent_tool_failure_goes_directly_to_replan(mocker) -> None:
+def test_execute_agent_tool_failure_still_fails_after_explicit_failure_limit(mocker) -> None:
     image_path = Path("examples/fig1.jpg")
     state = {
         "input": {
@@ -3577,7 +3581,8 @@ def test_execute_agent_tool_failure_goes_directly_to_replan(mocker) -> None:
         "operations": [],
         "task_act_records": [],
         "task_loops": [],
-        "max_execute_acts": 3,
+        "max_execute_acts": 1,
+        "max_tool_failures": 1,
     }
 
     mocker.patch("tools.edit_tool.EditTool.execute", side_effect=RuntimeError("backend unavailable"))
@@ -3585,18 +3590,141 @@ def test_execute_agent_tool_failure_goes_directly_to_replan(mocker) -> None:
     result = ExecuteAgent().run(state)
 
     task_state = result["session"].task_states["task_001"]
-    assert result["session"].phase == SessionPhase.PLANNING
+    assert result["session"].phase == SessionPhase.FAILED
     assert result["session"].current_task_id is None
     assert task_state.latest_execute_checkpoint == "failed"
     assert task_state.latest_execution_outcome == ExecutionOutcome.FAILURE
+    assert result["task_act_records"][-1].tool_args == {
+        "instruction": "保持图片内容不变",
+        "image_refs": ["art_img_input_001"],
+    }
+    assert "Tool failure 1/1" in result["task_act_records"][-1].observation_text
+    assert "backend unavailable" in result["task_act_records"][-1].observation_text
     assert result["operations"][-1].status == "failed"
     assert result["operations"][-1].error == {
         "type": "RuntimeError",
         "message": "backend unavailable",
     }
-    assert result["decision"].route == DecisionRoute.REPLAN
+    assert result["decision"].route == DecisionRoute.FAIL
     assert "execute_tool_failed" in result["decision"].issues
     assert "backend unavailable" in result["decision"].summary
+
+
+def test_execute_agent_retries_after_tool_failure_with_error_context(mocker) -> None:
+    state = {
+        "input": {
+            "instruction_text": "保持图片内容不变",
+            "use_llm": True,
+        },
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="global_edit",
+                instruction="保持图片内容不变",
+                input_artifact_ids=["art_img_input_001"],
+            )
+        },
+        "session": SessionState(
+            session_id="sess_execute_tool_failure_retry",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.RUNNING,
+                    resolved_input_artifact_ids=["art_img_input_001"],
+                )
+            },
+            artifact_index=ArtifactIndex(by_type={ArtifactKind.IMAGE: ["art_img_input_001"]}),
+        ),
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri="store://images/input.png",
+                payload={"role": "input"},
+                scope="session",
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+        "task_loops": [],
+        "max_execute_acts": 2,
+        "max_tool_failures": 2,
+    }
+
+    mocker.patch("agents.execute_agent.load_llm_config", return_value=mocker.Mock(api_key="k", base_url="u", model_name="m"))
+    captured_prompts: list[str] = []
+
+    def fake_strategy(*, user_prompt, system_prompt, output_schema):
+        captured_prompts.append(user_prompt)
+        return ExecuteLLMOutput(reasoning="try edit", selected_tools=["edit"])
+
+    mocker.patch("agents.execute_agent.invoke_structured_llm", side_effect=fake_strategy)
+
+    failed_execution = mocker.Mock()
+    failed_execution.invocation = ToolInvocationRecord(
+        id="op_edit_001",
+        task_id="task_001",
+        loop_index=1,
+        tool_name=ToolName.EDIT,
+        args={"instruction": "保持图片内容不变", "image_refs": ["art_img_input_001"]},
+        status="failed",
+        output_refs=[],
+        error={"type": "RuntimeError", "message": "backend unavailable"},
+    )
+    failed_execution.artifacts = []
+
+    success_execution = mocker.Mock()
+    success_execution.invocation = ToolInvocationRecord(
+        id="op_edit_002",
+        task_id="task_001",
+        loop_index=1,
+        tool_name=ToolName.EDIT,
+        args={"instruction": "保持图片内容不变", "image_refs": ["art_img_input_001"]},
+        status="succeeded",
+        output_refs=["art_image_candidate_001"],
+    )
+    success_execution.artifacts = [
+        ImageArtifact(
+            id="art_image_candidate_001",
+            uri="store://generated/task_001/candidate.png",
+            payload={"role": "candidate_image"},
+            created_by=ToolName.EDIT.value,
+            scope="task",
+        )
+    ]
+    mocker.patch.object(
+        ExecuteAgent,
+        "_select_and_run_tool",
+        side_effect=[failed_execution, success_execution],
+    )
+    mocker.patch.object(
+        ExecuteAgent,
+        "_observe_with_llm",
+        return_value=ObserveLLMOutput(
+            outcome="success",
+            observation="candidate is ready",
+            artifact_summaries=[],
+        ),
+    )
+
+    result = ExecuteAgent().run(state)
+
+    task_state = result["session"].task_states["task_001"]
+    assert [operation.status for operation in result["operations"]] == [
+        "failed",
+        "succeeded",
+    ]
+    assert len(captured_prompts) == 2
+    assert "Last tool failure:" in captured_prompts[1]
+    assert "tool=edit" in captured_prompts[1]
+    assert "backend unavailable" in captured_prompts[1]
+    assert task_state.latest_execute_checkpoint == "passed"
+    assert task_state.latest_artifact_ids == ["art_image_candidate_001"]
+    assert task_state.retry_context_text is None
+    assert result["session"].phase == SessionPhase.EVALUATING
 
 
 def test_evaluator_agent_failed_candidate_can_continue_same_task() -> None:

@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 from langgraph.graph.state import CompiledStateGraph
 
 from runtime.graph import build_runtime_graph
-from runtime.config import default_max_execute_acts
+from runtime.config import default_max_execute_acts, default_max_tool_failures
 from schema import ArtifactKind, SessionPhase, ToolName
 from vision_backends.firered_edit_backend import unload_pipeline
 
@@ -315,7 +315,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Maximum evaluator checkpoints before replanning/finalizing.",
     )
-    parser.add_argument("--max-tool-failures", type=_positive_int, default=1, help="Maximum tolerated tool failures.")
+    parser.add_argument(
+        "--max-tool-failures",
+        type=_positive_int,
+        default=default_max_tool_failures(),
+        help="Maximum tolerated tool failures.",
+    )
     parser.add_argument("--stop-after-first-edit", action="store_true", help="Return after the first edit artifact is created.")
     use_llm_group = parser.add_mutually_exclusive_group()
     use_llm_group.add_argument("--use-llm", dest="use_llm", action="store_true", help="Use configured LLM clients.")

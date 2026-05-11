@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MAX_EXECUTE_ACTS = 4
+DEFAULT_MAX_TOOL_FAILURES = 3
 
 load_dotenv(REPO_ROOT / ".env")
 
@@ -31,3 +32,9 @@ def default_max_execute_acts() -> int:
     """Return the default execute-loop act budget from environment."""
 
     return _env_positive_int("AGENT_MAX_EXECUTE_ACTS", DEFAULT_MAX_EXECUTE_ACTS)
+
+
+def default_max_tool_failures() -> int:
+    """Return the default tolerated tool-failure budget from environment."""
+
+    return _env_positive_int("AGENT_MAX_TOOL_FAILURES", DEFAULT_MAX_TOOL_FAILURES)

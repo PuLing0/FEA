@@ -21,7 +21,7 @@ from schema import (
 )
 
 from .prompts import BOOTSTRAP_UNDERSTAND_QUESTION_TEMPLATE
-from .config import default_max_execute_acts
+from .config import default_max_execute_acts, default_max_tool_failures
 from .artifact_context import (
     add_to_session_working_set,
     register_artifact_in_session_pool,
@@ -60,7 +60,7 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
     max_task_loops = state.get("max_task_loops", 2)
     max_execute_acts = state.get("max_execute_acts", default_max_execute_acts())
     max_evaluator_checkpoints = state.get("max_evaluator_checkpoints", 3)
-    max_tool_failures = state.get("max_tool_failures", 3)
+    max_tool_failures = state.get("max_tool_failures", default_max_tool_failures())
     logger = create_run_logger(runtime_input["session_id"])
     session = _initial_session(runtime_input["session_id"])
     session.artifact_index = ArtifactIndex(by_type={})

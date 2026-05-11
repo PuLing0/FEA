@@ -32,7 +32,7 @@ from runtime.prompts import (
     build_execute_strategy_user_prompt,
     build_execution_history_summary_user_prompt,
 )
-from runtime.config import default_max_execute_acts
+from runtime.config import default_max_execute_acts, default_max_tool_failures
 from runtime.state import RuntimeState
 from runtime.tool_runner import ToolRunner
 from schema import (
@@ -64,6 +64,7 @@ from tools.registry import ToolRegistry, build_default_tool_registry
 
 
 EDIT_IMAGE_INPUT_LIMIT = 3
+TOOL_FAILURE_RETRY_CONTEXT_HEADER = "Last tool failure:"
 
 
 class EditInputBudgetExceeded(RuntimeError):
@@ -101,8 +102,10 @@ class ExecuteAgent:
         latest_refs: list[str] = []
         previous_latest_refs = list(task_state.latest_artifact_ids)
         max_acts = state.get("max_execute_acts", default_max_execute_acts())
+        max_tool_failures = state.get("max_tool_failures", default_max_tool_failures())
         overflow_retry: EditInputBudgetExceeded | None = None
         last_base_image_ref: str | None = None
+        tool_failure_count = 0
 
         for act_index in range(1, max_acts + 1):
             strategy = (
@@ -151,9 +154,15 @@ class ExecuteAgent:
                         list(error.get("attempted_refs", []))
                     )
                 else:
-                    observation = (
-                        f"Tool {selected_tool.value} failed: "
-                        f"{error.get('message', 'unknown error')}"
+                    tool_failure_count += 1
+                    observation = self._build_tool_failure_observation(
+                        invocation=execution.invocation,
+                        failure_count=tool_failure_count,
+                        max_tool_failures=max_tool_failures,
+                    )
+                    self._apply_tool_failure_retry_context(
+                        task_state,
+                        observation,
                     )
                 act_records.append((thinking, observation))
                 state["task_act_records"].append(
@@ -163,12 +172,18 @@ class ExecuteAgent:
                         act_index=act_index,
                         thinking_text=thinking,
                         tool_name=selected_tool.value,
-                        tool_args={},
+                        tool_args=dict(execution.invocation.args),
                         output_artifact_ids=[],
                         observation_text=observation,
                     )
                 )
-                break
+                if (
+                    error.get("type") == "EditInputBudgetExceeded"
+                    or tool_failure_count >= max_tool_failures
+                    or act_index >= max_acts
+                ):
+                    break
+                continue
 
             state["operations"].append(execution.invocation)
             observe_result = self._observe_with_llm(
@@ -252,6 +267,7 @@ class ExecuteAgent:
             task_state.latest_execution_outcome = ExecutionOutcome.SUCCESS
             task_state.latest_execute_checkpoint = "passed"
             task_state.edit_input_budget_overflow_count = 0
+            self._clear_tool_failure_retry_context(task_state)
             task_state.status = TaskStatus.WAITING_EVALUATION
             session.phase = SessionPhase.EVALUATING
         else:
@@ -1089,6 +1105,44 @@ class ExecuteAgent:
     def _clear_retry_context(self, task_state) -> None:
         task_state.retry_input_artifact_ids = []
         task_state.retry_context_text = None
+
+    def _build_tool_failure_observation(
+        self,
+        *,
+        invocation: ToolInvocationRecord,
+        failure_count: int,
+        max_tool_failures: int,
+    ) -> str:
+        error = invocation.error or {}
+        error_type = error.get("type", "unknown")
+        error_message = error.get("message", "unknown error")
+        tool_name = getattr(invocation.tool_name, "value", invocation.tool_name)
+        return (
+            f"Tool failure {failure_count}/{max_tool_failures}: "
+            f"tool={tool_name}; "
+            f"args={dict(invocation.args)}; "
+            f"error_type={error_type}; "
+            f"error={error_message}. "
+            "Read this error before choosing the next tool. Retry with corrected "
+            "arguments, choose the prerequisite tool, or switch tools if this call "
+            "cannot succeed as written."
+        )
+
+    def _apply_tool_failure_retry_context(self, task_state, observation: str) -> None:
+        existing = task_state.retry_context_text or ""
+        if TOOL_FAILURE_RETRY_CONTEXT_HEADER in existing:
+            existing = existing.split(TOOL_FAILURE_RETRY_CONTEXT_HEADER, 1)[0].rstrip()
+        failure_context = f"{TOOL_FAILURE_RETRY_CONTEXT_HEADER}\n- {observation}"
+        task_state.retry_context_text = (
+            f"{existing}\n\n{failure_context}" if existing else failure_context
+        )
+
+    def _clear_tool_failure_retry_context(self, task_state) -> None:
+        existing = task_state.retry_context_text
+        if not existing or TOOL_FAILURE_RETRY_CONTEXT_HEADER not in existing:
+            return
+        preserved = existing.split(TOOL_FAILURE_RETRY_CONTEXT_HEADER, 1)[0].rstrip()
+        task_state.retry_context_text = preserved or None
 
     def _apply_execute_retry_context(
         self,
