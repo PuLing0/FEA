@@ -87,6 +87,7 @@ REAL_TOOL_TESTS = {
     "test_grounding_tool_rejects_non_local_image_uri",
     "test_collage_tool_returns_image_artifact",
     "test_crop_tool_uses_mask_cutout_branch",
+    "test_crop_tool_uses_unique_output_paths_within_same_loop",
     "test_segment_tool_uses_grounding_and_writes_mask_file",
     "test_crop_tool_uses_grounding_preview_branch",
     "test_crop_tool_rejects_mismatched_mask_source",
@@ -251,7 +252,8 @@ def fake_model_tools_for_schema_tests(mocker, monkeypatch, request):
                 "image_ref": args.image_ref,
                 "mask_ref": args.mask_ref,
                 "grounding_ref": args.grounding_ref,
-                "source": "fake_crop_output",
+                "source": "crop_preview",
+                "crop_mode": "mask_cutout",
             },
             source_ids=[
                 args.image_ref,
@@ -2070,6 +2072,74 @@ def test_crop_tool_uses_mask_cutout_branch(tmp_path) -> None:
     assert Path(artifact.uri).is_file()
     with Image.open(artifact.uri) as cropped:
         assert cropped.mode == "RGBA"
+
+
+def test_crop_tool_uses_unique_output_paths_within_same_loop(tmp_path) -> None:
+    from PIL import Image
+    from tools.crop_tool import CropTool
+
+    image_path = tmp_path / "source.png"
+    mask_path = tmp_path / "mask.png"
+    Image.new("RGBA", (10, 10), color=(255, 0, 0, 255)).save(image_path)
+    Image.new("L", (10, 10), color=255).save(mask_path)
+
+    state = {
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="local_edit",
+                instruction="裁剪前景",
+            )
+        },
+        "session": SessionState(
+            session_id="sess_crop_unique",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={"task_001": TaskState(task_id="task_001", status=TaskStatus.RUNNING)},
+            artifact_index=ArtifactIndex(by_type={}),
+        ),
+        "artifacts": {
+            "art_img_001": ImageArtifact(
+                id="art_img_001",
+                uri=str(image_path),
+                payload={"role": "input"},
+            ),
+            "art_mask_001": MaskArtifact(
+                id="art_mask_001",
+                uri=str(mask_path),
+                payload={"image_ref": "art_img_001"},
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+    }
+
+    first = _run_tool(
+        CropTool(),
+        state,
+        task_id="task_001",
+        loop_index=1,
+        args=CropArgs(image_ref="art_img_001", mask_ref="art_mask_001"),
+    )
+    for artifact in first.artifacts:
+        state["artifacts"][artifact.id] = artifact
+    second = _run_tool(
+        CropTool(),
+        state,
+        task_id="task_001",
+        loop_index=1,
+        args=CropArgs(image_ref="art_img_001", mask_ref="art_mask_001"),
+    )
+
+    first_uri = first.artifacts[0].uri
+    second_uri = second.artifacts[0].uri
+    assert first_uri != second_uri
+    assert first.artifacts[0].id in first_uri
+    assert second.artifacts[0].id in second_uri
+    assert Path(first_uri).is_file()
+    assert Path(second_uri).is_file()
 
 
 def test_segment_tool_uses_grounding_and_writes_mask_file(tmp_path, mocker) -> None:
@@ -4943,7 +5013,8 @@ def test_execute_agent_build_edit_image_refs_caps_inputs_to_budget() -> None:
             "art_crop_001": ImageArtifact(
                 id="art_crop_001",
                 uri="examples/fig1.jpg",
-                payload={"role": "cropped_preview"},
+                payload={"role": "cropped_preview", "source": "crop_preview"},
+                created_by=ToolName.CROP.value,
                 scope="task",
             ),
         },
@@ -4967,6 +5038,83 @@ def test_execute_agent_build_edit_image_refs_caps_inputs_to_budget() -> None:
         "art_collage_001",
         "art_crop_001",
     ]
+
+
+def test_execute_agent_repairs_repeated_crop_to_next_tool() -> None:
+    state = {
+        "session": SessionState(
+            session_id="sess_repair_crop",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.RUNNING,
+                    task_artifact_ids=["art_mask_001", "art_crop_001"],
+                )
+            },
+        ),
+        "artifacts": {
+            "art_mask_001": MaskArtifact(
+                id="art_mask_001",
+                uri="generated/segment/mask.png",
+                payload={},
+            ),
+            "art_crop_001": ImageArtifact(
+                id="art_crop_001",
+                uri="examples/fig1.jpg",
+                payload={"role": "cropped_preview", "source": "crop_preview"},
+                created_by=ToolName.CROP.value,
+                scope="task",
+            ),
+        },
+    }
+
+    assert ExecuteAgent()._repair_next_tool(state, "task_001", ToolName.CROP) == ToolName.UNDERSTAND
+
+    state["artifacts"]["art_understanding_001"] = UnderstandingArtifact(
+        id="art_understanding_001",
+        payload={"image_ref": "art_crop_001", "summary": "crop summary"},
+    )
+    state["session"].task_states["task_001"].task_artifact_ids.append("art_understanding_001")
+
+    assert ExecuteAgent()._repair_next_tool(state, "task_001", ToolName.CROP) == ToolName.EDIT
+
+
+def test_execute_agent_finds_crop_preview_after_observe_relabels_role() -> None:
+    state = {
+        "session": SessionState(
+            session_id="sess_relabelled_crop",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.RUNNING,
+                    task_artifact_ids=["art_crop_001"],
+                )
+            },
+        ),
+        "artifacts": {
+            "art_crop_001": ImageArtifact(
+                id="art_crop_001",
+                uri="examples/fig1.jpg",
+                payload={
+                    "role": "cropped_preview",
+                    "source": "crop_preview",
+                    "crop_mode": "mask_cutout",
+                },
+                created_by=ToolName.CROP.value,
+                role="person_identity_crop",
+                scope="task",
+            ),
+        },
+    }
+
+    assert ExecuteAgent()._find_latest_crop_ref(state, "task_001") == "art_crop_001"
+    assert ExecuteAgent()._repair_next_tool(state, "task_001", ToolName.CROP) == ToolName.UNDERSTAND
 
 
 def test_edit_tool_generates_local_candidate_image_with_unified_args(tmp_path, mocker) -> None:

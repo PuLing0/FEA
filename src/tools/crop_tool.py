@@ -113,10 +113,10 @@ class CropTool(BaseTool):
         )
         return bbox, None, "grounding_preview"
 
-    def _write_crop_image(self, image: Image.Image, *, task_id: str, loop_index: int) -> str:
+    def _write_crop_image(self, image: Image.Image, *, task_id: str, loop_index: int, artifact_id: str) -> str:
         output_dir = Path("generated") / "crop"
         output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / f"{task_id}_{loop_index:03d}.png"
+        output_path = output_dir / f"{task_id}_{loop_index:03d}_{artifact_id}.png"
         image.save(output_path)
         return str(output_path)
 
@@ -143,13 +143,15 @@ class CropTool(BaseTool):
             assert mask is not None
             local_mask = mask.crop((left, top, right, bottom)).convert("L")
             cropped.putalpha(local_mask)
+        artifact_id = next_artifact_id(state, ArtifactKind.IMAGE)
         output_path = self._write_crop_image(
             cropped,
             task_id=task_id,
             loop_index=loop_index,
+            artifact_id=artifact_id,
         )
         artifact = ImageArtifact(
-            id=next_artifact_id(state, ArtifactKind.IMAGE),
+            id=artifact_id,
             uri=output_path,
             payload={
                 "role": "cropped_preview",

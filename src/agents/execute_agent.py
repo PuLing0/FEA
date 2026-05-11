@@ -708,6 +708,10 @@ class ExecuteAgent:
     ) -> ToolName:
         mask_ref = self._find_latest_mask_ref(state, task_id)
         crop_ref = self._find_latest_crop_ref(state, task_id)
+        if selected_tool == ToolName.CROP and crop_ref is not None:
+            if not self._has_understanding_for_image(state, task_id, crop_ref):
+                return ToolName.UNDERSTAND
+            return ToolName.EDIT
         if selected_tool == ToolName.CROP and mask_ref is None:
             return ToolName.SEGMENT
         if selected_tool == ToolName.UNDERSTAND and crop_ref is None and mask_ref is not None:
@@ -918,10 +922,18 @@ class ExecuteAgent:
             if (
                 artifact is not None
                 and artifact.kind == "image"
-                and artifact.role == "cropped_preview"
+                and self._is_crop_preview_artifact(artifact)
             ):
                 return artifact_id
         return None
+
+    def _is_crop_preview_artifact(self, artifact) -> bool:
+        payload = artifact.payload if isinstance(artifact.payload, dict) else {}
+        if artifact.created_by == ToolName.CROP.value and payload.get("source") == "crop_preview":
+            return True
+        if artifact.created_by == ToolName.CROP.value and payload.get("crop_mode"):
+            return True
+        return False
 
     def _find_latest_collage_ref(self, state: RuntimeState, task_id: str) -> str | None:
         for artifact_id in reversed(state["session"].task_states[task_id].task_artifact_ids):
