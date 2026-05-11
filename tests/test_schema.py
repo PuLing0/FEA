@@ -6026,6 +6026,10 @@ def test_prompt_module_builds_plan_prompt() -> None:
     assert "at most 3 input images" in PLAN_SYSTEM_PROMPT
     assert "multiple thinking-act-observe rounds" in PLAN_SYSTEM_PROMPT
     assert "Avoid over-splitting" in PLAN_SYSTEM_PROMPT
+    assert "Bootstrap image understanding has already run before planning" in PLAN_SYSTEM_PROMPT
+    assert "do not create standalone prepare" in PLAN_SYSTEM_PROMPT
+    assert "core edit into concrete construction steps" in PLAN_SYSTEM_PROMPT
+    assert "generic polish" in PLAN_SYSTEM_PROMPT
     assert "Instruction: 把人物放到背景里" in prompt
     assert "Available artifacts for planning" in prompt
     assert "1-2 edit attempts" in prompt
@@ -6090,6 +6094,8 @@ def test_prompt_module_includes_execute_convergence_guidance() -> None:
     assert "Target 1-2 edit attempts per task" in EXECUTE_STRATEGY_SYSTEM_PROMPT
     assert "at most 3 input images" in EXECUTE_STRATEGY_SYSTEM_PROMPT
     assert "Prefer edit" in EXECUTE_STRATEGY_SYSTEM_PROMPT
+    assert "For ordinary edit, image_edit, refine, and finalize tasks" in EXECUTE_STRATEGY_SYSTEM_PROMPT
+    assert "choose segment or crop only when the task explicitly needs" in EXECUTE_STRATEGY_SYSTEM_PROMPT
     assert "let evaluator decide" in EXECUTE_OBSERVE_SYSTEM_PROMPT
     assert "same execute checkpoint" in EXECUTE_OBSERVE_SYSTEM_PROMPT
     assert "3-image input budget" in EXECUTE_OBSERVE_SYSTEM_PROMPT
