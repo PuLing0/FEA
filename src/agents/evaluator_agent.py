@@ -353,7 +353,7 @@ class EvaluatorAgent:
         task_id: str,
     ) -> DecisionRoute:
         verdict = evaluation_payload.get("verdict")
-        if verdict == "pass":
+        if verdict in {"pass", "pass_with_issues"}:
             return DecisionRoute.PASS
         if verdict == "needs_revision":
             return DecisionRoute.CONTINUE_EXECUTE

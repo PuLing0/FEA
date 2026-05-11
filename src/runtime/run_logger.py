@@ -216,7 +216,7 @@ def summarize_operation(operation: Any) -> dict[str, Any]:
 
 
 def summarize_artifact(artifact: Any) -> dict[str, Any]:
-    return {
+    summary = {
         "id": artifact.id,
         "kind": getattr(artifact.kind, "value", artifact.kind),
         "uri": artifact.uri,
@@ -224,6 +224,19 @@ def summarize_artifact(artifact: Any) -> dict[str, Any]:
         "source_ids": list(artifact.source_ids),
         "role": getattr(artifact, "role", None),
     }
+    if getattr(artifact.kind, "value", artifact.kind) == ArtifactKind.EVALUATION.value:
+        payload = _as_dict(getattr(artifact, "payload", {}))
+        scores = _as_dict(payload.get("scores"))
+        summary["payload"] = {
+            "verdict": payload.get("verdict"),
+            "scores": scores,
+            "reason": payload.get("reason"),
+            "issues": list(payload.get("issues") or []),
+            "is_satisfied": payload.get("is_satisfied"),
+            "candidate_ref": payload.get("candidate_ref"),
+        }
+        summary["summary"] = getattr(artifact, "summary", None)
+    return summary
 
 
 def summarize_decision(decision: Any | None) -> dict[str, Any] | None:
@@ -462,9 +475,20 @@ def _format_execute_checkpoint(payload: dict[str, Any]) -> str:
 def _format_evaluate_decision(payload: dict[str, Any]) -> str:
     decision = _as_dict(payload.get("decision"))
     route = payload.get("decision_route") or decision.get("route") or "未知"
+    evaluation_verdict = payload.get("evaluation_verdict")
+    evaluation_scores = _as_dict(payload.get("evaluation_scores"))
     summary = _short_text(decision.get("summary"))
     issues = _format_refs(decision.get("issues"))
     pieces = [f"评估决策：{route}"]
+    if evaluation_verdict:
+        pieces.append(f"结论：{evaluation_verdict}")
+    if evaluation_scores:
+        pieces.append(
+            "分数："
+            f"semantic={_format_score(evaluation_scores.get('semantic_score'))}, "
+            f"quality={_format_score(evaluation_scores.get('quality_score'))}, "
+            f"overall={_format_score(evaluation_scores.get('overall_score'))}"
+        )
     if summary:
         pieces.append(f"原因：{summary}")
     if issues != "无":

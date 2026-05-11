@@ -127,7 +127,7 @@ class EvaluateArgs(StrictModel):
         return self
 
 
-EvaluationVerdict = Literal["pass", "needs_revision", "replan"]
+EvaluationVerdict = Literal["pass", "pass_with_issues", "needs_revision", "replan"]
 
 
 class EvaluationScores(StrictModel):
@@ -140,6 +140,7 @@ class EvaluationScores(StrictModel):
 
 class EvaluateLLMOutput(StrictModel):
     is_satisfied: bool
+    verdict: EvaluationVerdict
     scores: EvaluationScores
     reason: str
     issues: list[str] = Field(default_factory=list)

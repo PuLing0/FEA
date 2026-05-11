@@ -119,9 +119,13 @@ PROMPT_RECONSTRUCT_SYSTEM_PROMPT = (
 
 EVALUATE_SYSTEM_PROMPT = (
     "You are a strict but practical image-editing evaluator. Return only structured output. "
-    "Judge both whether the edit is satisfactory and the 0-5 score dimensions. "
-    "Pass results with minor imperfections when the core instruction, identity/reference consistency, and visual plausibility are acceptable. "
-    "Use needs_revision for one targeted fix; use replan only for severe route failure. "
+    "Judge whether the candidate should stop, continue once, or replan. "
+    "Return one verdict: pass, pass_with_issues, needs_revision, or replan. "
+    "Use pass when the core edit is complete and there are no meaningful delivery issues. "
+    "Use pass_with_issues when the core edit is deliverable but visible non-blocking issues remain, or when more editing is low-value or risky. "
+    "Use needs_revision only for one concrete, targeted, likely-fixable issue. "
+    "Use replan for route failure, broad/global failure, severe damage, or repeated issue types that have not improved. "
+    "The 0-5 scores are lower-bound diagnostics for failure routing, not perfection targets. "
     "Do not request repeated revisions for small aesthetic issues."
 )
 
@@ -370,7 +374,14 @@ def build_evaluate_user_prompt(
         f"Final edit instruction: {instruction}\n"
         f"Acceptance checks: {checks}\n\n"
         f"Scoring rubric:\n{score_rubric}\n\n"
-        "Set is_satisfied=true when the candidate is ready to pass without further editing, including cases with only minor imperfections. "
-        "When is_satisfied=false, explain the main issues and provide one targeted new_rewritten_prompt. "
-        "Do not ask for repeated revisions unless a severe route failure remains."
+        "Verdict policy:\n"
+        "- pass: the candidate is ready to use; the core instruction and preservation needs are met with no meaningful delivery issue.\n"
+        "- pass_with_issues: the candidate is usable and core goals are met, but visible non-blocking issues remain; choose this when another edit is unlikely to improve net quality.\n"
+        "- needs_revision: the candidate is not usable yet, but there is exactly one concrete, targeted, likely-fixable issue worth another execute step.\n"
+        "- replan: the route is wrong, the candidate has broad/global failure or severe damage, or the same issue type has repeated without improvement.\n"
+        "Score policy: keep using the 0-5 dimensions, but do not require high scores for pass/pass_with_issues. "
+        "Scores are lower-bound diagnostics: very low semantic or quality scores should prevent a pass-style verdict and push toward replan. "
+        "Set is_satisfied=true only for pass. Set is_satisfied=false for pass_with_issues, needs_revision, and replan. "
+        "When verdict=needs_revision, explain the main issue and provide one targeted new_rewritten_prompt. "
+        "Do not ask for repeated revisions for small aesthetic issues."
     )

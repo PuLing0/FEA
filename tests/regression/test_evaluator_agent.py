@@ -36,6 +36,16 @@ def test_evaluator_agent_uses_structured_evaluation_verdict() -> None:
     assert result["session"].current_task_id is None
 
 
+def test_evaluator_agent_routes_pass_with_issues_as_pass() -> None:
+    route = EvaluatorAgent()._route_from_evaluation_payload(
+        evaluation_payload={"verdict": "pass_with_issues"},
+        state={"input": {"desired_decision_route": "replan"}},
+        task_id="task_001",
+    )
+
+    assert route == DecisionRoute.PASS
+
+
 def test_evaluator_agent_failed_candidate_can_continue_same_task() -> None:
     state = {
         "input": {

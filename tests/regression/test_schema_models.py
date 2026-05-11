@@ -60,6 +60,18 @@ def test_instruction_artifact_returns_instruction_text() -> None:
     assert artifact.get_instruction_text() == "把人物放入背景中，并保持人物身份不变。"
 
 
+def test_evaluate_llm_output_accepts_pass_with_issues() -> None:
+    output = EvaluateLLMOutput(
+        is_satisfied=False,
+        verdict="pass_with_issues",
+        scores=_evaluation_scores(4, naturalness=3),
+        reason="核心目标已完成，但仍有轻微视觉问题。",
+        issues=["minor visual roughness"],
+    )
+
+    assert output.verdict == "pass_with_issues"
+
+
 def test_runtime_models_construct() -> None:
     plan = Plan(
         id="plan_001",

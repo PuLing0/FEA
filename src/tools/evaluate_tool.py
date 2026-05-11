@@ -25,9 +25,9 @@ from .utils import next_artifact_id, next_operation_id
 
 
 REFERENCE_BOARD_MAX_SIDE = 2048
-PASS_MIN_SUBSCORE = 4
-PASS_WEIGHTED_SCORE = 3.5
+LOW_SCORE_REPLAN_THRESHOLD = 2
 MAX_NEEDS_REVISION_COUNT = 3
+SUPPORTED_VERDICTS = {"pass", "pass_with_issues", "needs_revision", "replan"}
 
 SCORE_RUBRIC = EVALUATE_SCORE_RUBRIC
 
@@ -147,29 +147,26 @@ class EvaluateTool(BaseTool):
     @staticmethod
     def _derive_verdict(
         *,
+        llm_verdict: str | None,
         is_satisfied: bool,
         scores: EvaluationScores,
         calculated_scores: dict[str, float | int],
         evaluator_checkpoint_count: int,
     ) -> str:
-        subscores = [
-            scores.instruction_success,
-            scores.reference_consistency,
-            scores.overediting,
-            scores.naturalness,
-            scores.artifacts,
-        ]
+        verdict = llm_verdict if llm_verdict in SUPPORTED_VERDICTS else None
+        if verdict is None:
+            verdict = "pass" if is_satisfied else "needs_revision"
+
+        semantic_score = float(calculated_scores["semantic_score"])
+        quality_score = float(calculated_scores["quality_score"])
         if (
-            is_satisfied
-            and min(subscores) > 3
-            and float(calculated_scores["weighted_score"]) > PASS_WEIGHTED_SCORE
+            semantic_score <= LOW_SCORE_REPLAN_THRESHOLD
+            or quality_score <= LOW_SCORE_REPLAN_THRESHOLD
         ):
-            return "pass"
-        if any(score == 1 for score in subscores):
             return "replan"
-        if evaluator_checkpoint_count >= MAX_NEEDS_REVISION_COUNT:
+        if verdict == "needs_revision" and evaluator_checkpoint_count >= MAX_NEEDS_REVISION_COUNT:
             return "replan"
-        return "needs_revision"
+        return verdict
 
     def _evaluate_with_llm(
         self,
@@ -258,6 +255,7 @@ class EvaluateTool(BaseTool):
         calculated_scores = self._calculate_scores(llm_output.scores)
         evaluator_checkpoint_count = state["session"].task_states[task_id].evaluator_checkpoint_count
         verdict = self._derive_verdict(
+            llm_verdict=llm_output.verdict,
             is_satisfied=llm_output.is_satisfied,
             scores=llm_output.scores,
             calculated_scores=calculated_scores,

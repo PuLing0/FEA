@@ -9,11 +9,12 @@ from tests.regression.common import (
 )
 
 
-def test_evaluate_tool_derive_verdict_passes_only_satisfied_high_scores() -> None:
+def test_evaluate_tool_derive_verdict_keeps_llm_pass() -> None:
     scores = _evaluation_scores(4)
     calculated_scores = EvaluateTool._calculate_scores(scores)
 
     verdict = EvaluateTool._derive_verdict(
+        llm_verdict="pass",
         is_satisfied=True,
         scores=scores,
         calculated_scores=calculated_scores,
@@ -23,25 +24,27 @@ def test_evaluate_tool_derive_verdict_passes_only_satisfied_high_scores() -> Non
     assert verdict == "pass"
 
 
-def test_evaluate_tool_derive_verdict_unsatisfied_low_risk_needs_revision() -> None:
-    scores = _evaluation_scores(3)
+def test_evaluate_tool_derive_verdict_keeps_pass_with_issues() -> None:
+    scores = _evaluation_scores(4, naturalness=3)
     calculated_scores = EvaluateTool._calculate_scores(scores)
 
     verdict = EvaluateTool._derive_verdict(
+        llm_verdict="pass_with_issues",
         is_satisfied=False,
         scores=scores,
         calculated_scores=calculated_scores,
         evaluator_checkpoint_count=1,
     )
 
-    assert verdict == "needs_revision"
+    assert verdict == "pass_with_issues"
 
 
-def test_evaluate_tool_derive_verdict_severe_subscore_replans() -> None:
-    scores = _evaluation_scores(4, artifacts=1)
+def test_evaluate_tool_derive_verdict_low_semantic_guardrail_replans() -> None:
+    scores = _evaluation_scores(4, reference_consistency=2)
     calculated_scores = EvaluateTool._calculate_scores(scores)
 
     verdict = EvaluateTool._derive_verdict(
+        llm_verdict="pass_with_issues",
         is_satisfied=False,
         scores=scores,
         calculated_scores=calculated_scores,
@@ -51,15 +54,46 @@ def test_evaluate_tool_derive_verdict_severe_subscore_replans() -> None:
     assert verdict == "replan"
 
 
+def test_evaluate_tool_derive_verdict_keeps_needs_revision_when_scores_allow() -> None:
+    scores = _evaluation_scores(3)
+    calculated_scores = EvaluateTool._calculate_scores(scores)
+
+    verdict = EvaluateTool._derive_verdict(
+        llm_verdict="needs_revision",
+        is_satisfied=False,
+        scores=scores,
+        calculated_scores=calculated_scores,
+        evaluator_checkpoint_count=1,
+    )
+
+    assert verdict == "needs_revision"
+
+
 def test_evaluate_tool_derive_verdict_max_revision_count_replans_when_not_passed() -> None:
     scores = _evaluation_scores(3)
     calculated_scores = EvaluateTool._calculate_scores(scores)
 
     verdict = EvaluateTool._derive_verdict(
+        llm_verdict="needs_revision",
         is_satisfied=False,
         scores=scores,
         calculated_scores=calculated_scores,
         evaluator_checkpoint_count=3,
+    )
+
+    assert verdict == "replan"
+
+
+def test_evaluate_tool_derive_verdict_keeps_replan() -> None:
+    scores = _evaluation_scores(4)
+    calculated_scores = EvaluateTool._calculate_scores(scores)
+
+    verdict = EvaluateTool._derive_verdict(
+        llm_verdict="replan",
+        is_satisfied=False,
+        scores=scores,
+        calculated_scores=calculated_scores,
+        evaluator_checkpoint_count=1,
     )
 
     assert verdict == "replan"
@@ -974,6 +1008,7 @@ def test_evaluate_tool_uses_multimodal_llm(mocker, tmp_path) -> None:
         "tools.evaluate_tool.invoke_structured_multimodal_llm",
         return_value=EvaluateLLMOutput(
             is_satisfied=True,
+            verdict="pass",
             scores=EvaluationScores(
                 instruction_success=4,
                 reference_consistency=4,

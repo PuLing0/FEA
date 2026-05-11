@@ -252,10 +252,20 @@ def evaluate_checkpoint(state: RuntimeState) -> RuntimeState:
             log_event(result, "artifact_created", **summarize_artifact(artifact))
     task_state = result["session"].task_states.get(task_id) if task_id else None
     decision = result.get("decision")
+    evaluation_payload = None
+    evaluation_ref = None
+    for operation in reversed(result.get("operations", [])[before_operation_count:]):
+        if operation.tool_name == ToolName.EVALUATE and operation.status == "succeeded":
+            evaluation_payload = operation.result_payload or {}
+            evaluation_ref = evaluation_payload.get("evaluation_ref")
+            break
     log_event(
         result,
         "evaluate_decision",
         decision_route=getattr(decision.route, "value", decision.route) if decision else None,
+        evaluation_ref=evaluation_ref,
+        evaluation_verdict=evaluation_payload.get("verdict") if evaluation_payload else None,
+        evaluation_scores=evaluation_payload.get("scores") if evaluation_payload else None,
         task_state=summarize_task_state(task_state, result),
         decision=summarize_decision(decision),
     )

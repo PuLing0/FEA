@@ -127,6 +127,71 @@ def test_runtime_run_logger_formats_plan_tasks_for_humans() -> None:
     assert "验收=人物主体完整, 背景不被误选" in line
 
 
+def test_runtime_run_logger_summarizes_evaluation_artifact_payload() -> None:
+    from runtime.run_logger import summarize_artifact
+
+    artifact = EvaluationArtifact(
+        id="art_evaluation_001",
+        payload={
+            "verdict": "pass_with_issues",
+            "scores": {
+                "semantic_score": 4,
+                "quality_score": 3,
+                "weighted_score": 3.8,
+                "overall_score": 3.46,
+            },
+            "reason": "核心目标已完成，但仍有轻微问题。",
+            "issues": ["minor artifact"],
+            "is_satisfied": False,
+            "candidate_ref": "art_image_001",
+        },
+        summary="核心目标已完成，但仍有轻微问题。",
+        created_by=ToolName.EVALUATE.value,
+        source_ids=["art_image_001"],
+        role="evaluation_feedback",
+    )
+
+    summary = summarize_artifact(artifact)
+
+    assert summary["payload"]["verdict"] == "pass_with_issues"
+    assert summary["payload"]["scores"]["semantic_score"] == 4
+    assert summary["payload"]["issues"] == ["minor artifact"]
+
+
+def test_runtime_run_logger_formats_evaluation_verdict_for_humans() -> None:
+    from runtime.run_logger import _format_console_line
+
+    record = {
+        "timestamp": "2026-05-07T01:02:03.000+00:00",
+        "run_id": "run123",
+        "session_id": "sess",
+        "event": "evaluate_decision",
+        "phase": "done",
+        "current_plan_id": "plan_001",
+        "current_task_id": None,
+        "payload": {
+            "decision_route": "pass",
+            "evaluation_verdict": "pass_with_issues",
+            "evaluation_scores": {
+                "semantic_score": 4,
+                "quality_score": 3,
+                "overall_score": 3.46,
+            },
+            "decision": {
+                "route": "pass",
+                "summary": "核心目标已完成，但仍有轻微问题。",
+                "issues": ["minor artifact"],
+            },
+        },
+    }
+
+    line = _format_console_line(record)
+
+    assert "评估决策：pass" in line
+    assert "结论：pass_with_issues" in line
+    assert "semantic=4" in line
+
+
 def test_runtime_run_logger_context_includes_current_task_instruction() -> None:
     from runtime.run_logger import _format_console_line
     from schema import Task

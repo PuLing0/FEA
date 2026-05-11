@@ -52,8 +52,10 @@ def test_prompt_module_builds_evaluate_prompt_with_rubric() -> None:
     assert EVALUATE_SCORE_RUBRIC in prompt
     assert "minor imperfections" in EVALUATE_SCORE_RUBRIC.lower()
     assert "Candidate ref: art_image_001" in prompt
-    assert "Set is_satisfied=true" in prompt
-    assert "severe route failure" in prompt
+    assert "pass_with_issues" in prompt
+    assert "Score policy" in prompt
+    assert "Set is_satisfied=true only for pass" in prompt
+    assert "same issue type has repeated" in prompt
 
 
 def test_prompt_module_includes_execute_convergence_guidance() -> None:
