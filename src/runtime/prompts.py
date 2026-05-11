@@ -12,7 +12,8 @@ INPUT_THINKING_SYSTEM_PROMPT = (
 
 INPUT_SELECTOR_SYSTEM_PROMPT = (
     "You are a stateless artifact selector for initializing a task. "
-    "Given the current task instruction and the session working set, choose only the relevant image and instruction artifacts."
+    "Given the current task instruction and the session working set, choose only the relevant image and instruction artifacts. "
+    "If the next step may use edit, choose at most 3 image artifacts."
 )
 
 INPUT_VALIDATION_SYSTEM_PROMPT = (
@@ -170,7 +171,8 @@ def build_input_selector_user_prompt(*, task: Any, thinking: str, candidates_tex
         f"Input thinking:\n{thinking}\n"
         f"Session working set candidates:\n{candidates_text}\n"
         "Return selected_artifact_ids and one working_set_entries item for each selected artifact. "
-        "Each working_set_entries item must include artifact_id, usage, and selection_reason."
+        "Each working_set_entries item must include artifact_id, usage, and selection_reason. "
+        "Select at most 3 image artifacts; instruction artifacts do not count toward that image limit."
     )
 
 

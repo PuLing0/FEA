@@ -41,6 +41,7 @@ from tools.registry import build_default_tool_registry
 
 TOOL_REGISTRY = build_default_tool_registry()
 TOOL_RUNNER = ToolRunner(TOOL_REGISTRY)
+EDIT_IMAGE_INPUT_LIMIT = 3
 
 
 class TaskInputSelectionOutput(StrictModel):
@@ -89,14 +90,11 @@ def prepare_task_inputs(state: RuntimeState, task_id: str) -> TaskInputSelection
 
     task_state = state["session"].task_states[task_id]
     if task_state.task_working_set:
-        task_state.resolved_input_artifact_ids = [
-            artifact_id
-            for artifact_id in working_set_artifact_ids(task_state.task_working_set)
-            if _is_image_artifact(state, artifact_id)
-        ]
+        capped = _cap_working_set_image_count(state, list(task_state.task_working_set))
+        replace_task_working_set(state, task_id, capped)
         return TaskInputSelectionOutput(
-            selected_artifact_ids=working_set_artifact_ids(task_state.task_working_set),
-            working_set_entries=list(task_state.task_working_set),
+            selected_artifact_ids=working_set_artifact_ids(capped),
+            working_set_entries=list(capped),
         )
 
     if task_state.retry_input_artifact_ids and not task_state.task_artifact_ids:
@@ -254,6 +252,19 @@ def select_initial_task_artifacts(
     """Select initial task artifacts from the session working set."""
 
     task = state["tasks"][task_id]
+    if _use_llm(state):
+        selection = invoke_structured_llm(
+            system_prompt=INPUT_SELECTOR_SYSTEM_PROMPT,
+            user_prompt=build_input_selector_user_prompt(
+                task=task,
+                thinking=thinking,
+                candidates_text=candidates_text,
+            ),
+            output_schema=TaskInputSelectionOutput,
+        )
+        validated = _validate_selection_budget(state, selection)
+        if validated is not None:
+            return validated
     return _fallback_initial_selection(state, task_id)
 
 
@@ -342,59 +353,71 @@ def _fallback_initial_selection(state: RuntimeState, task_id: str) -> TaskInputS
         visible_ids = list(task.input_artifact_ids)
     if not visible_ids and state["session"].artifact_index is not None:
         visible_ids = list(state["session"].artifact_index.by_type.get(ArtifactKind.IMAGE, []))
+    image_count = 0
+
+    def append_entry(artifact_id: str, *, usage: str, selection_reason: str) -> None:
+        nonlocal image_count
+        if artifact_id in selected_ids:
+            return
+        artifact = state["artifacts"].get(artifact_id)
+        if artifact is None:
+            return
+        if artifact.kind == ArtifactKind.INSTRUCTION:
+            if artifact.role != "session_root_instruction":
+                return
+        elif artifact.kind == ArtifactKind.IMAGE:
+            if image_count >= EDIT_IMAGE_INPUT_LIMIT:
+                return
+            image_count += 1
+        else:
+            return
+        selected_entries.append(
+            make_working_set_entry(
+                artifact_id,
+                usage=usage,
+                selection_reason=selection_reason,
+            )
+        )
+        selected_ids.append(artifact_id)
+
     for artifact_id in visible_ids:
         artifact = state["artifacts"].get(artifact_id)
         if artifact is None:
             continue
         if artifact.kind == ArtifactKind.INSTRUCTION:
-            if artifact.role == "session_root_instruction":
-                selected_entries.append(
-                    make_working_set_entry(
-                        artifact_id,
-                        usage="session instruction context",
-                        selection_reason="retain the root instruction for task initialization",
-                    )
-                )
-                selected_ids.append(artifact_id)
-            continue
-        if artifact.kind != ArtifactKind.IMAGE:
-            continue
-        if task.input_artifact_ids:
-            if artifact_id not in task.input_artifact_ids:
-                continue
-        selected_entries.append(
-            make_working_set_entry(
+            append_entry(
                 artifact_id,
-                usage="initial task image input",
-                selection_reason="selected from the session working set for task initialization",
+                usage="session instruction context",
+                selection_reason="retain the root instruction for task initialization",
             )
+    for artifact_id in task.input_artifact_ids:
+        append_entry(
+            artifact_id,
+            usage="static task image input",
+            selection_reason="selected because the task explicitly requested this input artifact",
         )
-        selected_ids.append(artifact_id)
     if task.depends_on:
         for dep_id in task.depends_on:
             dep_final = state["session"].task_states[dep_id].final_artifact_id
-            if dep_final and dep_final not in selected_ids:
-                selected_entries.append(
-                    make_working_set_entry(
-                        dep_final,
-                        usage="dependency output image",
-                        selection_reason="selected because this task depends on an earlier task result",
-                    )
+            if dep_final:
+                append_entry(
+                    dep_final,
+                    usage="dependency output image",
+                    selection_reason="selected because this task depends on an earlier task result",
                 )
-                selected_ids.append(dep_final)
-    if not selected_entries:
-        for artifact_id in visible_ids:
-            artifact = state["artifacts"].get(artifact_id)
-            if artifact is None or artifact.kind != ArtifactKind.IMAGE:
-                continue
-            selected_entries.append(
-                make_working_set_entry(
-                    artifact_id,
-                    usage="fallback initial task image input",
-                    selection_reason="used because no explicit task input artifacts were available",
-                )
+    for artifact_id in visible_ids:
+        append_entry(
+            artifact_id,
+            usage="initial task image input",
+            selection_reason="selected from the session working set for task initialization",
+        )
+    if not selected_entries and state["session"].artifact_index is not None:
+        for artifact_id in state["session"].artifact_index.by_type.get(ArtifactKind.IMAGE, []):
+            append_entry(
+                artifact_id,
+                usage="fallback initial task image input",
+                selection_reason="used because no explicit task input artifacts were available",
             )
-            selected_ids.append(artifact_id)
     return TaskInputSelectionOutput(
         selected_artifact_ids=selected_ids,
         working_set_entries=selected_entries,
@@ -472,6 +495,72 @@ def _fallback_continue_execute_selection(
         selected_artifact_ids=selected_ids,
         working_set_entries=selected_entries,
     )
+
+
+def _candidate_selection_ids(state: RuntimeState) -> set[str]:
+    return {entry.artifact_id for entry in state["session"].session_working_set if entry.artifact_id in state["artifacts"]}
+
+
+def _validate_selection_budget(
+    state: RuntimeState,
+    selection: TaskInputSelectionOutput,
+) -> TaskInputSelectionOutput | None:
+    candidate_ids = _candidate_selection_ids(state)
+    selected_entries: list[WorkingSetEntry] = []
+    selected_ids: list[str] = []
+    image_count = 0
+    source_entries = list(selection.working_set_entries)
+    if not source_entries:
+        source_entries = [
+            make_working_set_entry(
+                artifact_id,
+                usage="selected task artifact",
+                selection_reason="selected by the input selector",
+            )
+            for artifact_id in selection.selected_artifact_ids
+        ]
+
+    for entry in source_entries:
+        artifact = state["artifacts"].get(entry.artifact_id)
+        if artifact is None:
+            continue
+        if entry.artifact_id not in candidate_ids:
+            continue
+        if artifact.kind == ArtifactKind.IMAGE:
+            if image_count >= EDIT_IMAGE_INPUT_LIMIT:
+                continue
+            image_count += 1
+        elif artifact.kind != ArtifactKind.INSTRUCTION:
+            continue
+        if entry.artifact_id in selected_ids:
+            continue
+        selected_entries.append(entry)
+        selected_ids.append(entry.artifact_id)
+
+    if not selected_entries:
+        return None
+    return TaskInputSelectionOutput(
+        selected_artifact_ids=selected_ids,
+        working_set_entries=selected_entries,
+    )
+
+
+def _cap_working_set_image_count(
+    state: RuntimeState,
+    entries: list[WorkingSetEntry],
+) -> list[WorkingSetEntry]:
+    capped: list[WorkingSetEntry] = []
+    image_count = 0
+    for entry in entries:
+        artifact = state["artifacts"].get(entry.artifact_id)
+        if artifact is None:
+            continue
+        if artifact.kind == ArtifactKind.IMAGE:
+            if image_count >= EDIT_IMAGE_INPUT_LIMIT:
+                continue
+            image_count += 1
+        capped.append(entry)
+    return capped
 
 
 def _find_latest_instruction_artifact_id(state: RuntimeState, task_id: str) -> str | None:

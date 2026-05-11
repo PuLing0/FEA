@@ -961,9 +961,12 @@ class ExecuteAgent:
 
         if not image_refs:
             raise ValueError("edit requires at least one image input")
-        if len(image_refs) > EDIT_IMAGE_INPUT_LIMIT:
-            raise EditInputBudgetExceeded(image_refs)
-        return image_refs
+        return self._select_edit_image_refs_within_budget(image_refs)
+
+    def _select_edit_image_refs_within_budget(self, image_refs: list[str]) -> list[str]:
+        if len(image_refs) <= EDIT_IMAGE_INPUT_LIMIT:
+            return image_refs
+        return image_refs[:EDIT_IMAGE_INPUT_LIMIT]
 
     def _has_understanding_for_image(
         self,
