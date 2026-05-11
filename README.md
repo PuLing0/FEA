@@ -29,7 +29,7 @@ Or use the existing virtual environment when present:
 
 ```bash
 cd /mnt/sda/sijuzheng/project/FEA
-./.venv/bin/pytest tests/test_schema.py -q
+./.venv/bin/pytest tests/regression -q
 ```
 
 Expected lightweight test result:
@@ -242,7 +242,7 @@ The CLI prints human-readable progress and a final summary with the run id, log 
 
 ```bash
 cd /mnt/sda/sijuzheng/project/FEA
-./.venv/bin/pytest tests/test_schema.py -q
+./.venv/bin/pytest tests/regression -q
 ./.venv/bin/python -m py_compile src/agent.py
 ./.venv/bin/python -m py_compile src/vision_backends/firered_edit_server.py src/vision_backends/sam31_segment_server.py
 ```

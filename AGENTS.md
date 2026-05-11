@@ -20,7 +20,7 @@ uv run langgraph dev
 Follow the existing style: 4-space indentation, type hints on public functions, and concise docstrings. Use `snake_case` for functions, variables, and modules; `PascalCase` for Pydantic models and agent/tool classes; enum values stay lowercase. Prefer strict schemas over loose dictionaries. When adding files, keep names descriptive, for example `runtime/input_selector.py` or `tools/prompt_reconstruct_tool.py`.
 
 ## Testing Guidelines
-Tests use `pytest`. Add or extend tests in `tests/test_schema.py` unless a new module clearly deserves its own file such as `tests/test_execute_agent.py`. Name tests `test_<behavior>()` and cover both success paths and guardrails, especially around plan validation, replan state transitions, and artifact selection. Run `uv run pytest` before opening a PR.
+Tests use `pytest`. Add or extend the focused files under `tests/regression/` unless a broader integration test clearly belongs in an existing top-level test file such as `tests/test_tool_runner.py`. Name tests `test_<behavior>()` and cover both success paths and guardrails, especially around plan validation, replan state transitions, and artifact selection. Run `uv run pytest` before opening a PR.
 
 ## Commit & Pull Request Guidelines
 Recent history uses short, imperative commit subjects such as `Refactor planner and execute runtime schemas` and `Cover replan and observe runtime behavior`. Keep that pattern: one line, present tense, focused on the main change. PRs should include a brief summary, affected modules, test evidence, and any `.env` or model-config assumptions. Attach screenshots only if a LangGraph UI or visual artifact output changed.

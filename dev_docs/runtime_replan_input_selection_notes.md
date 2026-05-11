@@ -78,7 +78,7 @@ Task.input_artifact_ids
 - `src/schema/runtime.py`
 - `src/agents/execute_agent.py`
 - `src/agents/plan_agent.py`
-- `tests/test_schema.py`
+- `tests/regression/`
 
 ## 3. Replan 不应该提前绑定 task 输入
 
@@ -613,7 +613,7 @@ ce17641 Use plan artifact pool for task input selection
 单测：
 
 ```bash
-uv run pytest -q tests/test_schema.py
+uv run pytest -q tests/regression
 ```
 
 当前结果：
