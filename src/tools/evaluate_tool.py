@@ -14,12 +14,11 @@ from schema import (
     EvaluateArgs,
     EvaluateLLMOutput,
     EvaluationArtifact,
-    ToolInvocationRecord,
     ToolName,
 )
 
 from .base import BaseTool, ToolExecutionResult
-from .utils import next_artifact_id, next_operation_id
+from .utils import next_artifact_id
 
 
 REFERENCE_BOARD_MAX_SIDE = 2048
@@ -222,15 +221,8 @@ class EvaluateTool(BaseTool):
             role="evaluation_feedback",
             scope="task",
         )
-        invocation = ToolInvocationRecord(
-            id=next_operation_id(state, self.name),
-            task_id=task_id,
-            loop_index=loop_index,
-            tool_name=self.name,
-            args=args.model_dump(),
-            status="succeeded",
-            output_refs=[artifact.id],
+        return ToolExecutionResult(
+            artifacts=[artifact],
             result_payload={**payload, "evaluation_ref": artifact.id, "generated_refs": generated_refs},
             raw_output_uri=f"runs/{task_id}/{self.name.value}.json",
         )
-        return ToolExecutionResult(invocation=invocation, artifacts=[artifact])

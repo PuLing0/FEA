@@ -14,7 +14,6 @@ from schema import (
     InstructionArtifact,
     SessionPhase,
     SessionState,
-    ToolInvocationRecord,
     ToolName,
     UnderstandArgs,
     UnderstandingArtifact,
@@ -32,9 +31,21 @@ from .run_logger import (
     summarize_artifact,
     summarize_decision,
     summarize_image_index,
-    summarize_operation,
     summarize_task,
     summarize_task_state,
+)
+from .message_query import (
+    find_latest_evaluation,
+    find_tool_results,
+    summarize_tool_result,
+)
+from .message_store import (
+    append_artifact_ref_message,
+    append_text_message,
+    append_tool_call_message,
+    append_tool_result_message,
+    init_message_store,
+    next_tool_call_id,
 )
 from .state import RuntimeState
 from .tool_runner import ToolRunner
@@ -70,21 +81,22 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
         "artifacts": {},
         "plans": {},
         "tasks": {},
-        "task_act_records": [],
-        "task_loops": [],
-        "operations": [],
+        "messages": [],
         "max_task_loops": max_task_loops,
         "max_execute_acts": max_execute_acts,
         "max_evaluator_checkpoints": max_evaluator_checkpoints,
         "max_tool_failures": max_tool_failures,
         "run_id": logger.run_id,
         "run_log_uri": logger.uri,
+        "message_log_uri": None,
         "run_logger": logger,
     }
+    init_message_store(state)
     log_event(
         state,
         "run_start",
         log_uri=logger.uri,
+        message_log_uri=state.get("message_log_uri"),
         image_uris=list(runtime_input["image_uris"]),
         use_llm=runtime_input.get("use_llm", False),
         max_task_loops=max_task_loops,
@@ -93,6 +105,11 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
         max_tool_failures=max_tool_failures,
     )
     log_event(state, "node_start", node="register_and_understand")
+    append_text_message(
+        state,
+        role="user",
+        text=runtime_input["instruction_text"],
+    )
     root_instruction = InstructionArtifact(
         id="art_instruction_session_root_001",
         summary=runtime_input["instruction_text"],
@@ -102,6 +119,7 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
         scope="session",
     )
     register_artifact_in_session_pool(state, root_instruction)
+    append_artifact_ref_message(state, root_instruction, role="user")
     add_to_session_working_set(
         state,
         root_instruction.id,
@@ -119,6 +137,7 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
             scope="session",
         )
         register_artifact_in_session_pool(state, image)
+        append_artifact_ref_message(state, image, role="user")
         add_to_session_working_set(
             state,
             image.id,
@@ -142,28 +161,48 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
                 scope="session",
             )
             register_artifact_in_session_pool(state, understanding)
-            invocation = ToolInvocationRecord(
-                    id=f"op_understand_bootstrap_{index:03d}",
-                    task_id="bootstrap",
-                    loop_index=0,
-                    tool_name=ToolName.UNDERSTAND,
-                    args={
-                        "image_ref": image.id,
-                        "question": BOOTSTRAP_UNDERSTAND_QUESTION_TEMPLATE.format(index=index),
-                    },
-                    status="succeeded",
-                    output_refs=[understanding.id],
-                    result_payload={
-                        "image_ref": image.id,
-                        "summary": understanding.payload["summary"],
-                        "understanding_ref": understanding.id,
-                    },
-                    raw_output_uri=f"runs/bootstrap/{ToolName.UNDERSTAND.value}.json",
-                )
-            state["operations"].append(invocation)
+            tool_args = {
+                "image_ref": image.id,
+                "question": BOOTSTRAP_UNDERSTAND_QUESTION_TEMPLATE.format(index=index),
+            }
+            tool_call_id = next_tool_call_id(state, ToolName.UNDERSTAND)
+            append_tool_call_message(
+                state,
+                tool_call_id=tool_call_id,
+                tool_name=ToolName.UNDERSTAND,
+                args=tool_args,
+                task_id="bootstrap",
+                loop_index=0,
+            )
+            append_tool_result_message(
+                state,
+                tool_call_id=tool_call_id,
+                tool_name=ToolName.UNDERSTAND,
+                status="succeeded",
+                args=tool_args,
+                artifact_ids=[understanding.id],
+                result_payload={
+                    "image_ref": image.id,
+                    "summary": understanding.payload["summary"],
+                    "understanding_ref": understanding.id,
+                },
+                raw_output_uri=f"runs/bootstrap/{ToolName.UNDERSTAND.value}.json",
+                summary=understanding.payload["summary"],
+                task_id="bootstrap",
+                loop_index=0,
+            )
             image.summary = understanding.payload["summary"]
             image.role = "initial_input"
-            log_event(state, "operation_succeeded", **summarize_operation(invocation))
+            append_artifact_ref_message(state, understanding, role="assistant")
+            log_event(
+                state,
+                "operation_succeeded",
+                tool_call_id=tool_call_id,
+                tool_name=ToolName.UNDERSTAND.value,
+                status="succeeded",
+                args=tool_args,
+                artifact_ids=[understanding.id],
+            )
             log_event(state, "artifact_created", **summarize_artifact(understanding))
             continue
 
@@ -177,11 +216,21 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
                 question=BOOTSTRAP_UNDERSTAND_QUESTION_TEMPLATE.format(index=index),
             ),
         )
-        state["operations"].append(understand_execution.invocation)
-        event = "operation_failed" if understand_execution.invocation.status == "failed" else "operation_succeeded"
-        log_event(state, event, **summarize_operation(understand_execution.invocation))
+        event = "operation_failed" if understand_execution.status == "failed" else "operation_succeeded"
+        log_event(
+            state,
+            event,
+            tool_call_id=understand_execution.tool_call_id,
+            tool_name=ToolName.UNDERSTAND.value,
+            status=understand_execution.status,
+            args=understand_execution.args,
+            artifact_ids=understand_execution.output_refs,
+            error=understand_execution.error,
+            raw_output_uri=understand_execution.raw_output_uri,
+        )
         for artifact in understand_execution.artifacts:
             register_artifact_in_session_pool(state, artifact)
+            append_artifact_ref_message(state, artifact, role="assistant")
             if artifact.payload.get("summary"):
                 image.summary = artifact.payload["summary"]
             image.role = "initial_input"
@@ -217,13 +266,18 @@ def plan(state: RuntimeState) -> RuntimeState:
 
 def execute_current_task(state: RuntimeState) -> RuntimeState:
     log_event(state, "node_start", node="execute")
-    before_operation_count = len(state.get("operations", []))
+    before_message_count = len(state.get("messages", []))
     before_artifact_ids = set(state.get("artifacts", {}).keys())
     task_id = state["session"].current_task_id
     result = EXECUTE_AGENT.run(state)
-    for operation in result.get("operations", [])[before_operation_count:]:
-        event = "operation_failed" if operation.status == "failed" else "operation_succeeded"
-        log_event(result, event, **summarize_operation(operation))
+    for tool_result in find_tool_results(result):
+        if not any(
+            tool_result in envelope.message.content
+            for envelope in result.get("messages", [])[before_message_count:]
+        ):
+            continue
+        event = "operation_failed" if tool_result.status == "failed" else "operation_succeeded"
+        log_event(result, event, **summarize_tool_result(tool_result))
     for artifact_id, artifact in result.get("artifacts", {}).items():
         if artifact_id not in before_artifact_ids:
             log_event(result, "artifact_created", **summarize_artifact(artifact))
@@ -240,13 +294,18 @@ def execute_current_task(state: RuntimeState) -> RuntimeState:
 
 def evaluate_checkpoint(state: RuntimeState) -> RuntimeState:
     log_event(state, "node_start", node="evaluate")
-    before_operation_count = len(state.get("operations", []))
+    before_message_count = len(state.get("messages", []))
     before_artifact_ids = set(state.get("artifacts", {}).keys())
     task_id = state["session"].current_task_id
     result = EVALUATOR_AGENT.run(state)
-    for operation in result.get("operations", [])[before_operation_count:]:
-        event = "operation_failed" if operation.status == "failed" else "operation_succeeded"
-        log_event(result, event, **summarize_operation(operation))
+    for tool_result in find_tool_results(result):
+        if not any(
+            tool_result in envelope.message.content
+            for envelope in result.get("messages", [])[before_message_count:]
+        ):
+            continue
+        event = "operation_failed" if tool_result.status == "failed" else "operation_succeeded"
+        log_event(result, event, **summarize_tool_result(tool_result))
     for artifact_id, artifact in result.get("artifacts", {}).items():
         if artifact_id not in before_artifact_ids:
             log_event(result, "artifact_created", **summarize_artifact(artifact))
@@ -254,11 +313,16 @@ def evaluate_checkpoint(state: RuntimeState) -> RuntimeState:
     decision = result.get("decision")
     evaluation_payload = None
     evaluation_ref = None
-    for operation in reversed(result.get("operations", [])[before_operation_count:]):
-        if operation.tool_name == ToolName.EVALUATE and operation.status == "succeeded":
-            evaluation_payload = operation.result_payload or {}
-            evaluation_ref = evaluation_payload.get("evaluation_ref")
-            break
+    latest_evaluation = find_latest_evaluation(result, task_id=task_id)
+    if latest_evaluation is not None:
+        evaluation_payload = {
+            "verdict": latest_evaluation.verdict,
+            "reason": latest_evaluation.reason,
+            "candidate_ref": latest_evaluation.candidate_ref,
+            "candidate_refs": latest_evaluation.candidate_refs,
+            "checks": latest_evaluation.checks,
+        }
+        evaluation_ref = latest_evaluation.evaluation_ref
     log_event(
         result,
         "evaluate_decision",

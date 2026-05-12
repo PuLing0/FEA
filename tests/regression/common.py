@@ -28,6 +28,7 @@ from runtime.input_selector import (
     build_candidate_image_pool,
     build_candidate_images_text,
 )
+from runtime.message_query import find_recent_observations, find_tool_results
 from runtime.run_logger import summarize_task_state
 from runtime.scheduler import select_next_runnable_task
 from runtime.tool_runner import ToolRunner
@@ -96,6 +97,43 @@ def _assert_tool_failed(result, *, error_type: str, message: str) -> None:
     assert result.invocation.error is not None
     assert result.invocation.error["type"] == error_type
     assert message in result.invocation.error["message"]
+
+
+def message_tool_results(state: dict, **filters):
+    return find_tool_results(state, **filters)
+
+
+def latest_message_tool_result(state: dict, **filters):
+    results = message_tool_results(state, **filters)
+    return results[-1] if results else None
+
+
+def message_observations(state: dict, *, task_id: str, limit: int = 1000):
+    return find_recent_observations(state, task_id=task_id, limit=limit)
+
+
+def message_loop_tool_sequences(state: dict, *, task_id: str | None = None) -> list[list[str]]:
+    grouped: dict[tuple[str | None, int | None], list[str]] = {}
+    for envelope in state.get("messages", []):
+        if task_id is not None and envelope.task_id != task_id:
+            continue
+        for block in envelope.message.content:
+            if getattr(block, "type", None) != "tool_result":
+                continue
+            key = (envelope.task_id, envelope.loop_index)
+            grouped.setdefault(key, []).append(str(block.tool_name))
+    return list(grouped.values())
+
+
+def message_loop_task_ids(state: dict) -> list[str | None]:
+    task_ids: list[str | None] = []
+    for envelope in state.get("messages", []):
+        for block in envelope.message.content:
+            if getattr(block, "type", None) != "tool_result":
+                continue
+            if envelope.task_id not in task_ids:
+                task_ids.append(envelope.task_id)
+    return task_ids
 
 
 def _make_instruction_resolution_state(

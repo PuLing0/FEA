@@ -29,6 +29,7 @@ load_dotenv(REPO_ROOT / ".env")
 from agent import create_agent, format_final_summary  # noqa: E402
 from llm import load_llm_config  # noqa: E402
 from runtime.config import default_max_execute_acts  # noqa: E402
+from runtime.message_query import find_tool_results  # noqa: E402
 from runtime.prompts import REAL_AGENT_SMOKE_DEFAULT_INSTRUCTION  # noqa: E402
 from schema import ArtifactKind, SessionPhase, ToolName  # noqa: E402
 from vision_backends.firered_edit_backend import unload_pipeline  # noqa: E402
@@ -92,10 +93,9 @@ def _is_enabled(name: str, default: bool) -> bool:
 
 
 def _find_latest_edit_output_id(state: dict[str, Any]) -> str | None:
-    for operation in reversed(state.get("operations", [])):
-        if operation.tool_name == ToolName.EDIT and operation.status == "succeeded":
-            if operation.output_refs:
-                return operation.output_refs[-1]
+    for result in reversed(find_tool_results(state, tool_name=ToolName.EDIT, status="succeeded")):
+        if result.artifact_ids:
+            return result.artifact_ids[-1]
     return None
 
 
@@ -112,18 +112,18 @@ def _run_graph_smoke(graph: Any, input_state: dict[str, Any]) -> tuple[dict[str,
         raise RuntimeError("agent graph produced no states")
     return latest_state, "graph_terminal"
 
-def _summarize_operations(state: dict[str, Any]) -> list[dict[str, Any]]:
+def _summarize_tool_results(state: dict[str, Any]) -> list[dict[str, Any]]:
     rows = []
-    for operation in state.get("operations", []):
+    for result in find_tool_results(state):
         rows.append(
             {
-                "id": operation.id,
-                "task_id": operation.task_id,
-                "loop_index": operation.loop_index,
-                "tool_name": _enum_value(operation.tool_name),
-                "status": operation.status,
-                "output_refs": list(operation.output_refs),
-                "error": operation.error,
+                "id": result.tool_call_id,
+                "task_id": result.task_id,
+                "loop_index": result.loop_index,
+                "tool_name": _enum_value(result.tool_name),
+                "status": result.status,
+                "output_refs": list(result.artifact_ids),
+                "error": result.error,
             }
         )
     return rows
@@ -195,6 +195,7 @@ def main() -> int:
         summary = {
             "run_id": result.get("run_id"),
             "run_log_uri": result.get("run_log_uri"),
+            "message_log_uri": result.get("message_log_uri"),
             "stop_reason": stop_reason,
             "session_phase": _enum_value(session.phase),
             "current_plan_id": session.current_plan_id,
@@ -212,7 +213,7 @@ def main() -> int:
                 "issues": list(decision.issues),
             },
             "final_artifact": _summarize_artifact(result, final_artifact_id),
-            "operations": _summarize_operations(result),
+            "tool_results": _summarize_tool_results(result),
         }
         print(format_final_summary(summary))
 

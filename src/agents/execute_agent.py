@@ -21,6 +21,20 @@ from runtime.instruction_resolver import (
     resolve_active_instruction_text,
 )
 from runtime.input_selector import prepare_task_inputs
+from runtime.message_query import (
+    count_failed_tool_results,
+    find_latest_tool_result,
+    find_tool_results,
+)
+from runtime.message_store import (
+    append_artifact_ref_message,
+    append_decision_message,
+    append_observation_message,
+    append_thinking_message,
+    append_tool_call_message,
+    append_tool_result_message,
+    next_tool_call_id,
+)
 from runtime.prompts import (
     EXECUTE_COLLAGE_LAYOUT_GOAL,
     EXECUTE_GROUNDING_QUERY,
@@ -52,14 +66,12 @@ from schema import (
     ReplanRequest,
     SegmentArgs,
     SessionPhase,
-    TaskActRecord,
-    TaskLoop,
     TaskRetryAdvice,
     TaskStatus,
-    ToolInvocationRecord,
     ToolName,
     UnderstandArgs,
 )
+from tools.base import ToolExecutionResult
 from tools.registry import ToolRegistry, build_default_tool_registry
 
 
@@ -118,6 +130,13 @@ class ExecuteAgent:
                 if strategy
                 else self._build_rule_based_thinking(state, task, current_task_id, act_index)
             )
+            append_thinking_message(
+                state,
+                text=thinking,
+                task_id=current_task_id,
+                loop_index=loop_index,
+                act_index=act_index,
+            )
             selected_tool = self._resolve_next_tool(
                 state=state,
                 task=task,
@@ -142,9 +161,16 @@ class ExecuteAgent:
                 resolved_inputs=resolved_inputs,
                 base_image_ref=base_image_ref,
             )
-            if execution.invocation.status == "failed":
-                state["operations"].append(execution.invocation)
-                error = execution.invocation.error or {}
+            execution = self._coerce_execution_result(
+                state=state,
+                execution=execution,
+                selected_tool=selected_tool,
+                task_id=current_task_id,
+                loop_index=loop_index,
+                act_index=act_index,
+            )
+            if execution.status == "failed":
+                error = execution.error or {}
                 if error.get("type") == "EditInputBudgetExceeded":
                     observation = (
                         "Planned edit step exceeded the 3-image input budget: "
@@ -156,7 +182,7 @@ class ExecuteAgent:
                 else:
                     tool_failure_count += 1
                     observation = self._build_tool_failure_observation(
-                        invocation=execution.invocation,
+                        execution=execution,
                         failure_count=tool_failure_count,
                         max_tool_failures=max_tool_failures,
                     )
@@ -165,17 +191,14 @@ class ExecuteAgent:
                         observation,
                     )
                 act_records.append((thinking, observation))
-                state["task_act_records"].append(
-                    TaskActRecord(
-                        task_id=current_task_id,
-                        loop_index=loop_index,
-                        act_index=act_index,
-                        thinking_text=thinking,
-                        tool_name=selected_tool.value,
-                        tool_args=dict(execution.invocation.args),
-                        output_artifact_ids=[],
-                        observation_text=observation,
-                    )
+                append_observation_message(
+                    state,
+                    task_id=current_task_id,
+                    loop_index=loop_index,
+                    act_index=act_index,
+                    text=observation,
+                    outcome="failed",
+                    artifact_ids=[],
                 )
                 if (
                     error.get("type") == "EditInputBudgetExceeded"
@@ -185,7 +208,6 @@ class ExecuteAgent:
                     break
                 continue
 
-            state["operations"].append(execution.invocation)
             observe_result = self._observe_with_llm(
                 state=state,
                 task=task,
@@ -202,19 +224,17 @@ class ExecuteAgent:
                     usage=artifact.role or f"artifact produced by {selected_tool.value}",
                     selection_reason=f"produced in the current execute cycle via {selected_tool.value}",
                 )
+                append_artifact_ref_message(state, artifact, task_id=current_task_id)
             observation = observe_result.observation
             act_records.append((thinking, observation))
-            state["task_act_records"].append(
-                TaskActRecord(
-                    task_id=current_task_id,
-                    loop_index=loop_index,
-                    act_index=act_index,
-                    thinking_text=thinking,
-                    tool_name=selected_tool.value,
-                    tool_args=dict(execution.invocation.args),
-                    output_artifact_ids=list(execution.invocation.output_refs),
-                    observation_text=observation,
-                )
+            append_observation_message(
+                state,
+                task_id=current_task_id,
+                loop_index=loop_index,
+                act_index=act_index,
+                text=observation,
+                outcome=observe_result.outcome,
+                artifact_ids=execution.output_refs,
             )
 
             if observe_result.outcome == "success":
@@ -262,6 +282,7 @@ class ExecuteAgent:
                 )
             state["decision"] = decision
             session.latest_decision_id = decision.id
+            append_decision_message(state, decision)
         elif latest_refs:
             task_state.latest_artifact_ids = latest_refs
             task_state.latest_execution_outcome = ExecutionOutcome.SUCCESS
@@ -285,30 +306,11 @@ class ExecuteAgent:
             )
             state["decision"] = decision
             session.latest_decision_id = decision.id
+            append_decision_message(state, decision)
             if decision.route == DecisionRoute.FAIL:
                 task_state.status = TaskStatus.FAILED
                 session.phase = SessionPhase.FAILED
 
-        state["task_loops"].append(
-            TaskLoop(
-                id=f"loop_{current_task_id}_{loop_index:03d}",
-                task_id=current_task_id,
-                loop_index=loop_index,
-                thinking="\n\n".join(
-                    f"Act {index}: {thinking}"
-                    for index, (thinking, _) in enumerate(act_records, start=1)
-                ),
-                selected_tools=[
-                    record.tool_name
-                    for record in state["task_act_records"]
-                    if record.task_id == current_task_id and record.loop_index == loop_index
-                ],
-                output_artifact_ids=list(latest_refs),
-                observation="\n".join(
-                    f"{observation}" for _, observation in act_records
-                ),
-            )
-        )
         state["session"] = session
         return state
 
@@ -361,7 +363,7 @@ class ExecuteAgent:
             active_instruction=self._resolve_active_instruction_text_from_artifacts(state, task_id),
             retry_context=state["session"].task_states[task_id].retry_context_text,
             selected_tool=selected_tool.value,
-            tool_args=execution.invocation.args,
+            tool_args=execution.args,
             source_lines=source_lines,
             new_artifact_lines=new_artifact_lines,
         )
@@ -427,7 +429,7 @@ class ExecuteAgent:
         if failed_operation is not None:
             error = failed_operation.error or {}
             error_message = error.get("message", "tool execution failed")
-            failure_count = self._count_failed_operations(state)
+            failure_count = self._count_failed_tool_results(state)
             if failure_count >= state.get("max_tool_failures", 3):
                 return Decision(
                     id=f"dec_exec_fail_{task_id}_{task_state.loop_count + 1:03d}",
@@ -551,19 +553,195 @@ class ExecuteAgent:
         self,
         state: RuntimeState,
         task_id: str,
-    ) -> ToolInvocationRecord | None:
-        for operation in reversed(state.get("operations", [])):
-            if operation.task_id == task_id and operation.status == "failed":
-                return operation
+    ):
+        return find_latest_tool_result(state, task_id=task_id, status="failed")
+
+    def _count_failed_tool_results(self, state: RuntimeState) -> int:
+        return count_failed_tool_results(
+            state,
+            exclude_error_type="EditInputBudgetExceeded",
+        )
+
+    def _coerce_execution_result(
+        self,
+        *,
+        state: RuntimeState,
+        execution: Any,
+        selected_tool: ToolName,
+        task_id: str,
+        loop_index: int,
+        act_index: int,
+    ) -> ToolExecutionResult:
+        """Normalize direct/legacy execution fakes into message-first results."""
+
+        if isinstance(execution, ToolExecutionResult):
+            result = execution
+        else:
+            invocation = self._explicit_attr(execution, "invocation", None)
+            status = self._explicit_attr(invocation, "status", None)
+            error = self._explicit_attr(invocation, "error", None)
+            if status not in {"succeeded", "failed"}:
+                status = "failed" if isinstance(error, dict) else "succeeded"
+            result = ToolExecutionResult(
+                status=status,
+                tool_call_id=self._coerce_optional_str(
+                    self._explicit_attr(invocation, "id", None)
+                ),
+                tool_name=self._coerce_tool_name(
+                    self._explicit_attr(invocation, "tool_name", selected_tool),
+                    selected_tool,
+                ),
+                task_id=self._coerce_optional_str(
+                    self._explicit_attr(invocation, "task_id", task_id)
+                )
+                or task_id,
+                loop_index=self._coerce_optional_int(
+                    self._explicit_attr(invocation, "loop_index", loop_index)
+                )
+                or loop_index,
+                args=self._coerce_args(
+                    self._explicit_attr(
+                        invocation,
+                        "args",
+                        self._explicit_attr(execution, "args", {}),
+                    )
+                ),
+                artifacts=self._coerce_artifacts(
+                    self._explicit_attr(execution, "artifacts", [])
+                ),
+                result_payload=self._coerce_optional_dict(
+                    self._explicit_attr(
+                        invocation,
+                        "result_payload",
+                        self._explicit_attr(execution, "result_payload", None),
+                    )
+                ),
+                raw_output_uri=self._coerce_optional_str(
+                    self._explicit_attr(
+                        invocation,
+                        "raw_output_uri",
+                        self._explicit_attr(execution, "raw_output_uri", None),
+                    )
+                ),
+                error=self._coerce_optional_dict(error),
+                invocation=invocation,
+            )
+
+        update: dict[str, Any] = {}
+        if result.tool_call_id is None:
+            update["tool_call_id"] = next_tool_call_id(state, selected_tool)
+        if result.tool_name is None:
+            update["tool_name"] = selected_tool
+        if result.task_id is None:
+            update["task_id"] = task_id
+        if result.loop_index is None:
+            update["loop_index"] = loop_index
+        if update:
+            result = result.model_copy(update=update)
+        self._append_missing_tool_result_messages(
+            state=state,
+            result=result,
+            selected_tool=selected_tool,
+            task_id=task_id,
+            loop_index=loop_index,
+            act_index=act_index,
+        )
+        return result
+
+    def _append_missing_tool_result_messages(
+        self,
+        *,
+        state: RuntimeState,
+        result: ToolExecutionResult,
+        selected_tool: ToolName,
+        task_id: str,
+        loop_index: int,
+        act_index: int,
+    ) -> None:
+        tool_call_id = result.tool_call_id or next_tool_call_id(state, selected_tool)
+        if any(
+            block.tool_call_id == tool_call_id
+            for block in find_tool_results(state, task_id=task_id)
+        ):
+            return
+        tool_name = self._coerce_tool_name(result.tool_name, selected_tool)
+        append_tool_call_message(
+            state,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            args=result.args,
+            task_id=task_id,
+            loop_index=loop_index,
+            act_index=act_index,
+        )
+        append_tool_result_message(
+            state,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            status=result.status,
+            args=result.args,
+            artifact_ids=result.output_refs,
+            result_payload=result.result_payload,
+            raw_output_uri=result.raw_output_uri,
+            error=result.error,
+            task_id=task_id,
+            loop_index=loop_index,
+            act_index=act_index,
+        )
+
+    def _explicit_attr(self, value: Any, name: str, default: Any) -> Any:
+        if value is None:
+            return default
+        if isinstance(value, dict):
+            return value.get(name, default)
+        try:
+            attrs = vars(value)
+        except TypeError:
+            attrs = {}
+        if name in attrs:
+            return attrs[name]
+        if self._looks_like_mock(value):
+            return default
+        return getattr(value, name, default)
+
+    def _looks_like_mock(self, value: Any) -> bool:
+        return type(value).__module__.startswith("unittest.mock")
+
+    def _coerce_tool_name(self, value: Any, default: ToolName) -> ToolName:
+        if isinstance(value, ToolName):
+            return value
+        if isinstance(value, str):
+            try:
+                return ToolName(value)
+            except ValueError:
+                return default
+        return default
+
+    def _coerce_args(self, value: Any) -> dict[str, Any]:
+        if hasattr(value, "model_dump"):
+            return value.model_dump()
+        if isinstance(value, dict):
+            return dict(value)
+        return {}
+
+    def _coerce_artifacts(self, value: Any) -> list[Any]:
+        if value is None or self._looks_like_mock(value):
+            return []
+        try:
+            return list(value)
+        except TypeError:
+            return []
+
+    def _coerce_optional_dict(self, value: Any) -> dict[str, Any] | None:
+        if isinstance(value, dict):
+            return dict(value)
         return None
 
-    def _count_failed_operations(self, state: RuntimeState) -> int:
-        return sum(
-            1
-            for operation in state.get("operations", [])
-            if operation.status == "failed"
-            and (operation.error or {}).get("type") != "EditInputBudgetExceeded"
-        )
+    def _coerce_optional_str(self, value: Any) -> str | None:
+        return value if isinstance(value, str) else None
+
+    def _coerce_optional_int(self, value: Any) -> int | None:
+        return value if isinstance(value, int) else None
 
     def _fallback_replan_mode(self, task_type: str) -> ReplanMode:
         if task_type in {"local_edit", "compose_subject", "reference_edit"}:
@@ -668,7 +846,12 @@ class ExecuteAgent:
     def _is_evaluable_candidate_artifact(self, artifact) -> bool:
         if artifact.kind != ArtifactKind.IMAGE:
             return False
-        return artifact.created_by == ToolName.EDIT.value or artifact.role == "candidate_image"
+        payload = artifact.payload if isinstance(artifact.payload, dict) else {}
+        return (
+            artifact.created_by == ToolName.EDIT.value
+            or artifact.role == "candidate_image"
+            or payload.get("role") == "candidate_image"
+        )
 
     def _is_image_artifact(self, state: RuntimeState, artifact_id: str) -> bool:
         artifact = self._get_artifact(state, artifact_id)
@@ -1124,18 +1307,18 @@ class ExecuteAgent:
     def _build_tool_failure_observation(
         self,
         *,
-        invocation: ToolInvocationRecord,
+        execution: ToolExecutionResult,
         failure_count: int,
         max_tool_failures: int,
     ) -> str:
-        error = invocation.error or {}
+        error = execution.error or {}
         error_type = error.get("type", "unknown")
         error_message = error.get("message", "unknown error")
-        tool_name = getattr(invocation.tool_name, "value", invocation.tool_name)
+        tool_name = getattr(execution.tool_name, "value", execution.tool_name)
         return (
             f"Tool failure {failure_count}/{max_tool_failures}: "
             f"tool={tool_name}; "
-            f"args={dict(invocation.args)}; "
+            f"args={dict(execution.args)}; "
             f"error_type={error_type}; "
             f"error={error_message}. "
             "Read this error before choosing the next tool. Retry with corrected "
@@ -1256,42 +1439,20 @@ class ExecuteAgent:
         )
 
     def _build_recent_raw_tao_text(self, state: RuntimeState, task_id: str) -> str:
-        records = [
-            record for record in state["task_act_records"] if record.task_id == task_id
-        ]
-        recent = records[-5:]
+        entries = self._collect_task_history_entries(state, task_id)
+        recent = entries[-20:]
         if not recent:
             return "(no previous rounds)"
-        blocks = []
-        for record in recent:
-            blocks.append(
-                f"Loop {record.loop_index} Act {record.act_index}\n"
-                f"Thinking:\n{record.thinking_text}\n"
-                f"Act:\ntool={record.tool_name}\nargs={record.tool_args}\n"
-                f"Observe:\n{record.observation_text}\n"
-                f"Outputs: {record.output_artifact_ids}"
-            )
-        return "\n\n".join(blocks)
+        return "\n".join(recent)
 
     def _summarize_earlier_tao_rounds(self, state: RuntimeState, task_id: str) -> str:
-        records = [
-            record for record in state["task_act_records"] if record.task_id == task_id
-        ]
-        if len(records) <= 5:
+        entries = self._collect_task_history_entries(state, task_id)
+        if len(entries) <= 20:
             return "(no earlier rounds)"
-        earlier = records[-15:-5]
+        earlier = entries[-60:-20]
         if not earlier:
             return "(no earlier rounds)"
-        raw = "\n\n".join(
-            (
-                f"Loop {record.loop_index} Act {record.act_index}\n"
-                f"Thinking:\n{record.thinking_text}\n"
-                f"Act:\ntool={record.tool_name}\nargs={record.tool_args}\n"
-                f"Observe:\n{record.observation_text}\n"
-                f"Outputs: {record.output_artifact_ids}"
-            )
-            for record in earlier
-        )
+        raw = "\n".join(earlier)
         response = invoke_llm(
             system_prompt=EXECUTION_HISTORY_SUMMARY_SYSTEM_PROMPT,
             user_prompt=build_execution_history_summary_user_prompt(
@@ -1300,3 +1461,26 @@ class ExecuteAgent:
             ),
         )
         return str(response.content).strip()
+
+    def _collect_task_history_entries(self, state: RuntimeState, task_id: str) -> list[str]:
+        entries: list[str] = []
+        for envelope in state.get("messages", []):
+            if envelope.task_id != task_id:
+                continue
+            for block in envelope.message.content:
+                block_type = getattr(block, "type", "")
+                prefix = f"Loop {envelope.loop_index or '-'} Act {envelope.act_index or '-'}"
+                if block_type == "thinking_summary":
+                    entries.append(f"{prefix} Thinking: {block.text}")
+                elif block_type == "tool_call":
+                    entries.append(
+                        f"{prefix} Act: tool={block.tool_name} args={block.args}"
+                    )
+                elif block_type == "tool_result":
+                    entries.append(
+                        f"{prefix} Result: tool={block.tool_name} status={block.status} "
+                        f"outputs={block.artifact_ids} error={block.error}"
+                    )
+                elif block_type == "observation":
+                    entries.append(f"{prefix} Observe: {block.text}")
+        return entries

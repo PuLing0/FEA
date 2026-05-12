@@ -82,7 +82,7 @@ class ObserveLLMOutput(StrictModel):
 
 
 class TaskActRecord(StrictModel):
-    """Single thinking-act-observe record inside an execute loop."""
+    """Legacy TAO record retained for fixture/backward compatibility."""
 
     task_id: str
     loop_index: int
@@ -95,7 +95,7 @@ class TaskActRecord(StrictModel):
 
 
 class TaskLoop(StrictModel):
-    """Minimal single-loop execution record."""
+    """Legacy loop record retained for fixture/backward compatibility."""
 
     id: str
     task_id: str

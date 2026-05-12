@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
-from schema import Artifact, StrictModel, ToolInvocationRecord, ToolName
+from schema import Artifact, StrictModel, ToolName
 
 if TYPE_CHECKING:
     from runtime.state import RuntimeState
@@ -16,8 +16,111 @@ if TYPE_CHECKING:
 class ToolExecutionResult(StrictModel):
     """Result of a single runtime tool invocation."""
 
-    invocation: ToolInvocationRecord
+    status: Literal["succeeded", "failed"] = "succeeded"
+    tool_call_id: str | None = None
+    tool_name: ToolName | None = None
+    task_id: str | None = None
+    loop_index: int | None = None
+    args: dict[str, Any] = Field(default_factory=dict)
     artifacts: list[Artifact] = Field(default_factory=list)
+    result_payload: dict[str, Any] | None = None
+    raw_output_uri: str | None = None
+    error: dict[str, Any] | None = None
+    invocation: Any | None = Field(default=None, exclude=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_invocation(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or "invocation" not in data:
+            return data
+        migrated = dict(data)
+        invocation = migrated.pop("invocation")
+        migrated.setdefault("invocation", invocation)
+        status = cls._explicit_invocation_attr(invocation, "status", "succeeded")
+        migrated.setdefault("status", status if status in {"succeeded", "failed"} else "succeeded")
+        migrated.setdefault(
+            "tool_call_id",
+            cls._optional_str(cls._explicit_invocation_attr(invocation, "id", None)),
+        )
+        migrated.setdefault(
+            "tool_name",
+            cls._explicit_invocation_attr(invocation, "tool_name", None),
+        )
+        migrated.setdefault(
+            "task_id",
+            cls._optional_str(cls._explicit_invocation_attr(invocation, "task_id", None)),
+        )
+        migrated.setdefault(
+            "loop_index",
+            cls._optional_int(cls._explicit_invocation_attr(invocation, "loop_index", None)),
+        )
+        migrated.setdefault(
+            "args",
+            cls._coerce_args(cls._explicit_invocation_attr(invocation, "args", {})),
+        )
+        migrated.setdefault(
+            "result_payload",
+            cls._optional_dict(
+                cls._explicit_invocation_attr(invocation, "result_payload", None)
+            ),
+        )
+        migrated.setdefault(
+            "raw_output_uri",
+            cls._optional_str(
+                cls._explicit_invocation_attr(invocation, "raw_output_uri", None)
+            ),
+        )
+        migrated.setdefault(
+            "error",
+            cls._optional_dict(cls._explicit_invocation_attr(invocation, "error", None)),
+        )
+        return migrated
+
+    @staticmethod
+    def _explicit_invocation_attr(invocation: Any, name: str, default: Any) -> Any:
+        if invocation is None:
+            return default
+        if isinstance(invocation, dict):
+            return invocation.get(name, default)
+        try:
+            attrs = vars(invocation)
+        except TypeError:
+            attrs = {}
+        if name in attrs:
+            return attrs[name]
+        if type(invocation).__module__.startswith("unittest.mock"):
+            return default
+        return getattr(invocation, name, default)
+
+    @staticmethod
+    def _coerce_args(value: Any) -> dict[str, Any]:
+        if hasattr(value, "model_dump"):
+            return value.model_dump()
+        if isinstance(value, dict):
+            return dict(value)
+        return {}
+
+    @staticmethod
+    def _optional_dict(value: Any) -> dict[str, Any] | None:
+        return dict(value) if isinstance(value, dict) else None
+
+    @staticmethod
+    def _optional_str(value: Any) -> str | None:
+        return value if isinstance(value, str) else None
+
+    @staticmethod
+    def _optional_int(value: Any) -> int | None:
+        return value if isinstance(value, int) else None
+
+    @property
+    def output_refs(self) -> list[str]:
+        refs = [artifact.id for artifact in self.artifacts]
+        if refs:
+            return refs
+        legacy_refs = getattr(self.invocation, "output_refs", None)
+        if isinstance(legacy_refs, list):
+            return list(legacy_refs)
+        return []
 
 
 class BaseTool(ABC):

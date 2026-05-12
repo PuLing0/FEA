@@ -7,10 +7,10 @@ from pathlib import Path
 from llm import invoke_multimodal_llm
 from runtime.instruction_resolver import resolve_active_instruction_text
 from runtime.prompts import UNDERSTAND_SYSTEM_PROMPT, build_understand_user_prompt
-from schema import ArtifactKind, ToolInvocationRecord, ToolName, UnderstandArgs, UnderstandingArtifact
+from schema import ArtifactKind, ToolName, UnderstandArgs, UnderstandingArtifact
 
 from .base import BaseTool, ToolExecutionResult
-from .utils import next_artifact_id, next_operation_id
+from .utils import next_artifact_id
 
 
 class UnderstandTool(BaseTool):
@@ -71,14 +71,8 @@ class UnderstandTool(BaseTool):
             role="image_understanding",
             scope="task" if task_id != "bootstrap" else "session",
         )
-        invocation = ToolInvocationRecord(
-            id=next_operation_id(state, self.name),
-            task_id=task_id,
-            loop_index=loop_index,
-            tool_name=self.name,
-            args=args.model_dump(),
-            status="succeeded",
-            output_refs=[artifact.id],
+        return ToolExecutionResult(
+            artifacts=[artifact],
             result_payload={
                 "image_ref": args.image_ref,
                 "task_instruction": task_instruction,
@@ -87,4 +81,3 @@ class UnderstandTool(BaseTool):
             },
             raw_output_uri=f"runs/{task_id}/{self.name.value}.json",
         )
-        return ToolExecutionResult(invocation=invocation, artifacts=[artifact])

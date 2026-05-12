@@ -1,4 +1,4 @@
-"""Minimal tool schemas and a shared invocation log type."""
+"""Minimal tool schemas."""
 
 from __future__ import annotations
 
@@ -136,7 +136,7 @@ class EvaluateLLMOutput(StrictModel):
 
 
 class ToolInvocationRecord(StrictModel):
-    """Generic execution log for a single tool invocation."""
+    """Legacy invocation record retained for fixture/backward compatibility."""
 
     id: str
     task_id: str

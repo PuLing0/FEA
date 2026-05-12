@@ -64,13 +64,12 @@ def test_minimal_runtime_graph_pass_path() -> None:
     assert result["session"].phase == SessionPhase.EXECUTING
     assert result["session"].current_plan_id == "plan_001"
     assert result["session"].current_task_id == "task_001"
-    assert len(result["operations"]) == 1
-    assert [op.tool_name for op in result["operations"]] == [ToolName.UNDERSTAND]
+    understand_results = message_tool_results(result, tool_name=ToolName.UNDERSTAND)
+    assert len(understand_results) == 1
+    assert [block.tool_name for block in understand_results] == [ToolName.UNDERSTAND]
     assert result["plans"]["plan_001"].task_ids == ["task_001", "task_002"]
     assert result["tasks"]["task_001"].type == "compose_subject"
     assert result["tasks"]["task_002"].type == "place_subject_in_background"
-    understand_ops = [op for op in result["operations"] if op.tool_name == ToolName.UNDERSTAND]
-    assert len(understand_ops) == 1
 
 
 def test_minimal_runtime_graph_replan_path() -> None:
@@ -114,8 +113,8 @@ def test_four_images_generate_task_todo_array() -> None:
     )
 
     assert len(result["session"].artifact_index.by_type[ArtifactKind.IMAGE]) == 4
-    understand_ops = [op for op in result["operations"] if op.tool_name == ToolName.UNDERSTAND]
-    assert len(understand_ops) == 4
+    understand_results = message_tool_results(result, tool_name=ToolName.UNDERSTAND)
+    assert len(understand_results) == 4
     assert result["plans"]["plan_001"].task_ids == ["task_001", "task_002"]
     assert result["tasks"]["task_001"].instruction.startswith("Combine the face")
     assert result["tasks"]["task_002"].instruction.startswith("Place the composed subject")
@@ -153,8 +152,9 @@ def test_single_task_loop_runs_until_success() -> None:
     assert result["session"].phase == SessionPhase.DONE
     assert result["decision"].route == DecisionRoute.PASS
     assert result["session"].final_result_id is not None
-    assert len(result["task_loops"]) >= 2
-    assert all(loop.selected_tools for loop in result["task_loops"])
+    loop_sequences = message_loop_tool_sequences(result)
+    assert len(loop_sequences) >= 2
+    assert all(loop_sequence for loop_sequence in loop_sequences)
 
 
 def test_all_tasks_run_until_session_done() -> None:
@@ -181,7 +181,7 @@ def test_all_tasks_run_until_session_done() -> None:
     assert result["session"].current_task_id is None
     assert result["session"].task_states["task_001"].status == TaskStatus.PASSED
     assert result["session"].task_states["task_002"].status == TaskStatus.PASSED
-    loop_task_ids = [loop.task_id for loop in result["task_loops"]]
+    loop_task_ids = message_loop_task_ids(result)
     assert "task_001" in loop_task_ids
     assert "task_002" in loop_task_ids
 
@@ -232,12 +232,16 @@ def test_task_two_uses_reference_edit_after_task_switch() -> None:
         }
     )
 
-    task_two_edit_ops = [
-        op for op in result["operations"]
-        if op.task_id == "task_002" and op.tool_name == ToolName.EDIT
-    ]
-    assert task_two_edit_ops
-    assert "reference_refs" in task_two_edit_ops[0].args
+    task_two_edit_results = message_tool_results(
+        result,
+        task_id="task_002",
+        tool_name=ToolName.EDIT,
+    )
+    assert task_two_edit_results
+    assert any(
+        artifact_id.startswith("art_image_")
+        for artifact_id in task_two_edit_results[0].args["image_refs"]
+    )
 
 
 def test_register_and_understand_reads_runtime_budgets_from_env(
@@ -301,12 +305,12 @@ def test_local_edit_flow_materializes_task_inputs_and_intermediate_task_artifact
         result["artifacts"][artifact_id].kind == ArtifactKind.UNDERSTANDING
         for artifact_id in task_state.task_artifact_ids
     )
-    assert [loop.selected_tools for loop in result["task_loops"]] == [
+    assert message_loop_tool_sequences(result, task_id="task_001") == [
         ["segment", "crop", "understand", "edit"],
     ]
     assert result["session"].phase == SessionPhase.EVALUATING
     assert result["session"].task_states["task_001"].latest_execute_checkpoint == "passed"
-    assert len(result["task_act_records"]) == 4
+    assert len(message_tool_results(result, task_id="task_001")) == 4
 
 
 def test_route_after_execute_retries_same_task_on_budget_overflow() -> None:

@@ -7,12 +7,10 @@ from typing import Any, TypedDict
 from schema import (
     Artifact,
     Decision,
+    MessageEnvelope,
     Plan,
     SessionState,
     Task,
-    TaskActRecord,
-    TaskLoop,
-    ToolInvocationRecord,
 )
 
 
@@ -34,10 +32,8 @@ class RuntimeState(TypedDict, total=False):
     session: SessionState
     plans: dict[str, Plan]
     tasks: dict[str, Task]
-    task_act_records: list[TaskActRecord]
-    task_loops: list[TaskLoop]
     artifacts: dict[str, Artifact]
-    operations: list[ToolInvocationRecord]
+    messages: list[MessageEnvelope]
     decision: Decision
     max_task_loops: int
     max_execute_acts: int
@@ -45,4 +41,5 @@ class RuntimeState(TypedDict, total=False):
     max_tool_failures: int
     run_id: str
     run_log_uri: str | None
+    message_log_uri: str | None
     run_logger: Any

@@ -324,13 +324,6 @@ def _enrich_console_record(record: dict[str, Any], state: dict[str, Any] | None)
                 payload["summary"] = getattr(artifact, "summary", None)
             if "payload" not in payload:
                 payload["payload"] = getattr(artifact, "payload", {})
-    elif event in {"operation_succeeded", "operation_failed"}:
-        operation_id = payload.get("id")
-        for operation in state.get("operations", []):
-            if getattr(operation, "id", None) == operation_id:
-                if "result_payload" not in payload:
-                    payload["result_payload"] = getattr(operation, "result_payload", None)
-                break
     current_task_id = record.get("current_task_id")
     if current_task_id and "current_task" not in payload:
         task = _as_dict(state.get("tasks")).get(current_task_id)

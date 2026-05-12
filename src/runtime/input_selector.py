@@ -16,6 +16,7 @@ from runtime.instruction_resolver import (
     resolve_active_instruction_artifact,
     resolve_active_instruction_text,
 )
+from runtime.message_store import append_artifact_ref_message
 from runtime.prompts import (
     CANDIDATE_UNDERSTAND_QUESTION_TEMPLATE,
     INPUT_SELECTOR_SYSTEM_PROMPT,
@@ -301,9 +302,9 @@ def ensure_understanding_for_images(state: RuntimeState, image_ids: list[str], *
                 question=CANDIDATE_UNDERSTAND_QUESTION_TEMPLATE.format(image_id=image_id),
             ),
         )
-        state["operations"].append(understand_execution.invocation)
         for artifact in understand_execution.artifacts:
             state["artifacts"][artifact.id] = artifact
+            append_artifact_ref_message(state, artifact, task_id=task_id)
 
 
 def build_candidate_images_text(state: RuntimeState, image_ids: list[str]) -> str:

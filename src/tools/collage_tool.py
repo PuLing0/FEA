@@ -16,12 +16,11 @@ from schema import (
     CollageArgs,
     ImageArtifact,
     StrictModel,
-    ToolInvocationRecord,
     ToolName,
 )
 
 from .base import BaseTool, ToolExecutionResult
-from .utils import next_artifact_id, next_operation_id
+from .utils import next_artifact_id
 
 
 MAX_CANVAS_WIDTH = 4096
@@ -132,14 +131,8 @@ class CollageTool(BaseTool):
                 "width": planned_layout.canvas_width,
                 "height": planned_layout.canvas_height,
             }
-        invocation = ToolInvocationRecord(
-            id=next_operation_id(state, self.name),
-            task_id=task_id,
-            loop_index=loop_index,
-            tool_name=self.name,
-            args=args.model_dump(),
-            status="succeeded",
-            output_refs=[artifact.id],
+        return ToolExecutionResult(
+            artifacts=[artifact],
             result_payload={
                 "layout_goal": args.layout_goal,
                 "block_artifact_ids": list(args.block_artifact_ids),
@@ -148,7 +141,6 @@ class CollageTool(BaseTool):
             },
             raw_output_uri=f"runs/{task_id}/{self.name.value}.json",
         )
-        return ToolExecutionResult(invocation=invocation, artifacts=[artifact])
 
     def _resolve_source_image(self, state, artifact_id: str) -> SourceImage:
         artifact = state["artifacts"].get(artifact_id)

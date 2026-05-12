@@ -8,12 +8,11 @@ from schema import (
     ArtifactKind,
     InstructionArtifact,
     PromptReconstructArgs,
-    ToolInvocationRecord,
     ToolName,
 )
 
 from .base import BaseTool, ToolExecutionResult
-from .utils import next_artifact_id, next_operation_id
+from .utils import next_artifact_id
 
 
 class PromptReconstructTool(BaseTool):
@@ -43,14 +42,7 @@ class PromptReconstructTool(BaseTool):
             role="rewritten_instruction",
             scope="task",
         )
-        invocation = ToolInvocationRecord(
-            id=next_operation_id(state, self.name),
-            task_id=task_id,
-            loop_index=loop_index,
-            tool_name=self.name,
-            args=args.model_dump(),
-            status="succeeded",
-            output_refs=[artifact.id],
+        return ToolExecutionResult(
+            artifacts=[artifact],
             raw_output_uri=f"runs/{task_id}/{self.name.value}.json",
         )
-        return ToolExecutionResult(invocation=invocation, artifacts=[artifact])

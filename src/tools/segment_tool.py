@@ -10,7 +10,7 @@ import re
 import numpy as np
 from PIL import Image
 
-from schema import ArtifactKind, MaskArtifact, SegmentArgs, ToolInvocationRecord, ToolName
+from schema import ArtifactKind, MaskArtifact, SegmentArgs, ToolName
 from vision_backends.sam3_point_backend import (
     Sam3BackendError,
     predict_text_prompt_candidates as sam31_predict_text_prompt_candidates,
@@ -22,7 +22,7 @@ from vision_backends.remote_client import (
 )
 
 from .base import BaseTool, ToolExecutionResult
-from .utils import next_artifact_id, next_operation_id
+from .utils import next_artifact_id
 
 
 @dataclass(slots=True)
@@ -414,14 +414,8 @@ class SegmentTool(BaseTool):
             created_by=self.name.value,
             scope="task",
         )
-        invocation = ToolInvocationRecord(
-            id=next_operation_id(state, self.name),
-            task_id=task_id,
-            loop_index=loop_index,
-            tool_name=self.name,
-            args=args.model_dump(),
-            status="succeeded",
-            output_refs=[artifact.id],
+        return ToolExecutionResult(
+            artifacts=[artifact],
             result_payload={
                 "image_ref": args.image_ref,
                 "prompt": text_prompt,
@@ -430,4 +424,3 @@ class SegmentTool(BaseTool):
             },
             raw_output_uri=f"runs/{task_id}/{self.name.value}.json",
         )
-        return ToolExecutionResult(invocation=invocation, artifacts=[artifact])

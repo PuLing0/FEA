@@ -107,7 +107,9 @@ def test_execute_agent_uses_llm_strategy_when_enabled(mocker) -> None:
 
     result = ExecuteAgent().run(state)
 
-    assert result["operations"][-1].tool_name == ToolName.EDIT
+    latest_edit = latest_message_tool_result(result, tool_name=ToolName.EDIT)
+    assert latest_edit is not None
+    assert latest_edit.tool_name == ToolName.EDIT
     assert result["session"].task_states["task_001"].resolved_input_artifact_ids == [
         "art_img_input_001",
     ]
@@ -115,11 +117,11 @@ def test_execute_agent_uses_llm_strategy_when_enabled(mocker) -> None:
     latest_refs = result["session"].task_states["task_001"].latest_artifact_ids
     assert len(latest_refs) == 1
     assert latest_refs[0].startswith("art_image_")
-    assert result["operations"][-1].args == {
+    assert latest_edit.args == {
         "instruction": "global recolor",
         "image_refs": ["art_img_input_001"],
     }
-    assert result["task_act_records"]
+    assert message_observations(result, task_id="task_001")
 
 
 def test_execute_agent_accepts_grounding_and_collage_strategy(mocker) -> None:
@@ -312,10 +314,10 @@ def test_execute_agent_accepts_grounding_and_collage_strategy(mocker) -> None:
     result = ExecuteAgent().run(state)
     tmpdir.cleanup()
 
-    tool_names = [op.tool_name for op in result["operations"]]
+    tool_names = [block.tool_name for block in message_tool_results(result)]
     assert ToolName.GROUNDING in tool_names
     assert ToolName.COLLAGE in tool_names
-    assert result["operations"][-1].tool_name == ToolName.EDIT
+    assert message_tool_results(result)[-1].tool_name == ToolName.EDIT
     assert invoke_structured.call_count == 3
 
 
@@ -551,13 +553,15 @@ def test_execute_agent_caps_oversized_edit_inputs_instead_of_retrying() -> None:
     assert task_state.status == TaskStatus.WAITING_EVALUATION
     assert task_state.latest_execute_checkpoint == "passed"
     assert task_state.edit_input_budget_overflow_count == 0
-    assert result["operations"][-1].status == "succeeded"
-    assert result["operations"][-1].args["image_refs"] == [
+    latest_edit = latest_message_tool_result(result, tool_name=ToolName.EDIT)
+    assert latest_edit is not None
+    assert latest_edit.status == "succeeded"
+    assert latest_edit.args["image_refs"] == [
         "art_img_input_001",
         "art_img_input_002",
         "art_img_input_003",
     ]
-    assert len(result["operations"][-1].args["image_refs"]) == 3
+    assert len(latest_edit.args["image_refs"]) == 3
 
 
 def test_execute_agent_caps_retry_inputs_and_resets_previous_budget_overflow() -> None:
@@ -624,8 +628,10 @@ def test_execute_agent_caps_retry_inputs_and_resets_previous_budget_overflow() -
     assert task_state.status == TaskStatus.WAITING_EVALUATION
     assert task_state.latest_execute_checkpoint == "passed"
     assert task_state.edit_input_budget_overflow_count == 0
-    assert result["operations"][-1].status == "succeeded"
-    assert result["operations"][-1].args["image_refs"] == [
+    latest_edit = latest_message_tool_result(result, tool_name=ToolName.EDIT)
+    assert latest_edit is not None
+    assert latest_edit.status == "succeeded"
+    assert latest_edit.args["image_refs"] == [
         "art_img_input_001",
         "art_img_input_002",
         "art_img_input_003",
@@ -901,7 +907,7 @@ def test_execute_agent_prompt_reconstruct_then_edit_uses_only_image_candidate(mo
     assert task_state.latest_execute_checkpoint == "passed"
     assert task_state.latest_artifact_ids == ["art_image_candidate_001"]
     assert result["session"].phase == SessionPhase.EVALUATING
-    assert [record.tool_name for record in result["task_act_records"][-2:]] == [
+    assert [block.tool_name for block in message_tool_results(result, task_id="task_001")[-2:]] == [
         ToolName.PROMPT_RECONSTRUCT.value,
         ToolName.EDIT.value,
     ]
@@ -1072,14 +1078,17 @@ def test_execute_agent_tool_failure_still_fails_after_explicit_failure_limit(moc
     assert result["session"].current_task_id is None
     assert task_state.latest_execute_checkpoint == "failed"
     assert task_state.latest_execution_outcome == ExecutionOutcome.FAILURE
-    assert result["task_act_records"][-1].tool_args == {
+    latest_edit = latest_message_tool_result(result, tool_name=ToolName.EDIT)
+    assert latest_edit is not None
+    latest_observation = message_observations(result, task_id="task_001")[-1]
+    assert latest_edit.args == {
         "instruction": "保持图片内容不变",
         "image_refs": ["art_img_input_001"],
     }
-    assert "Tool failure 1/1" in result["task_act_records"][-1].observation_text
-    assert "backend unavailable" in result["task_act_records"][-1].observation_text
-    assert result["operations"][-1].status == "failed"
-    assert result["operations"][-1].error == {
+    assert "Tool failure 1/1" in latest_observation.text
+    assert "backend unavailable" in latest_observation.text
+    assert latest_edit.status == "failed"
+    assert latest_edit.error == {
         "type": "RuntimeError",
         "message": "backend unavailable",
     }
@@ -1191,7 +1200,7 @@ def test_execute_agent_retries_after_tool_failure_with_error_context(mocker) -> 
     result = ExecuteAgent().run(state)
 
     task_state = result["session"].task_states["task_001"]
-    assert [operation.status for operation in result["operations"]] == [
+    assert [block.status for block in message_tool_results(result, task_id="task_001")] == [
         "failed",
         "succeeded",
     ]
@@ -1372,7 +1381,7 @@ def test_execute_agent_observe_injects_artifact_summary(mocker) -> None:
 
     artifact = result["artifacts"]["art_image_candidate_001"]
     assert artifact.summary == "人物已放入背景的候选图，可交给 evaluator 评估。"
-    assert result["task_act_records"][-1].observation_text == "This candidate is ready for evaluator checkpoint."
+    assert message_observations(result, task_id="task_001")[-1].text == "This candidate is ready for evaluator checkpoint."
 
 
 def test_execute_agent_observe_uses_multimodal_when_image_artifact_exists(mocker, tmp_path) -> None:

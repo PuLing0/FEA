@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Iterable
 
 from runtime.state import RuntimeState
-from schema import Artifact, ArtifactKind, ToolInvocationRecord, ToolName
+from schema import Artifact, ArtifactKind
 
 
 def next_artifact_id(state: RuntimeState, kind: ArtifactKind) -> str:
@@ -15,10 +15,6 @@ def next_artifact_id(state: RuntimeState, kind: ArtifactKind) -> str:
         if artifact.kind == kind
     ]
     return f"art_{kind.value}_{len(existing) + 1:03d}"
-
-
-def next_operation_id(state: RuntimeState, tool_name: ToolName) -> str:
-    return f"op_{tool_name.value}_{len(state.get('operations', [])) + 1:03d}"
 
 
 def register_artifacts(state: RuntimeState, artifacts: Iterable[Artifact]) -> None:

@@ -11,7 +11,6 @@ from schema import (
     ArtifactKind,
     EditArgs,
     ImageArtifact,
-    ToolInvocationRecord,
     ToolName,
 )
 from vision_backends.firered_edit_backend import (
@@ -26,7 +25,7 @@ from vision_backends.remote_client import (
 )
 
 from .base import BaseTool, ToolExecutionResult
-from .utils import next_artifact_id, next_operation_id
+from .utils import next_artifact_id
 
 
 class EditTool(BaseTool):
@@ -134,14 +133,8 @@ class EditTool(BaseTool):
             created_by=self.name.value,
             scope="task",
         )
-        invocation = ToolInvocationRecord(
-            id=next_operation_id(state, self.name),
-            task_id=task_id,
-            loop_index=loop_index,
-            tool_name=self.name,
-            args=dumped,
-            status="succeeded",
-            output_refs=[artifact.id],
+        return ToolExecutionResult(
+            artifacts=[artifact],
             result_payload={
                 "instruction": args.instruction,
                 "image_refs": list(args.image_refs),
@@ -149,4 +142,3 @@ class EditTool(BaseTool):
             },
             raw_output_uri=f"runs/{task_id}/{self.name.value}.json",
         )
-        return ToolExecutionResult(invocation=invocation, artifacts=[artifact])

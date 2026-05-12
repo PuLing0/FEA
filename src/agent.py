@@ -22,6 +22,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from runtime.graph import build_runtime_graph
 from runtime.config import default_max_execute_acts, default_max_tool_failures
+from runtime.message_query import find_latest_tool_result, find_tool_results
 from schema import ArtifactKind, SessionPhase, ToolName
 from vision_backends.firered_edit_backend import unload_pipeline
 
@@ -112,10 +113,13 @@ def _resolve_image_paths(image_values: Sequence[str]) -> list[Path]:
 
 
 def _find_latest_edit_output_id(state: dict[str, Any]) -> str | None:
-    for operation in reversed(state.get("operations", [])):
-        if operation.tool_name == ToolName.EDIT and operation.status == "succeeded":
-            if operation.output_refs:
-                return operation.output_refs[-1]
+    result = find_latest_tool_result(
+        state,
+        tool_name=ToolName.EDIT,
+        status="succeeded",
+    )
+    if result is not None and result.artifact_ids:
+        return result.artifact_ids[-1]
     return None
 
 
@@ -130,18 +134,18 @@ def _latest_image_artifact_id(state: dict[str, Any]) -> str | None:
     return None
 
 
-def _summarize_operations(state: dict[str, Any]) -> list[dict[str, Any]]:
+def _summarize_tool_results(state: dict[str, Any]) -> list[dict[str, Any]]:
     rows = []
-    for operation in state.get("operations", []):
+    for result in find_tool_results(state):
         rows.append(
             {
-                "id": operation.id,
-                "task_id": operation.task_id,
-                "loop_index": operation.loop_index,
-                "tool_name": _enum_value(operation.tool_name),
-                "status": operation.status,
-                "output_refs": list(operation.output_refs),
-                "error": operation.error,
+                "id": result.tool_call_id,
+                "task_id": result.task_id,
+                "loop_index": result.loop_index,
+                "tool_name": _enum_value(result.tool_name),
+                "status": result.status,
+                "output_refs": list(result.artifact_ids),
+                "error": result.error,
             }
         )
     return rows
@@ -213,6 +217,7 @@ def _build_summary(state: dict[str, Any], stop_reason: str) -> dict[str, Any]:
     return {
         "run_id": state.get("run_id"),
         "run_log_uri": state.get("run_log_uri"),
+        "message_log_uri": state.get("message_log_uri"),
         "stop_reason": stop_reason,
         "session_phase": _enum_value(session.phase),
         "current_plan_id": session.current_plan_id,
@@ -222,7 +227,7 @@ def _build_summary(state: dict[str, Any], stop_reason: str) -> dict[str, Any]:
         "fallback_final_image_id": final_artifact_id,
         "decision": _summarize_decision(state),
         "final_artifact": _summarize_artifact(state, final_artifact_id),
-        "operations": _summarize_operations(state),
+        "tool_results": _summarize_tool_results(state),
     }
 
 
@@ -271,20 +276,20 @@ def format_final_summary(summary: dict[str, Any]) -> str:
     else:
         lines.append("- 未生成最终图片产物")
 
-    operations = summary.get("operations") or []
+    tool_results = summary.get("tool_results") or []
     lines.append("")
     lines.append("操作流水")
-    if not operations:
+    if not tool_results:
         lines.append("- 无工具调用记录")
     else:
-        for index, operation in enumerate(operations, start=1):
-            status = operation.get("status") or "unknown"
-            refs = _format_refs(operation.get("output_refs"))
+        for index, tool_result in enumerate(tool_results, start=1):
+            status = tool_result.get("status") or "unknown"
+            refs = _format_refs(tool_result.get("output_refs"))
             line = (
-                f"- {index}. {_tool_label(operation.get('tool_name'))} "
-                f"[{status}] task={operation.get('task_id')} loop={operation.get('loop_index')} -> {refs}"
+                f"- {index}. {_tool_label(tool_result.get('tool_name'))} "
+                f"[{status}] task={tool_result.get('task_id')} loop={tool_result.get('loop_index')} -> {refs}"
             )
-            error = operation.get("error")
+            error = tool_result.get("error")
             if error:
                 line += f"；错误={error.get('type')}: {_short_text(error.get('message'))}"
             lines.append(line)

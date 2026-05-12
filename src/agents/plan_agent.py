@@ -7,6 +7,7 @@ from typing import Any
 from llm import invoke_structured_llm, load_llm_config
 from runtime.artifact_context import add_to_session_working_set, register_artifact_in_session_pool
 from runtime.input_selector import initialize_task_working_set_from_session
+from runtime.message_store import append_artifact_ref_message, append_message
 from runtime.prompts import PLAN_SYSTEM_PROMPT, build_plan_user_prompt
 from runtime.scheduler import select_next_runnable_task
 from runtime.state import RuntimeState
@@ -14,11 +15,13 @@ from schema import (
     DecisionRoute,
     InstructionArtifact,
     Plan,
+    PlanBlock,
     PlanLLMOutput,
     PlanTaskSpec,
     ReplanMode,
     SessionPhase,
     Task,
+    TaskBlock,
     TaskState,
     TaskStatus,
 )
@@ -65,6 +68,7 @@ class PlanAgent:
                 status=TaskStatus.PENDING,
             )
             self._attach_instruction_artifact(state, task)
+        self._append_plan_messages(state, plan_obj, tasks)
 
         session.current_plan_id = plan_obj.id
         session.current_task_id = None
@@ -122,6 +126,7 @@ class PlanAgent:
                 status=TaskStatus.PENDING,
             )
             self._attach_instruction_artifact(state, task)
+        self._append_plan_messages(state, new_plan, new_tasks)
 
         session.current_plan_id = new_plan.id
         session.current_task_id = None
@@ -226,7 +231,40 @@ class PlanAgent:
             scope="task",
         )
         register_artifact_in_session_pool(state, instruction_artifact)
+        append_artifact_ref_message(state, instruction_artifact, task_id=task.id)
         state["session"].task_states[task.id].task_artifact_ids.append(instruction_artifact.id)
+
+    def _append_plan_messages(self, state: RuntimeState, plan_obj: Plan, tasks: list[Task]) -> None:
+        append_message(
+            state,
+            role="assistant",
+            content=[
+                PlanBlock(
+                    plan_id=plan_obj.id,
+                    instruction=plan_obj.instruction,
+                    task_ids=list(plan_obj.task_ids),
+                    input_artifact_ids=list(plan_obj.input_artifact_ids),
+                    understanding_artifact_ids=list(plan_obj.understanding_artifact_ids),
+                )
+            ],
+        )
+        for task in tasks:
+            append_message(
+                state,
+                role="assistant",
+                task_id=task.id,
+                content=[
+                    TaskBlock(
+                        task_id=task.id,
+                        plan_id=task.plan_id,
+                        task_type=task.type,
+                        instruction=task.instruction,
+                        input_artifact_ids=list(task.input_artifact_ids),
+                        depends_on=list(task.depends_on),
+                        acceptance_criteria=list(task.acceptance_criteria),
+                    )
+                ],
+            )
 
     def _next_plan_id(self, state: RuntimeState) -> str:
         existing_nums = [
