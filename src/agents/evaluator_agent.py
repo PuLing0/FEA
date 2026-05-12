@@ -116,25 +116,21 @@ class EvaluatorAgent:
             "source_execution_outcome": task_state.latest_execution_outcome,
             "candidate_artifact_ids": list(task_state.latest_artifact_ids),
             "summary": evaluation_payload.get("reason", "structured evaluator checkpoint decision"),
-            "issues": evaluation_payload.get("issues", []),
+            "issues": self._build_decision_issues(evaluation_payload),
             "meta": {"evaluation_ref": evaluate_execution.artifacts[0].id if evaluate_execution.artifacts else None},
         }
 
         if route == DecisionRoute.CONTINUE_EXECUTE:
             task_state.latest_evaluate_checkpoint = "failed"
-            fix_focuses = evaluation_payload.get("issues") or []
-            if not fix_focuses and evaluation_payload.get("new_rewritten_prompt"):
-                fix_focuses = [evaluation_payload["new_rewritten_prompt"]]
-            if not fix_focuses:
-                fix_focuses = ["continue the current task using evaluator feedback to choose the next tool"]
+            reason = evaluation_payload.get(
+                "reason",
+                "continue the current task using evaluator feedback to choose the next tool",
+            )
             task_retry = TaskRetryAdvice(
-                reason=evaluation_payload.get(
-                    "reason",
-                    "the current task is still worth continuing with an appropriate next tool",
-                ),
+                reason=reason,
                 base_candidate_artifact_id=task_state.latest_artifact_ids[-1],
                 reuse_artifact_ids=self._build_reuse_artifact_ids(task_state),
-                fix_focuses=fix_focuses,
+                fix_focuses=[reason],
                 avoid_changes=["do not discard the original input images"],
             )
             decision = Decision(
@@ -207,6 +203,13 @@ class EvaluatorAgent:
         state["decision"] = decision
         state["session"] = session
         return state
+
+    def _build_decision_issues(self, evaluation_payload: dict) -> list[str]:
+        verdict = evaluation_payload.get("verdict")
+        reason = str(evaluation_payload.get("reason", "")).strip()
+        if verdict in {"pass_with_issues", "needs_revision", "replan"} and reason:
+            return [reason]
+        return []
 
     def _build_evaluate_failure_replan_decision(
         self,

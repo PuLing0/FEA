@@ -3,7 +3,6 @@ from __future__ import annotations
 from tests.regression.common import *
 from tests.regression.common import (
     _assert_tool_failed,
-    _evaluation_scores,
     _make_instruction_resolution_state,
     _run_tool,
 )
@@ -38,7 +37,7 @@ def test_public_imports_construct_minimal_objects() -> None:
     )
     evaluation = EvaluationArtifact(
         id="art_eval_001",
-        payload={"verdict": "good", "issues": []},
+        payload={"verdict": "pass", "reason": "candidate is ready"},
         source_ids=["art_img_001"],
     )
 
@@ -62,14 +61,12 @@ def test_instruction_artifact_returns_instruction_text() -> None:
 
 def test_evaluate_llm_output_accepts_pass_with_issues() -> None:
     output = EvaluateLLMOutput(
-        is_satisfied=False,
         verdict="pass_with_issues",
-        scores=_evaluation_scores(4, naturalness=3),
         reason="核心目标已完成，但仍有轻微视觉问题。",
-        issues=["minor visual roughness"],
     )
 
     assert output.verdict == "pass_with_issues"
+    assert output.reason == "核心目标已完成，但仍有轻微视觉问题。"
 
 
 def test_runtime_models_construct() -> None:

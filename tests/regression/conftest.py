@@ -189,16 +189,10 @@ def fake_model_tools_for_schema_regression_tests(mocker, monkeypatch, request):
         desired_route = state.get("input", {}).get("desired_decision_route", "pass")
         if desired_route == "continue_execute":
             verdict = "replan" if state["session"].task_states[task_id].evaluator_checkpoint_count > 3 else "needs_revision"
-            is_satisfied = True
-            base_score = 3
         elif desired_route in {"replan", "fail"}:
             verdict = "replan"
-            is_satisfied = False
-            base_score = 2
         else:
             verdict = "pass"
-            is_satisfied = True
-            base_score = 4
         artifact = EvaluationArtifact(
             id=f"art_eval_fake_{loop_index:03d}",
             payload={
@@ -206,21 +200,8 @@ def fake_model_tools_for_schema_regression_tests(mocker, monkeypatch, request):
                 "candidate_ref": args.candidate_ref,
                 "candidate_refs": list(args.candidate_refs),
                 "checks": list(args.checks),
-                "is_satisfied": is_satisfied,
                 "verdict": verdict,
                 "reason": "Fake evaluation for schema test.",
-                "issues": [],
-                "scores": {
-                    "instruction_success": base_score,
-                    "reference_consistency": base_score,
-                    "overediting": base_score,
-                    "naturalness": base_score,
-                    "artifacts": base_score,
-                    "semantic_score": base_score,
-                    "quality_score": base_score,
-                    "weighted_score": base_score,
-                    "overall_score": base_score,
-                },
             },
             source_ids=list(args.candidate_refs),
             created_by=ToolName.EVALUATE.value,

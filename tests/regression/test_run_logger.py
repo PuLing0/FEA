@@ -3,7 +3,6 @@ from __future__ import annotations
 from tests.regression.common import *
 from tests.regression.common import (
     _assert_tool_failed,
-    _evaluation_scores,
     _make_instruction_resolution_state,
     _run_tool,
 )
@@ -134,15 +133,7 @@ def test_runtime_run_logger_summarizes_evaluation_artifact_payload() -> None:
         id="art_evaluation_001",
         payload={
             "verdict": "pass_with_issues",
-            "scores": {
-                "semantic_score": 4,
-                "quality_score": 3,
-                "weighted_score": 3.8,
-                "overall_score": 3.46,
-            },
             "reason": "核心目标已完成，但仍有轻微问题。",
-            "issues": ["minor artifact"],
-            "is_satisfied": False,
             "candidate_ref": "art_image_001",
         },
         summary="核心目标已完成，但仍有轻微问题。",
@@ -154,8 +145,8 @@ def test_runtime_run_logger_summarizes_evaluation_artifact_payload() -> None:
     summary = summarize_artifact(artifact)
 
     assert summary["payload"]["verdict"] == "pass_with_issues"
-    assert summary["payload"]["scores"]["semantic_score"] == 4
-    assert summary["payload"]["issues"] == ["minor artifact"]
+    assert summary["payload"]["reason"] == "核心目标已完成，但仍有轻微问题。"
+    assert summary["payload"]["candidate_ref"] == "art_image_001"
 
 
 def test_runtime_run_logger_formats_evaluation_verdict_for_humans() -> None:
@@ -172,11 +163,6 @@ def test_runtime_run_logger_formats_evaluation_verdict_for_humans() -> None:
         "payload": {
             "decision_route": "pass",
             "evaluation_verdict": "pass_with_issues",
-            "evaluation_scores": {
-                "semantic_score": 4,
-                "quality_score": 3,
-                "overall_score": 3.46,
-            },
             "decision": {
                 "route": "pass",
                 "summary": "核心目标已完成，但仍有轻微问题。",
@@ -189,7 +175,7 @@ def test_runtime_run_logger_formats_evaluation_verdict_for_humans() -> None:
 
     assert "评估决策：pass" in line
     assert "结论：pass_with_issues" in line
-    assert "semantic=4" in line
+    assert "原因：核心目标已完成，但仍有轻微问题。" in line
 
 
 def test_runtime_run_logger_context_includes_current_task_instruction() -> None:

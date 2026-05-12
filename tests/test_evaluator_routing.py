@@ -37,22 +37,8 @@ class FakeEvaluateTool(BaseTool):
                 "candidate_refs": list(args.candidate_refs),
                 "instruction": args.instruction,
                 "checks": list(args.checks),
-                "is_satisfied": self.verdict == "pass",
                 "verdict": self.verdict,
                 "reason": f"fake {self.verdict} evaluation",
-                "issues": ["revise visible mismatch"] if self.verdict == "needs_revision" else [],
-                "new_rewritten_prompt": "refine the edit" if self.verdict == "needs_revision" else None,
-                "scores": {
-                    "instruction_success": 4,
-                    "reference_consistency": 4,
-                    "overediting": 4,
-                    "naturalness": 4,
-                    "artifacts": 4,
-                    "semantic_score": 4,
-                    "quality_score": 4,
-                    "weighted_score": 4,
-                    "overall_score": 4,
-                },
             },
             source_ids=[*args.input_refs, args.candidate_ref],
             created_by=ToolName.EVALUATE.value,
@@ -172,6 +158,19 @@ def test_evaluator_routes_pass_verdict_to_task_pass() -> None:
     assert result["session"].final_result_id == "art_image_candidate_001"
 
 
+def test_evaluator_routes_pass_with_issues_verdict_to_task_pass() -> None:
+    state = _make_evaluator_state()
+
+    result = EvaluatorAgent(registry=FakeRegistry("pass_with_issues")).run(state)
+
+    task_state = result["session"].task_states["task_001"]
+    assert result["decision"].route == DecisionRoute.PASS
+    assert result["decision"].issues == ["fake pass_with_issues evaluation"]
+    assert task_state.status == TaskStatus.PASSED
+    assert task_state.latest_evaluate_checkpoint == "passed"
+    assert result["session"].phase == SessionPhase.DONE
+
+
 def test_evaluator_routes_needs_revision_verdict_to_continue_execute() -> None:
     state = _make_evaluator_state()
 
@@ -180,6 +179,9 @@ def test_evaluator_routes_needs_revision_verdict_to_continue_execute() -> None:
     task_state = result["session"].task_states["task_001"]
     assert result["decision"].route == DecisionRoute.CONTINUE_EXECUTE
     assert result["decision"].task_retry is not None
+    assert result["decision"].task_retry.reason == "fake needs_revision evaluation"
+    assert result["decision"].task_retry.fix_focuses == ["fake needs_revision evaluation"]
+    assert result["decision"].issues == ["fake needs_revision evaluation"]
     assert task_state.status == TaskStatus.RUNNING
     assert task_state.latest_evaluate_checkpoint == "failed"
     assert result["session"].phase == SessionPhase.EXECUTING
@@ -196,6 +198,8 @@ def test_evaluator_routes_replan_verdict_to_replan() -> None:
     task_state = result["session"].task_states["task_001"]
     assert result["decision"].route == DecisionRoute.REPLAN
     assert result["decision"].replan is not None
+    assert result["decision"].replan.reason == "fake replan evaluation"
+    assert result["decision"].issues == ["fake replan evaluation"]
     assert task_state.status == TaskStatus.REPLANNED
     assert task_state.latest_evaluate_checkpoint == "failed"
     assert result["session"].phase == SessionPhase.PLANNING

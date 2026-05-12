@@ -3,7 +3,6 @@ from __future__ import annotations
 from tests.regression.common import *
 from tests.regression.common import (
     _assert_tool_failed,
-    _evaluation_scores,
     _make_instruction_resolution_state,
     _run_tool,
 )

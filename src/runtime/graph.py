@@ -265,7 +265,6 @@ def evaluate_checkpoint(state: RuntimeState) -> RuntimeState:
         decision_route=getattr(decision.route, "value", decision.route) if decision else None,
         evaluation_ref=evaluation_ref,
         evaluation_verdict=evaluation_payload.get("verdict") if evaluation_payload else None,
-        evaluation_scores=evaluation_payload.get("scores") if evaluation_payload else None,
         task_state=summarize_task_state(task_state, result),
         decision=summarize_decision(decision),
     )

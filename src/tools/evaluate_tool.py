@@ -2,20 +2,18 @@
 
 from __future__ import annotations
 
-from math import sqrt
 from pathlib import Path
 from typing import Any
 
 from llm import invoke_structured_multimodal_llm
 from PIL import Image, ImageDraw, ImageFont
 from runtime.instruction_resolver import resolve_active_instruction_text
-from runtime.prompts import EVALUATE_SCORE_RUBRIC, EVALUATE_SYSTEM_PROMPT, build_evaluate_user_prompt
+from runtime.prompts import EVALUATE_SYSTEM_PROMPT, build_evaluate_user_prompt
 from schema import (
     ArtifactKind,
     EvaluateArgs,
     EvaluateLLMOutput,
     EvaluationArtifact,
-    EvaluationScores,
     ToolInvocationRecord,
     ToolName,
 )
@@ -25,12 +23,7 @@ from .utils import next_artifact_id, next_operation_id
 
 
 REFERENCE_BOARD_MAX_SIDE = 2048
-LOW_SCORE_REPLAN_THRESHOLD = 2
-MAX_NEEDS_REVISION_COUNT = 3
 SUPPORTED_VERDICTS = {"pass", "pass_with_issues", "needs_revision", "replan"}
-
-SCORE_RUBRIC = EVALUATE_SCORE_RUBRIC
-
 
 
 class EvaluateTool(BaseTool):
@@ -117,56 +110,12 @@ class EvaluateTool(BaseTool):
         return str(board_path), [str(board_path)]
 
     @staticmethod
-    def _calculate_scores(scores: EvaluationScores) -> dict[str, float | int]:
-        semantic_score = min(
-            scores.instruction_success,
-            scores.reference_consistency,
-            scores.overediting,
-        )
-        quality_score = min(scores.naturalness, scores.artifacts)
-        weighted_score = (
-            scores.instruction_success * 0.30
-            + scores.reference_consistency * 0.25
-            + scores.overediting * 0.15
-            + scores.naturalness * 0.15
-            + scores.artifacts * 0.15
-        )
-        overall_score = sqrt(semantic_score * quality_score)
-        return {
-            "instruction_success": scores.instruction_success,
-            "reference_consistency": scores.reference_consistency,
-            "overediting": scores.overediting,
-            "naturalness": scores.naturalness,
-            "artifacts": scores.artifacts,
-            "semantic_score": round(float(semantic_score), 2),
-            "quality_score": round(float(quality_score), 2),
-            "weighted_score": round(float(weighted_score), 2),
-            "overall_score": round(float(overall_score), 2),
-        }
-
-    @staticmethod
     def _derive_verdict(
         *,
         llm_verdict: str | None,
-        is_satisfied: bool,
-        scores: EvaluationScores,
-        calculated_scores: dict[str, float | int],
-        evaluator_checkpoint_count: int,
     ) -> str:
         verdict = llm_verdict if llm_verdict in SUPPORTED_VERDICTS else None
-        if verdict is None:
-            verdict = "pass" if is_satisfied else "needs_revision"
-
-        semantic_score = float(calculated_scores["semantic_score"])
-        quality_score = float(calculated_scores["quality_score"])
-        if (
-            semantic_score <= LOW_SCORE_REPLAN_THRESHOLD
-            or quality_score <= LOW_SCORE_REPLAN_THRESHOLD
-        ):
-            return "replan"
-        if verdict == "needs_revision" and evaluator_checkpoint_count >= MAX_NEEDS_REVISION_COUNT:
-            return "replan"
-        return verdict
+        return verdict or "replan"
 
     def _evaluate_with_llm(
         self,
@@ -193,7 +142,6 @@ class EvaluateTool(BaseTool):
                 candidate_ref=candidate_ref,
                 instruction=instruction,
                 checks=checks,
-                score_rubric=SCORE_RUBRIC,
             ),
             image_paths=image_paths,
             output_schema=EvaluateLLMOutput,
@@ -252,14 +200,8 @@ class EvaluateTool(BaseTool):
             input_refs=input_refs,
             candidate_ref=candidate_ref,
         )
-        calculated_scores = self._calculate_scores(llm_output.scores)
-        evaluator_checkpoint_count = state["session"].task_states[task_id].evaluator_checkpoint_count
         verdict = self._derive_verdict(
             llm_verdict=llm_output.verdict,
-            is_satisfied=llm_output.is_satisfied,
-            scores=llm_output.scores,
-            calculated_scores=calculated_scores,
-            evaluator_checkpoint_count=evaluator_checkpoint_count,
         )
         payload: dict[str, Any] = {
             "input_refs": input_refs,
@@ -268,13 +210,8 @@ class EvaluateTool(BaseTool):
             "reference_board_uri": reference_board_path,
             "instruction": instruction,
             "checks": args.checks,
-            "is_satisfied": llm_output.is_satisfied,
             "verdict": verdict,
-            "scores": calculated_scores,
             "reason": llm_output.reason,
-            "issues": llm_output.issues,
-            "new_rewritten_prompt": llm_output.new_rewritten_prompt,
-            "score_rubric": SCORE_RUBRIC,
         }
         artifact = EvaluationArtifact(
             id=next_artifact_id(state, ArtifactKind.EVALUATION),

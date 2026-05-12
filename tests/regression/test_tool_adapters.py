@@ -3,97 +3,54 @@ from __future__ import annotations
 from tests.regression.common import *
 from tests.regression.common import (
     _assert_tool_failed,
-    _evaluation_scores,
     _make_instruction_resolution_state,
     _run_tool,
 )
 
 
 def test_evaluate_tool_derive_verdict_keeps_llm_pass() -> None:
-    scores = _evaluation_scores(4)
-    calculated_scores = EvaluateTool._calculate_scores(scores)
-
     verdict = EvaluateTool._derive_verdict(
         llm_verdict="pass",
-        is_satisfied=True,
-        scores=scores,
-        calculated_scores=calculated_scores,
-        evaluator_checkpoint_count=1,
     )
 
     assert verdict == "pass"
 
 
 def test_evaluate_tool_derive_verdict_keeps_pass_with_issues() -> None:
-    scores = _evaluation_scores(4, naturalness=3)
-    calculated_scores = EvaluateTool._calculate_scores(scores)
-
     verdict = EvaluateTool._derive_verdict(
         llm_verdict="pass_with_issues",
-        is_satisfied=False,
-        scores=scores,
-        calculated_scores=calculated_scores,
-        evaluator_checkpoint_count=1,
     )
 
     assert verdict == "pass_with_issues"
 
 
-def test_evaluate_tool_derive_verdict_low_semantic_guardrail_replans() -> None:
-    scores = _evaluation_scores(4, reference_consistency=2)
-    calculated_scores = EvaluateTool._calculate_scores(scores)
-
-    verdict = EvaluateTool._derive_verdict(
-        llm_verdict="pass_with_issues",
-        is_satisfied=False,
-        scores=scores,
-        calculated_scores=calculated_scores,
-        evaluator_checkpoint_count=1,
-    )
-
-    assert verdict == "replan"
-
-
-def test_evaluate_tool_derive_verdict_keeps_needs_revision_when_scores_allow() -> None:
-    scores = _evaluation_scores(3)
-    calculated_scores = EvaluateTool._calculate_scores(scores)
-
+def test_evaluate_tool_derive_verdict_keeps_needs_revision() -> None:
     verdict = EvaluateTool._derive_verdict(
         llm_verdict="needs_revision",
-        is_satisfied=False,
-        scores=scores,
-        calculated_scores=calculated_scores,
-        evaluator_checkpoint_count=1,
     )
 
     assert verdict == "needs_revision"
 
 
-def test_evaluate_tool_derive_verdict_max_revision_count_replans_when_not_passed() -> None:
-    scores = _evaluation_scores(3)
-    calculated_scores = EvaluateTool._calculate_scores(scores)
-
+def test_evaluate_tool_derive_verdict_keeps_replan() -> None:
     verdict = EvaluateTool._derive_verdict(
-        llm_verdict="needs_revision",
-        is_satisfied=False,
-        scores=scores,
-        calculated_scores=calculated_scores,
-        evaluator_checkpoint_count=3,
+        llm_verdict="replan",
     )
 
     assert verdict == "replan"
 
 
-def test_evaluate_tool_derive_verdict_keeps_replan() -> None:
-    scores = _evaluation_scores(4)
-    calculated_scores = EvaluateTool._calculate_scores(scores)
-
+def test_evaluate_tool_derive_verdict_invalid_verdict_replans() -> None:
     verdict = EvaluateTool._derive_verdict(
-        llm_verdict="replan",
-        is_satisfied=False,
-        scores=scores,
-        calculated_scores=calculated_scores,
-        evaluator_checkpoint_count=1,
+        llm_verdict="continue_execute",
+    )
+
+    assert verdict == "replan"
+
+
+def test_evaluate_tool_derive_verdict_missing_verdict_replans() -> None:
+    verdict = EvaluateTool._derive_verdict(
+        llm_verdict=None,
     )
 
     assert verdict == "replan"
@@ -1007,18 +964,8 @@ def test_evaluate_tool_uses_multimodal_llm(mocker, tmp_path) -> None:
     mocker.patch(
         "tools.evaluate_tool.invoke_structured_multimodal_llm",
         return_value=EvaluateLLMOutput(
-            is_satisfied=True,
             verdict="pass",
-            scores=EvaluationScores(
-                instruction_success=4,
-                reference_consistency=4,
-                overediting=4,
-                naturalness=4,
-                artifacts=4,
-            ),
             reason="候选图满足大部分要求，人物已进入背景。",
-            issues=[],
-            new_rewritten_prompt=None,
         ),
     )
 
@@ -1033,7 +980,7 @@ def test_evaluate_tool_uses_multimodal_llm(mocker, tmp_path) -> None:
 
     assert result.artifacts[0].payload["reason"] == "候选图满足大部分要求，人物已进入背景。"
     assert result.artifacts[0].payload["verdict"] == "pass"
-    assert result.artifacts[0].payload["scores"]["weighted_score"] == 4
+    assert "scores" not in result.artifacts[0].payload
 
 
 def test_edit_tool_generates_local_candidate_image_with_unified_args(tmp_path, mocker) -> None:

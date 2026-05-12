@@ -43,7 +43,6 @@ from schema import (
     EditArgs,
     EvaluateArgs,
     EvaluateLLMOutput,
-    EvaluationScores,
     EvaluationArtifact,
     ExecuteLLMOutput,
     ExecutionOutcome,
@@ -80,18 +79,6 @@ from schema import (
 from tools import BaseTool, ToolExecutionResult, build_default_tool_registry
 from tools.evaluate_tool import EvaluateTool
 from tools.registry import ToolRegistry
-
-
-def _evaluation_scores(score: int = 4, **overrides: int) -> EvaluationScores:
-    values = {
-        "instruction_success": score,
-        "reference_consistency": score,
-        "overediting": score,
-        "naturalness": score,
-        "artifacts": score,
-    }
-    values.update(overrides)
-    return EvaluationScores(**values)
 
 
 def _run_tool(tool: BaseTool, state: dict, *, task_id: str, loop_index: int, args):

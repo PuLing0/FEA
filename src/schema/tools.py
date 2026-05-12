@@ -130,21 +130,9 @@ class EvaluateArgs(StrictModel):
 EvaluationVerdict = Literal["pass", "pass_with_issues", "needs_revision", "replan"]
 
 
-class EvaluationScores(StrictModel):
-    instruction_success: int = Field(ge=0, le=5)
-    reference_consistency: int = Field(ge=0, le=5)
-    overediting: int = Field(ge=0, le=5)
-    naturalness: int = Field(ge=0, le=5)
-    artifacts: int = Field(ge=0, le=5)
-
-
 class EvaluateLLMOutput(StrictModel):
-    is_satisfied: bool
     verdict: EvaluationVerdict
-    scores: EvaluationScores
-    reason: str
-    issues: list[str] = Field(default_factory=list)
-    new_rewritten_prompt: str | None = None
+    reason: str = Field(min_length=1)
 
 
 class ToolInvocationRecord(StrictModel):

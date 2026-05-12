@@ -119,32 +119,13 @@ PROMPT_RECONSTRUCT_SYSTEM_PROMPT = (
 
 EVALUATE_SYSTEM_PROMPT = (
     "You are a strict but practical image-editing evaluator. Return only structured output. "
-    "Judge whether the candidate should stop, continue once, or replan. "
-    "Return one verdict: pass, pass_with_issues, needs_revision, or replan. "
-    "Use pass when the core edit is complete and there are no meaningful delivery issues. "
-    "Use pass_with_issues when the core edit is deliverable but visible non-blocking issues remain, or when more editing is low-value or risky. "
-    "Use needs_revision only for one concrete, targeted, likely-fixable issue. "
-    "Use replan for route failure, broad/global failure, severe damage, or repeated issue types that have not improved. "
-    "The 0-5 scores are lower-bound diagnostics for failure routing, not perfection targets. "
-    "Do not request repeated revisions for small aesthetic issues."
+    "Choose exactly one verdict from pass, pass_with_issues, needs_revision, or replan, and provide one concise reason. "
+    "Use pass when the core edit is complete, the result is deliverable, and there is no meaningful issue worth reporting. "
+    "Use pass_with_issues when the core edit is deliverable but visible non-blocking issues remain; the reason should name those issues. "
+    "Use needs_revision only when one concrete, localized, low-risk fix would likely improve the result; the reason should be directly usable as the next edit focus. "
+    "Use replan when the route is wrong, the reference use failed, the result has broad/global failure or severe damage, or repeated edits have not improved the same issue. "
+    "Do not request repeated revisions for small aesthetic issues; prefer pass_with_issues when further editing is low-value or risky."
 )
-
-EVALUATE_SCORE_RUBRIC = """
-All score dimensions use this 0-5 scale:
-0: Not applicable or impossible to judge from the provided images.
-1: Severe failure. The dimension is essentially wrong and should trigger replan.
-2: Major issue. The result is mostly unsatisfactory for this dimension and may need one targeted revision.
-3: Partial success. The core idea is visible, but important problems remain.
-4: Good. Minor imperfections remain, but this dimension is acceptable and should usually pass.
-5: Excellent. This dimension is fully satisfied with no meaningful issue.
-
-Dimensions:
-- instruction_success: Whether the candidate fulfills the final edit instruction.
-- reference_consistency: Whether the candidate uses the task input/reference images correctly.
-- overediting: Whether the candidate avoids changing content that should be preserved.
-- naturalness: Whether lighting, perspective, scale, composition, and blending look natural.
-- artifacts: Whether the image avoids distortions, broken anatomy, blurred faces, watermarks, damaged edges, or texture artifacts.
-""".strip()
 
 REAL_AGENT_SMOKE_DEFAULT_INSTRUCTION = (
     "Generate a photo of this person wearing the provided top and skirt in the "
@@ -365,7 +346,6 @@ def build_evaluate_user_prompt(
     candidate_ref: str,
     instruction: str,
     checks: list[str],
-    score_rubric: str = EVALUATE_SCORE_RUBRIC,
 ) -> str:
     return (
         f"{reference_text}\n"
@@ -373,15 +353,11 @@ def build_evaluate_user_prompt(
         f"Candidate ref: {candidate_ref}\n"
         f"Final edit instruction: {instruction}\n"
         f"Acceptance checks: {checks}\n\n"
-        f"Scoring rubric:\n{score_rubric}\n\n"
         "Verdict policy:\n"
         "- pass: the candidate is ready to use; the core instruction and preservation needs are met with no meaningful delivery issue.\n"
-        "- pass_with_issues: the candidate is usable and core goals are met, but visible non-blocking issues remain; choose this when another edit is unlikely to improve net quality.\n"
-        "- needs_revision: the candidate is not usable yet, but there is exactly one concrete, targeted, likely-fixable issue worth another execute step.\n"
-        "- replan: the route is wrong, the candidate has broad/global failure or severe damage, or the same issue type has repeated without improvement.\n"
-        "Score policy: keep using the 0-5 dimensions, but do not require high scores for pass/pass_with_issues. "
-        "Scores are lower-bound diagnostics: very low semantic or quality scores should prevent a pass-style verdict and push toward replan. "
-        "Set is_satisfied=true only for pass. Set is_satisfied=false for pass_with_issues, needs_revision, and replan. "
-        "When verdict=needs_revision, explain the main issue and provide one targeted new_rewritten_prompt. "
+        "- pass_with_issues: the candidate is usable and core goals are met, but visible non-blocking issues remain; choose this when another edit is unlikely to improve net quality, and put those issues in reason.\n"
+        "- needs_revision: the candidate is not usable yet, but there is exactly one concrete, localized, likely-fixable issue worth another execute step; put the next edit focus in reason.\n"
+        "- replan: the route is wrong, the reference use failed, the candidate has broad/global failure or severe damage, or the same issue type has repeated without improvement; explain why replanning is needed in reason.\n"
+        "Return only verdict and reason. Do not produce numeric scores. "
         "Do not ask for repeated revisions for small aesthetic issues."
     )

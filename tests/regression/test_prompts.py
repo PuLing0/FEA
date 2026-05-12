@@ -3,7 +3,6 @@ from __future__ import annotations
 from tests.regression.common import *
 from tests.regression.common import (
     _assert_tool_failed,
-    _evaluation_scores,
     _make_instruction_resolution_state,
     _run_tool,
 )
@@ -38,8 +37,8 @@ def test_prompt_module_builds_plan_prompt() -> None:
     assert "Do not invent future artifact ids" in prompt
 
 
-def test_prompt_module_builds_evaluate_prompt_with_rubric() -> None:
-    from runtime.prompts import EVALUATE_SCORE_RUBRIC, build_evaluate_user_prompt
+def test_prompt_module_builds_evaluate_prompt_with_verdict_policy() -> None:
+    from runtime.prompts import build_evaluate_user_prompt
 
     prompt = build_evaluate_user_prompt(
         reference_text="Image 1 is reference. Image 2 is candidate.",
@@ -49,12 +48,10 @@ def test_prompt_module_builds_evaluate_prompt_with_rubric() -> None:
         checks=["身份一致"],
     )
 
-    assert EVALUATE_SCORE_RUBRIC in prompt
-    assert "minor imperfections" in EVALUATE_SCORE_RUBRIC.lower()
     assert "Candidate ref: art_image_001" in prompt
     assert "pass_with_issues" in prompt
-    assert "Score policy" in prompt
-    assert "Set is_satisfied=true only for pass" in prompt
+    assert "Return only verdict and reason" in prompt
+    assert "Do not produce numeric scores" in prompt
     assert "same issue type has repeated" in prompt
 
 
