@@ -24,6 +24,8 @@ REAL_TOOL_TESTS = {
     "test_crop_tool_rejects_mismatched_mask_source",
     "test_understand_tool_uses_multimodal_llm",
     "test_evaluate_tool_uses_multimodal_llm",
+    "test_evaluate_reference_board_uses_tight_layout",
+    "test_evaluate_tool_fails_without_input_reference_image",
     "test_edit_tool_generates_local_candidate_image_with_unified_args",
     "test_edit_tool_uses_remote_backend_when_configured",
     "test_segment_tool_uses_remote_backend_when_configured",

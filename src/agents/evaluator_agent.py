@@ -450,6 +450,7 @@ class EvaluatorAgent:
 
     def _build_evaluate_input_refs(self, state: RuntimeState, task_id: str) -> list[str]:
         task_state = state["session"].task_states[task_id]
+        candidate_refs = set(task_state.latest_artifact_ids)
         refs = (
             task_state.resolved_input_artifact_ids
             or [entry.artifact_id for entry in task_state.task_working_set]
@@ -458,7 +459,8 @@ class EvaluatorAgent:
         return [
             artifact_id
             for artifact_id in refs
-            if artifact_id in state["artifacts"]
+            if artifact_id not in candidate_refs
+            and artifact_id in state["artifacts"]
             and state["artifacts"][artifact_id].kind == ArtifactKind.IMAGE
         ]
 

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from llm import invoke_structured_multimodal_llm
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from runtime.instruction_resolver import resolve_active_instruction_text
 from runtime.prompts import EVALUATE_SYSTEM_PROMPT, build_evaluate_user_prompt
 from schema import (
@@ -22,7 +24,29 @@ from .utils import next_artifact_id, tool_artifact_dir
 
 
 REFERENCE_BOARD_MAX_SIDE = 2048
+REFERENCE_BOARD_PADDING = 8
+REFERENCE_BOARD_LAYOUT_LIMIT = 48
 SUPPORTED_VERDICTS = {"pass", "pass_with_issues", "needs_revision", "replan"}
+
+
+@dataclass(frozen=True)
+class _BoardImage:
+    artifact_ref: str
+    image: Image.Image
+
+
+@dataclass(frozen=True)
+class _BoardPlacement:
+    index: int
+    x: int
+    y: int
+
+
+@dataclass(frozen=True)
+class _BoardLayout:
+    width: int
+    height: int
+    placements: tuple[_BoardPlacement, ...]
 
 
 class EvaluateTool(BaseTool):
@@ -60,39 +84,27 @@ class EvaluateTool(BaseTool):
         input_refs: list[str],
         task_id: str,
         loop_index: int,
-    ) -> tuple[str | None, list[str]]:
+    ) -> tuple[str, list[str]]:
         if not input_refs:
-            return None, []
+            raise ValueError("evaluate requires at least one input/reference image")
         input_paths = self._resolve_image_paths(state, input_refs, label="input")
-        if len(input_paths) == 1:
-            return str(input_paths[0]), []
 
-        images = []
+        images: list[_BoardImage] = []
         for artifact_ref, path in zip(input_refs, input_paths, strict=True):
             with Image.open(path) as image:
-                images.append((artifact_ref, image.convert("RGB")))
+                images.append(
+                    _BoardImage(
+                        artifact_ref=artifact_ref,
+                        image=ImageOps.exif_transpose(image).convert("RGB"),
+                    )
+                )
 
-        cell_width = max(image.width for _, image in images)
-        cell_height = max(image.height for _, image in images)
-        label_height = 36
-        columns = 2 if len(images) <= 4 else 3
-        rows = (len(images) + columns - 1) // columns
-        board = Image.new(
-            "RGB",
-            (columns * cell_width, rows * (cell_height + label_height)),
-            color=(245, 245, 245),
-        )
-        draw = ImageDraw.Draw(board)
-        font = ImageFont.load_default()
-
-        for index, (artifact_ref, image) in enumerate(images):
-            row = index // columns
-            col = index % columns
-            x = col * cell_width
-            y = row * (cell_height + label_height)
-            board.paste(image, (x, y + label_height))
-            draw.rectangle((x, y, x + cell_width, y + label_height), fill=(230, 230, 230))
-            draw.text((x + 8, y + 10), artifact_ref, fill=(0, 0, 0), font=font)
+        layout = self._build_compact_board_layout(images)
+        board = Image.new("RGB", (layout.width, layout.height), color=(245, 245, 245))
+        for placement in layout.placements:
+            board_image = images[placement.index]
+            board.paste(board_image.image, (placement.x, placement.y))
+        self._draw_reference_labels(board, images=images, layout=layout)
 
         max_side = max(board.size)
         if max_side > REFERENCE_BOARD_MAX_SIDE:
@@ -107,6 +119,163 @@ class EvaluateTool(BaseTool):
         board.save(board_path)
         return str(board_path), [str(board_path)]
 
+    @classmethod
+    def _build_compact_board_layout(cls, images: list[_BoardImage]) -> _BoardLayout:
+        dimensions = tuple((item.image.width, item.image.height) for item in images)
+        if len(dimensions) == 1:
+            width, height = dimensions[0]
+            return _BoardLayout(
+                width=width,
+                height=height,
+                placements=(_BoardPlacement(index=0, x=0, y=0),),
+            )
+        if len(dimensions) > 8:
+            return cls._build_shelf_board_layout(dimensions)
+
+        full_mask = (1 << len(dimensions)) - 1
+
+        @lru_cache(maxsize=None)
+        def best_layouts(mask: int) -> tuple[_BoardLayout, ...]:
+            if mask and mask & (mask - 1) == 0:
+                index = mask.bit_length() - 1
+                width, height = dimensions[index]
+                return (
+                    _BoardLayout(
+                        width=width,
+                        height=height,
+                        placements=(_BoardPlacement(index=index, x=0, y=0),),
+                    ),
+                )
+
+            candidates: list[_BoardLayout] = []
+            submask = (mask - 1) & mask
+            while submask:
+                other_mask = mask ^ submask
+                if submask < other_mask:
+                    for left in best_layouts(submask):
+                        for right in best_layouts(other_mask):
+                            candidates.append(cls._combine_layouts(left, right, horizontal=True))
+                            candidates.append(cls._combine_layouts(left, right, horizontal=False))
+                submask = (submask - 1) & mask
+            return tuple(cls._trim_layout_candidates(candidates))
+
+        return min(best_layouts(full_mask), key=cls._layout_score)
+
+    @classmethod
+    def _build_shelf_board_layout(cls, dimensions: tuple[tuple[int, int], ...]) -> _BoardLayout:
+        order = sorted(
+            range(len(dimensions)),
+            key=lambda index: dimensions[index][0] * dimensions[index][1],
+            reverse=True,
+        )
+        best: _BoardLayout | None = None
+        for columns in range(1, len(order) + 1):
+            placements: list[_BoardPlacement] = []
+            y = 0
+            width = 0
+            row_specs: list[tuple[list[int], int, int]] = []
+            for offset in range(0, len(order), columns):
+                row = order[offset : offset + columns]
+                row_width = sum(dimensions[index][0] for index in row) + REFERENCE_BOARD_PADDING * (
+                    len(row) - 1
+                )
+                row_height = max(dimensions[index][1] for index in row)
+                row_specs.append((row, row_width, row_height))
+                width = max(width, row_width)
+            height = sum(row_height for _, _, row_height in row_specs) + REFERENCE_BOARD_PADDING * (
+                len(row_specs) - 1
+            )
+            for row, row_width, row_height in row_specs:
+                x = (width - row_width) // 2
+                for index in row:
+                    item_width, item_height = dimensions[index]
+                    placements.append(
+                        _BoardPlacement(index=index, x=x, y=y + (row_height - item_height) // 2)
+                    )
+                    x += item_width + REFERENCE_BOARD_PADDING
+                y += row_height + REFERENCE_BOARD_PADDING
+            candidate = _BoardLayout(width=width, height=height, placements=tuple(placements))
+            if best is None or cls._layout_score(candidate) < cls._layout_score(best):
+                best = candidate
+        assert best is not None
+        return best
+
+    @staticmethod
+    def _combine_layouts(left: _BoardLayout, right: _BoardLayout, *, horizontal: bool) -> _BoardLayout:
+        if horizontal:
+            width = left.width + REFERENCE_BOARD_PADDING + right.width
+            height = max(left.height, right.height)
+            left_dx = 0
+            left_dy = (height - left.height) // 2
+            right_dx = left.width + REFERENCE_BOARD_PADDING
+            right_dy = (height - right.height) // 2
+        else:
+            width = max(left.width, right.width)
+            height = left.height + REFERENCE_BOARD_PADDING + right.height
+            left_dx = (width - left.width) // 2
+            left_dy = 0
+            right_dx = (width - right.width) // 2
+            right_dy = left.height + REFERENCE_BOARD_PADDING
+        placements = tuple(
+            [
+                *(
+                    _BoardPlacement(index=item.index, x=item.x + left_dx, y=item.y + left_dy)
+                    for item in left.placements
+                ),
+                *(
+                    _BoardPlacement(index=item.index, x=item.x + right_dx, y=item.y + right_dy)
+                    for item in right.placements
+                ),
+            ]
+        )
+        return _BoardLayout(width=width, height=height, placements=placements)
+
+    @classmethod
+    def _trim_layout_candidates(cls, layouts: list[_BoardLayout]) -> list[_BoardLayout]:
+        unique: dict[tuple[int, int], _BoardLayout] = {}
+        for layout in sorted(layouts, key=cls._layout_score):
+            unique.setdefault((layout.width, layout.height), layout)
+            if len(unique) >= REFERENCE_BOARD_LAYOUT_LIMIT:
+                break
+        return list(unique.values())
+
+    @staticmethod
+    def _layout_score(layout: _BoardLayout) -> tuple[int, int, int]:
+        return (
+            layout.width * layout.height,
+            max(layout.width, layout.height),
+            abs(layout.width - layout.height),
+        )
+
+    @staticmethod
+    def _draw_reference_labels(
+        board: Image.Image,
+        *,
+        images: list[_BoardImage],
+        layout: _BoardLayout,
+    ) -> None:
+        font = ImageFont.load_default()
+        label_height = 16
+        for placement in layout.placements:
+            board_image = images[placement.index]
+            label_width = min(
+                board_image.image.width,
+                max(36, min(160, len(board_image.artifact_ref) * 7 + 8)),
+            )
+            label_layer = Image.new(
+                "RGBA",
+                (label_width, min(label_height, board_image.image.height)),
+                (0, 0, 0, 150),
+            )
+            draw = ImageDraw.Draw(label_layer)
+            draw.text(
+                (4, 3),
+                board_image.artifact_ref,
+                fill=(255, 255, 255, 255),
+                font=font,
+            )
+            board.paste(label_layer, (placement.x, placement.y), label_layer)
+
     @staticmethod
     def _derive_verdict(
         *,
@@ -118,19 +287,17 @@ class EvaluateTool(BaseTool):
     def _evaluate_with_llm(
         self,
         *,
-        reference_board_path: str | None,
+        reference_board_path: str,
         candidate_path: str,
         instruction: str,
         checks: list[str],
         input_refs: list[str],
         candidate_ref: str,
     ) -> EvaluateLLMOutput:
-        image_paths = [path for path in [reference_board_path, candidate_path] if path]
+        image_paths = [reference_board_path, candidate_path]
         reference_text = (
-            "Image 1 is a reference board containing all task input/reference images. "
-            "Image 2 is the candidate edited result."
-            if reference_board_path
-            else "Only one image is provided: the candidate edited result."
+            "Image 1 is a compact reference board containing the task input/reference images. "
+            "Image 2 is the candidate edited output to evaluate."
         )
         return invoke_structured_multimodal_llm(
             system_prompt=EVALUATE_SYSTEM_PROMPT,
@@ -182,7 +349,12 @@ class EvaluateTool(BaseTool):
         candidate_ref = args.candidate_ref
         assert candidate_ref is not None
         _, candidate_path = self._resolve_image_artifact(state, candidate_ref, label="candidate")
-        input_refs = self._resolve_input_refs(state, task_id, args)
+        candidate_refs = set(args.candidate_refs or [candidate_ref])
+        input_refs = [
+            artifact_ref
+            for artifact_ref in self._resolve_input_refs(state, task_id, args)
+            if artifact_ref not in candidate_refs
+        ]
         instruction = self._resolve_instruction(state, task_id, args)
         reference_board_path, generated_refs = self._build_reference_board(
             state=state,

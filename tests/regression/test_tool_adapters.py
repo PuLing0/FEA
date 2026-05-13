@@ -992,18 +992,20 @@ def test_understand_tool_uses_multimodal_llm(mocker, tmp_path) -> None:
 
 
 def test_evaluate_tool_uses_multimodal_llm(mocker, tmp_path) -> None:
+    from PIL import Image
+
+    input_path = tmp_path / "input.png"
     image_path = tmp_path / "candidate.png"
-    image_path.write_bytes(
-        b"\x89PNG\r\n\x1a\n"
-        b"\x00\x00\x00\rIHDR"
-        b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00"
-        b"\x90wS\xde"
-        b"\x00\x00\x00\x0cIDATx\x9cc``\x00\x00\x00\x02\x00\x01"
-        b"\x0b\xe7\x02\x9d"
-        b"\x00\x00\x00\x00IEND\xaeB`\x82"
-    )
+    Image.new("RGB", (8, 12), color=(255, 255, 255)).save(input_path)
+    Image.new("RGB", (12, 8), color=(0, 0, 0)).save(image_path)
     state = {
         "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri=str(input_path),
+                payload={"role": "input"},
+                scope="session",
+            ),
             "art_image_001": ImageArtifact(
                 id="art_image_001",
                 uri=str(image_path),
@@ -1017,6 +1019,7 @@ def test_evaluate_tool_uses_multimodal_llm(mocker, tmp_path) -> None:
             ),
         },
         "operations": [],
+        "output_dir": str(tmp_path / "run"),
         "session": SessionState(
             session_id="sess_evaluate",
             phase=SessionPhase.EVALUATING,
@@ -1030,7 +1033,7 @@ def test_evaluate_tool_uses_multimodal_llm(mocker, tmp_path) -> None:
             },
         ),
     }
-    mocker.patch(
+    llm_mock = mocker.patch(
         "tools.evaluate_tool.invoke_structured_multimodal_llm",
         return_value=EvaluateLLMOutput(
             verdict="pass",
@@ -1044,12 +1047,117 @@ def test_evaluate_tool_uses_multimodal_llm(mocker, tmp_path) -> None:
         ToolName.EVALUATE,
         task_id="task_001",
         loop_index=1,
-        args=EvaluateArgs(candidate_refs=["art_image_001"], checks=["人物在背景里"]),
+        args=EvaluateArgs(
+            input_refs=["art_img_input_001", "art_image_001"],
+            candidate_refs=["art_image_001"],
+            checks=["人物在背景里"],
+        ),
     )
 
     assert result.artifacts[0].payload["reason"] == "候选图满足大部分要求，人物已进入背景。"
     assert result.artifacts[0].payload["verdict"] == "pass"
+    assert result.artifacts[0].payload["input_refs"] == ["art_img_input_001"]
     assert "scores" not in result.artifacts[0].payload
+    image_paths = llm_mock.call_args.kwargs["image_paths"]
+    assert len(image_paths) == 2
+    assert image_paths[0] != str(input_path)
+    assert Path(image_paths[0]).is_file()
+    assert image_paths[1] == str(image_path)
+    user_prompt = llm_mock.call_args.kwargs["user_prompt"]
+    assert "Image 1 is a compact reference board" in user_prompt
+    assert "Image 2 is the candidate edited output" in user_prompt
+
+
+def test_evaluate_reference_board_uses_tight_layout(mocker, tmp_path) -> None:
+    from PIL import Image
+
+    tall_path = tmp_path / "tall.png"
+    small_a_path = tmp_path / "small_a.png"
+    small_b_path = tmp_path / "small_b.png"
+    candidate_path = tmp_path / "candidate.png"
+    Image.new("RGB", (20, 100), color=(255, 0, 0)).save(tall_path)
+    Image.new("RGB", (50, 40), color=(0, 255, 0)).save(small_a_path)
+    Image.new("RGB", (50, 40), color=(0, 0, 255)).save(small_b_path)
+    Image.new("RGB", (64, 64), color=(255, 255, 255)).save(candidate_path)
+
+    state = {
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(id="art_img_input_001", uri=str(tall_path), payload={"role": "input"}),
+            "art_img_input_002": ImageArtifact(id="art_img_input_002", uri=str(small_a_path), payload={"role": "input"}),
+            "art_img_input_003": ImageArtifact(id="art_img_input_003", uri=str(small_b_path), payload={"role": "input"}),
+            "art_image_001": ImageArtifact(id="art_image_001", uri=str(candidate_path), payload={"role": "candidate_image"}),
+        },
+        "operations": [],
+        "output_dir": str(tmp_path / "run"),
+        "session": SessionState(
+            session_id="sess_evaluate_tight",
+            phase=SessionPhase.EVALUATING,
+            current_task_id="task_001",
+            task_states={"task_001": TaskState(task_id="task_001", status=TaskStatus.WAITING_EVALUATION)},
+        ),
+    }
+    mocker.patch(
+        "tools.evaluate_tool.invoke_structured_multimodal_llm",
+        return_value=EvaluateLLMOutput(verdict="pass", reason="ok"),
+    )
+
+    result = _run_tool(
+        EvaluateTool(),
+        state,
+        task_id="task_001",
+        loop_index=1,
+        args=EvaluateArgs(
+            input_refs=["art_img_input_001", "art_img_input_002", "art_img_input_003"],
+            candidate_refs=["art_image_001"],
+            instruction="检查输出",
+        ),
+    )
+
+    board_path = Path(result.artifacts[0].payload["reference_board_uri"])
+    assert board_path.is_file()
+    with Image.open(board_path) as board:
+        assert board.size == (78, 100)
+        assert board.width * board.height < 27_200
+
+
+def test_evaluate_tool_fails_without_input_reference_image(mocker, tmp_path) -> None:
+    from PIL import Image
+
+    candidate_path = tmp_path / "candidate.png"
+    Image.new("RGB", (16, 16), color=(255, 255, 255)).save(candidate_path)
+    llm_mock = mocker.patch("tools.evaluate_tool.invoke_structured_multimodal_llm")
+    state = {
+        "artifacts": {
+            "art_image_001": ImageArtifact(
+                id="art_image_001",
+                uri=str(candidate_path),
+                payload={"role": "candidate_image"},
+            ),
+        },
+        "operations": [],
+        "output_dir": str(tmp_path / "run"),
+        "session": SessionState(
+            session_id="sess_evaluate_missing_input",
+            phase=SessionPhase.EVALUATING,
+            current_task_id="task_001",
+            task_states={"task_001": TaskState(task_id="task_001", status=TaskStatus.WAITING_EVALUATION)},
+        ),
+    }
+
+    result = _run_tool(
+        EvaluateTool(),
+        state,
+        task_id="task_001",
+        loop_index=1,
+        args=EvaluateArgs(candidate_refs=["art_image_001"], instruction="检查输出"),
+    )
+
+    _assert_tool_failed(
+        result,
+        error_type="ValueError",
+        message="evaluate requires at least one input/reference image",
+    )
+    llm_mock.assert_not_called()
 
 
 def test_edit_tool_generates_local_candidate_image_with_unified_args(tmp_path, mocker) -> None:

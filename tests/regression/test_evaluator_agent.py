@@ -75,6 +75,60 @@ def test_evaluator_agent_routes_severe_pass_with_issues_to_revision() -> None:
     assert route == DecisionRoute.CONTINUE_EXECUTE
 
 
+def test_evaluator_agent_excludes_candidate_outputs_from_evaluate_inputs() -> None:
+    state = {
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="reference_edit",
+                instruction="把人物放到背景里",
+                input_artifact_ids=["art_img_input_001"],
+            )
+        },
+        "session": SessionState(
+            session_id="sess_eval_inputs",
+            phase=SessionPhase.EVALUATING,
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.WAITING_EVALUATION,
+                    latest_artifact_ids=["art_image_candidate_001"],
+                    task_working_set=[
+                        WorkingSetEntry(
+                            artifact_id="art_img_input_001",
+                            usage="source input",
+                        ),
+                        WorkingSetEntry(
+                            artifact_id="art_image_candidate_001",
+                            usage="latest candidate",
+                        ),
+                    ],
+                )
+            },
+        ),
+        "artifacts": {
+            "art_img_input_001": ImageArtifact(
+                id="art_img_input_001",
+                uri="store://images/input.png",
+                payload={"role": "input"},
+            ),
+            "art_image_candidate_001": ImageArtifact(
+                id="art_image_candidate_001",
+                uri="store://generated/candidate.png",
+                payload={"role": "candidate_image"},
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+    }
+
+    refs = EvaluatorAgent()._build_evaluate_input_refs(state, "task_001")
+
+    assert refs == ["art_img_input_001"]
+
+
 def test_evaluator_agent_does_not_promote_task_instruction_to_session() -> None:
     state = {
         "input": {
