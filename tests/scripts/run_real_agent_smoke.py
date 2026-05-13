@@ -194,6 +194,7 @@ def main() -> int:
         final_artifact_id = session.final_result_id or _find_latest_edit_output_id(result) or _latest_image_artifact_id(result)
         summary = {
             "run_id": result.get("run_id"),
+            "output_dir": result.get("output_dir"),
             "run_log_uri": result.get("run_log_uri"),
             "message_log_uri": result.get("message_log_uri"),
             "stop_reason": stop_reason,

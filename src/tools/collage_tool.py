@@ -20,7 +20,7 @@ from schema import (
 )
 
 from .base import BaseTool, ToolExecutionResult
-from .utils import next_artifact_id
+from .utils import next_artifact_id, tool_artifact_dir
 
 
 MAX_CANVAS_WIDTH = 4096
@@ -97,6 +97,7 @@ class CollageTool(BaseTool):
         self._validate_layout(layout=layout, input_ids=args.block_artifact_ids)
         canvas = self._render_collage(layout=layout, source_images=source_images)
         output_path = self._write_collage(
+            state=state,
             canvas=canvas,
             task_id=task_id,
             loop_index=loop_index,
@@ -317,9 +318,8 @@ class CollageTool(BaseTool):
         return canvas
 
     @staticmethod
-    def _write_collage(*, canvas: Image.Image, task_id: str, loop_index: int) -> Path:
-        output_dir = Path("generated") / "collage"
-        output_dir.mkdir(parents=True, exist_ok=True)
+    def _write_collage(*, state, canvas: Image.Image, task_id: str, loop_index: int) -> Path:
+        output_dir = tool_artifact_dir(state, ToolName.COLLAGE)
         output_path = output_dir / f"{task_id}_{loop_index:03d}.png"
         canvas.save(output_path)
         return output_path

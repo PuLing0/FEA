@@ -15,12 +15,12 @@ from runtime.instruction_resolver import (
     resolve_active_instruction_artifact,
     resolve_active_instruction_text,
 )
+from runtime.output_paths import build_run_output_dir
 from schema import ArtifactKind
 
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
-DEFAULT_LOG_DIR = "generated/agent_logs"
 MAX_CONSOLE_TEXT = 240
 
 
@@ -38,10 +38,6 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-
-
-def _safe_slug(value: str) -> str:
-    return "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in value)[:80]
 
 
 def _json_default(value: Any) -> Any:
@@ -113,7 +109,6 @@ def _display_time(record: dict[str, Any]) -> str:
 class RunLoggerConfig:
     enabled: bool
     console: bool
-    log_dir: Path
     level: str
 
     @classmethod
@@ -121,7 +116,6 @@ class RunLoggerConfig:
         return cls(
             enabled=_env_bool("AGENT_LOG_ENABLED", True),
             console=_env_bool("AGENT_LOG_CONSOLE", True),
-            log_dir=Path(os.getenv("AGENT_LOG_DIR", DEFAULT_LOG_DIR)),
             level=os.getenv("AGENT_LOG_LEVEL", "debug").strip().lower() or "debug",
         )
 
@@ -134,6 +128,7 @@ class RunLogger:
         *,
         run_id: str,
         session_id: str,
+        output_dir: Path,
         log_path: Path | None,
         enabled: bool,
         console: bool,
@@ -141,16 +136,22 @@ class RunLogger:
     ) -> None:
         self.run_id = run_id
         self.session_id = session_id
+        self.output_dir = output_dir
         self.log_path = log_path
         self.enabled = enabled
         self.console = console
         self.level = level
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         if self.enabled and self.log_path is not None:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
 
     @property
     def uri(self) -> str | None:
         return str(self.log_path) if self.log_path is not None else None
+
+    @property
+    def output_uri(self) -> str:
+        return str(self.output_dir)
 
     def event(self, name: str, state: dict[str, Any] | None = None, **payload: Any) -> None:
         if not self.enabled and not self.console:
@@ -176,13 +177,14 @@ class RunLogger:
 def create_run_logger(session_id: str) -> RunLogger:
     config = RunLoggerConfig.from_env()
     run_id = uuid4().hex[:12]
+    output_dir = build_run_output_dir(session_id, run_id)
     log_path = None
     if config.enabled:
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_path = config.log_dir / f"{_safe_slug(session_id)}_{stamp}_{run_id}.jsonl"
+        log_path = output_dir / "logs" / "run.jsonl"
     return RunLogger(
         run_id=run_id,
         session_id=session_id,
+        output_dir=output_dir,
         log_path=log_path,
         enabled=config.enabled,
         console=config.console,
@@ -387,8 +389,11 @@ def _format_run_start(payload: dict[str, Any]) -> str:
     image_uris = payload.get("image_uris") or []
     use_llm = "开启" if payload.get("use_llm") else "关闭"
     log_uri = payload.get("log_uri") or "未写入文件"
+    output_dir = payload.get("output_dir")
     instruction = _short_text(payload.get("instruction_text"))
     pieces = [f"开始运行：收到 {len(image_uris)} 张图片", f"LLM={use_llm}", f"日志={log_uri}"]
+    if output_dir:
+        pieces.append(f"输出目录={output_dir}")
     if instruction:
         pieces.append(f"指令：{instruction}")
     return "；".join(pieces)

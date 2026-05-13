@@ -25,7 +25,7 @@ from vision_backends.remote_client import (
 )
 
 from .base import BaseTool, ToolExecutionResult
-from .utils import next_artifact_id
+from .utils import next_artifact_id, tool_artifact_dir
 
 
 class EditTool(BaseTool):
@@ -59,16 +59,14 @@ class EditTool(BaseTool):
                 images.append(image.convert("RGB").copy())
         return images
 
-    def _write_output(self, image: Image.Image, *, task_id: str, loop_index: int) -> str:
-        output_dir = Path("generated") / "edit"
-        output_dir.mkdir(parents=True, exist_ok=True)
+    def _write_output(self, state, image: Image.Image, *, task_id: str, loop_index: int) -> str:
+        output_dir = tool_artifact_dir(state, self.name)
         output_path = output_dir / f"{task_id}_{loop_index:03d}.png"
         image.save(output_path)
         return str(output_path)
 
-    def _build_output_path(self, *, task_id: str, loop_index: int) -> str:
-        output_dir = Path("generated") / "edit"
-        output_dir.mkdir(parents=True, exist_ok=True)
+    def _build_output_path(self, state, *, task_id: str, loop_index: int) -> str:
+        output_dir = tool_artifact_dir(state, self.name)
         return str(output_dir / f"{task_id}_{loop_index:03d}.png")
 
     def execute(
@@ -85,7 +83,7 @@ class EditTool(BaseTool):
         backend_snapshot = backend_config_snapshot()
         if backend_name == "remote":
             image_paths = [str(self._resolve_image_artifact(state, image_ref).uri) for image_ref in args.image_refs]
-            requested_output_path = self._build_output_path(task_id=task_id, loop_index=loop_index)
+            requested_output_path = self._build_output_path(state, task_id=task_id, loop_index=loop_index)
             try:
                 remote_result = request_firered_edit(
                     image_paths=image_paths,
@@ -106,6 +104,7 @@ class EditTool(BaseTool):
                     "Check backend dependencies, runtime configuration, and input image paths."
                 ) from exc
             output_path = self._write_output(
+                state,
                 edited_image,
                 task_id=task_id,
                 loop_index=loop_index,

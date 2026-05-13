@@ -11,7 +11,7 @@ from tests.regression.common import (
 def test_runtime_run_logger_writes_jsonl(tmp_path, monkeypatch, capsys) -> None:
     import json
 
-    monkeypatch.setenv("AGENT_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("AGENT_OUTPUT_DIR", str(tmp_path))
     monkeypatch.setenv("AGENT_LOG_ENABLED", "true")
     monkeypatch.setenv("AGENT_LOG_CONSOLE", "true")
 
@@ -38,12 +38,22 @@ def test_runtime_run_logger_writes_jsonl(tmp_path, monkeypatch, capsys) -> None:
     assert "任务内容=" in captured.out
     assert "task_001[compose_subject]" in captured.out
     assert result["run_id"]
+    assert result["output_dir"] is not None
     assert result["run_log_uri"] is not None
+    assert result["message_log_uri"] is not None
 
+    output_dir = Path(result["output_dir"])
+    assert output_dir.is_dir()
+    assert output_dir.parent == tmp_path
     log_path = Path(result["run_log_uri"])
+    message_log_path = Path(result["message_log_uri"])
+    assert log_path == output_dir / "logs" / "run.jsonl"
+    assert message_log_path == output_dir / "logs" / "messages.jsonl"
     assert log_path.is_file()
+    assert message_log_path.is_file()
     records = [json.loads(line) for line in log_path.read_text().splitlines()]
     assert records[0]["event"] == "run_start"
+    assert records[0]["payload"]["output_dir"] == str(output_dir)
     assert any(record["event"] == "node_start" and record["payload"]["node"] == "plan" for record in records)
     assert any(record["event"] == "plan_created" for record in records)
     assert all(record["run_id"] == result["run_id"] for record in records)
@@ -269,7 +279,7 @@ def test_summarize_task_state_includes_active_instruction_fields() -> None:
 
 
 def test_runtime_run_logger_can_disable_file_and_console(tmp_path, monkeypatch, capsys) -> None:
-    monkeypatch.setenv("AGENT_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("AGENT_OUTPUT_DIR", str(tmp_path))
     monkeypatch.setenv("AGENT_LOG_ENABLED", "false")
     monkeypatch.setenv("AGENT_LOG_CONSOLE", "false")
 
@@ -289,5 +299,7 @@ def test_runtime_run_logger_can_disable_file_and_console(tmp_path, monkeypatch, 
     captured = capsys.readouterr()
     assert captured.out == ""
     assert result["run_id"]
+    assert result["output_dir"] is not None
     assert result["run_log_uri"] is None
-    assert list(tmp_path.iterdir()) == []
+    assert Path(result["message_log_uri"]).is_file()
+    assert Path(result["message_log_uri"]).parent == Path(result["output_dir"]) / "logs"

@@ -6,6 +6,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from runtime.output_paths import build_tool_result_path, write_json
 from runtime.state import RuntimeState
 from schema import StrictModel, ToolInvocationRecord, ToolName
 from tools.base import BaseTool, ToolExecutionResult
@@ -60,6 +61,14 @@ class ToolRunner:
                     args=parsed_args,
                 )
             )
+            raw_output_path = build_tool_result_path(
+                state,
+                tool_name=tool_name,
+                task_id=task_id,
+                loop_index=loop_index,
+                tool_call_id=tool_call_id,
+            )
+            raw_output_uri = str(raw_output_path) if raw_output_path is not None else result.raw_output_uri
             result = result.model_copy(
                 update={
                     "status": "succeeded",
@@ -68,6 +77,7 @@ class ToolRunner:
                     "task_id": task_id,
                     "loop_index": loop_index,
                     "args": self._dump_args(parsed_args),
+                    "raw_output_uri": raw_output_uri,
                     "invocation": self._legacy_invocation(
                         tool_call_id=tool_call_id,
                         tool_name=tool_name,
@@ -77,11 +87,13 @@ class ToolRunner:
                         status="succeeded",
                         output_refs=result.output_refs,
                         result_payload=result.result_payload,
-                        raw_output_uri=result.raw_output_uri,
+                        raw_output_uri=raw_output_uri,
                         error=None,
                     ),
                 }
             )
+            if raw_output_path is not None:
+                self._write_raw_output(raw_output_path, result)
             append_tool_result_message(
                 state,
                 tool_call_id=tool_call_id,
@@ -90,7 +102,7 @@ class ToolRunner:
                 args=result.args,
                 artifact_ids=result.output_refs,
                 result_payload=result.result_payload,
-                raw_output_uri=result.raw_output_uri,
+                raw_output_uri=raw_output_uri,
                 summary=self._summarize_artifacts(result.artifacts),
                 task_id=task_id,
                 loop_index=loop_index,
@@ -98,6 +110,24 @@ class ToolRunner:
             return result
         except Exception as exc:
             error = self._build_error_payload(exc)
+            raw_output_path = build_tool_result_path(
+                state,
+                tool_name=tool_name,
+                task_id=task_id,
+                loop_index=loop_index,
+                tool_call_id=tool_call_id,
+            )
+            raw_output_uri = str(raw_output_path) if raw_output_path is not None else None
+            if raw_output_path is not None:
+                self._write_raw_failure(
+                    raw_output_path,
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                    task_id=task_id,
+                    loop_index=loop_index,
+                    args=raw_args,
+                    error=error,
+                )
             append_tool_result_message(
                 state,
                 tool_call_id=tool_call_id,
@@ -105,6 +135,7 @@ class ToolRunner:
                 status="failed",
                 args=raw_args,
                 artifact_ids=[],
+                raw_output_uri=raw_output_uri,
                 error=error,
                 task_id=task_id,
                 loop_index=loop_index,
@@ -116,6 +147,7 @@ class ToolRunner:
                 loop_index=loop_index,
                 args=raw_args,
                 error=error,
+                raw_output_uri=raw_output_uri,
             )
 
     def failure_result(
@@ -141,6 +173,24 @@ class ToolRunner:
             loop_index=loop_index,
         )
         payload = self._build_error_payload(error)
+        raw_output_path = build_tool_result_path(
+            state,
+            tool_name=tool_name,
+            task_id=task_id,
+            loop_index=loop_index,
+            tool_call_id=tool_call_id,
+        )
+        raw_output_uri = str(raw_output_path) if raw_output_path is not None else None
+        if raw_output_path is not None:
+            self._write_raw_failure(
+                raw_output_path,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                task_id=task_id,
+                loop_index=loop_index,
+                args=raw_args,
+                error=payload,
+            )
         append_tool_result_message(
             state,
             tool_call_id=tool_call_id,
@@ -148,6 +198,7 @@ class ToolRunner:
             status="failed",
             args=raw_args,
             artifact_ids=[],
+            raw_output_uri=raw_output_uri,
             error=payload,
             task_id=task_id,
             loop_index=loop_index,
@@ -159,6 +210,7 @@ class ToolRunner:
             loop_index=loop_index,
             args=raw_args,
             error=payload,
+            raw_output_uri=raw_output_uri,
         )
 
     def _parse_args(
@@ -186,6 +238,7 @@ class ToolRunner:
         loop_index: int,
         args: dict[str, Any],
         error: dict[str, Any],
+        raw_output_uri: str | None,
     ) -> ToolExecutionResult:
         return ToolExecutionResult(
             status="failed",
@@ -194,6 +247,7 @@ class ToolRunner:
             task_id=task_id,
             loop_index=loop_index,
             args=args,
+            raw_output_uri=raw_output_uri,
             error=error,
             artifacts=[],
             invocation=self._legacy_invocation(
@@ -205,7 +259,7 @@ class ToolRunner:
                 status="failed",
                 output_refs=[],
                 result_payload=None,
-                raw_output_uri=None,
+                raw_output_uri=raw_output_uri,
                 error=error,
             ),
         )
@@ -291,6 +345,48 @@ class ToolRunner:
             kind = getattr(getattr(artifact, "kind", None), "value", getattr(artifact, "kind", None))
             parts.append(f"{artifact.id} ({kind}){': ' + summary if summary else ''}")
         return "; ".join(parts)
+
+    def _write_raw_output(self, path, result: ToolExecutionResult) -> None:
+        write_json(
+            path,
+            {
+                "tool_call_id": result.tool_call_id,
+                "tool_name": result.tool_name,
+                "task_id": result.task_id,
+                "loop_index": result.loop_index,
+                "status": result.status,
+                "args": result.args,
+                "output_refs": result.output_refs,
+                "result_payload": result.result_payload,
+                "artifacts": result.artifacts,
+            },
+        )
+
+    def _write_raw_failure(
+        self,
+        path,
+        *,
+        tool_call_id: str,
+        tool_name: ToolName,
+        task_id: str,
+        loop_index: int,
+        args: dict[str, Any],
+        error: dict[str, Any],
+    ) -> None:
+        write_json(
+            path,
+            {
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "task_id": task_id,
+                "loop_index": loop_index,
+                "status": "failed",
+                "args": args,
+                "output_refs": [],
+                "result_payload": None,
+                "error": error,
+            },
+        )
 
     def _build_error_payload(self, error: Exception) -> dict[str, Any]:
         if self._is_edit_input_budget_error(error):

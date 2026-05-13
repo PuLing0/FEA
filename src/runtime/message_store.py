@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from runtime.output_paths import run_logs_dir, safe_slug
 from schema import (
     ArtifactRefBlock,
     ContentBlock,
@@ -46,7 +47,7 @@ def _json_default(value: Any) -> Any:
 
 
 def _safe_slug(value: str) -> str:
-    return "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in value)[:80]
+    return safe_slug(value)
 
 
 def init_message_store(state: dict[str, Any]) -> None:
@@ -61,6 +62,10 @@ def init_message_store(state: dict[str, Any]) -> None:
         return
     session = state.get("session")
     session_id = getattr(session, "session_id", None) or state.get("input", {}).get("session_id", "session")
+    run_log_dir = run_logs_dir(state)
+    if run_log_dir is not None:
+        state["message_log_uri"] = str(run_log_dir / "messages.jsonl")
+        return
     log_dir = Path(os.getenv("AGENT_MESSAGE_LOG_DIR", DEFAULT_MESSAGE_LOG_DIR))
     log_dir.mkdir(parents=True, exist_ok=True)
     state["message_log_uri"] = str(log_dir / f"{_safe_slug(str(session_id))}_{run_id}.jsonl")

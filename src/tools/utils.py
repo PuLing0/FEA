@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
+from runtime.output_paths import tool_artifact_dir
 from runtime.state import RuntimeState
 from schema import Artifact, ArtifactKind
 
@@ -23,3 +24,6 @@ def register_artifacts(state: RuntimeState, artifacts: Iterable[Artifact]) -> No
         state["session"].artifact_index.by_type.setdefault(artifact.kind, []).append(
             artifact.id
         )
+
+
+__all__ = ["next_artifact_id", "register_artifacts", "tool_artifact_dir"]

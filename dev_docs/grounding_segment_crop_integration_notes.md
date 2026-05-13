@@ -165,7 +165,7 @@ CropArgs(
 
 - `mask_ref` 和 `grounding_ref` 至少一个存在
 - 两者都在时，优先 `mask_ref`
-- 输出图片会保存到本地 `generated/crop/`
+- 输出图片在 agent 运行中会保存到该 run 目录的 `artifacts/crop/`；直接调用工具且未提供 `output_dir` 时回退到 `generated/crop/`
 - 结果注册为新的 `ImageArtifact`
 
 ## 4. Crop 和 Grounding / Mask 的来源校验必须存在

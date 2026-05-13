@@ -22,7 +22,7 @@ from vision_backends.remote_client import (
 )
 
 from .base import BaseTool, ToolExecutionResult
-from .utils import next_artifact_id
+from .utils import next_artifact_id, tool_artifact_dir
 
 
 @dataclass(slots=True)
@@ -273,17 +273,15 @@ class SegmentTool(BaseTool):
         ranked.sort(key=lambda item: item.metrics["final_score"], reverse=True)
         return ranked[0]
 
-    def _write_mask(self, *, mask: np.ndarray, task_id: str, loop_index: int) -> str:
-        output_dir = Path("generated") / "segment"
-        output_dir.mkdir(parents=True, exist_ok=True)
+    def _write_mask(self, state, *, mask: np.ndarray, task_id: str, loop_index: int) -> str:
+        output_dir = tool_artifact_dir(state, self.name)
         output_path = output_dir / f"{task_id}_{loop_index:03d}_mask.png"
         mask_uint8 = (np.asarray(mask, dtype=bool).astype(np.uint8)) * 255
         Image.fromarray(mask_uint8).save(output_path)
         return str(output_path)
 
-    def _build_mask_path(self, *, task_id: str, loop_index: int) -> str:
-        output_dir = Path("generated") / "segment"
-        output_dir.mkdir(parents=True, exist_ok=True)
+    def _build_mask_path(self, state, *, task_id: str, loop_index: int) -> str:
+        output_dir = tool_artifact_dir(state, self.name)
         return str(output_dir / f"{task_id}_{loop_index:03d}_mask.png")
 
     def _is_retryable_prompt_failure(self, message: str) -> bool:
@@ -311,7 +309,7 @@ class SegmentTool(BaseTool):
             raise ValueError("segment requires at least one usable prompt candidate")
         backend_name = resolve_segment_backend()
         if backend_name == "remote":
-            requested_mask_path = self._build_mask_path(task_id=task_id, loop_index=loop_index)
+            requested_mask_path = self._build_mask_path(state, task_id=task_id, loop_index=loop_index)
             remote_error_messages: list[str] = []
             remote_result = None
             for prompt_candidate in prompt_candidates:
@@ -378,7 +376,7 @@ class SegmentTool(BaseTool):
                 mask_path, mask_score, selection_metrics, source_stage, text_prompt = (
                     self._build_full_image_mask_result(
                         image_path=image_path,
-                        mask_path=self._build_mask_path(task_id=task_id, loop_index=loop_index),
+                        mask_path=self._build_mask_path(state, task_id=task_id, loop_index=loop_index),
                         prompt=prompt_candidates[0],
                     )
                 )
@@ -386,6 +384,7 @@ class SegmentTool(BaseTool):
                     selection_metrics["local_errors"] = " | ".join(local_error_messages)
             else:
                 mask_path = self._write_mask(
+                    state,
                     mask=final_candidate.mask,
                     task_id=task_id,
                     loop_index=loop_index,

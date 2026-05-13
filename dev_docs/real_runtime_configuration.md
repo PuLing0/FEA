@@ -112,18 +112,19 @@ Do not commit `.env` or secrets. If these values are missing, the runtime falls
 back to rule-based behavior for normal graph runs; the real smoke script fails
 fast because it is intended to verify the real LLM path.
 
-## Agent run logs
+## Agent run outputs
 
-Agent graph runs write structured JSONL logs and mirror concise progress to the console by default. Logs are stored under `generated/agent_logs/`, which is ignored by git.
+Agent graph runs create one run-scoped output directory and mirror concise progress to the console by default. The default root is `generated/agent_runs/`, which is ignored by git. Each run directory contains `logs/run.jsonl`, `logs/messages.jsonl`, generated artifacts under `artifacts/<tool>/`, and per-tool JSON snapshots under `tool_results/<task_id>/`.
 
 Useful switches:
 
 - `AGENT_LOG_ENABLED=false` disables JSONL file output.
 - `AGENT_LOG_CONSOLE=false` disables console mirroring.
-- `AGENT_LOG_DIR=generated/agent_logs` changes the log directory.
+- `AGENT_OUTPUT_DIR=generated/agent_runs` changes the run output root.
+- `AGENT_LOG_DIR=generated/agent_logs` is still accepted as a compatibility fallback when `AGENT_OUTPUT_DIR` is unset.
 - `AGENT_LOG_LEVEL=debug` is reserved for verbose/debug filtering.
 
-The smoke summary prints `run_id` and `run_log_uri`. Each JSONL record includes the session phase, current plan/task, event name, and structured payload for operations, artifacts, checkpoints, and decisions. Secrets such as `LLM_API_KEY` are not logged.
+The smoke summary prints `run_id`, `output_dir`, and `run_log_uri`. Each JSONL record includes the session phase, current plan/task, event name, and structured payload for operations, artifacts, checkpoints, and decisions. Secrets such as `LLM_API_KEY` are not logged.
 
 ## Real end-to-end smoke
 

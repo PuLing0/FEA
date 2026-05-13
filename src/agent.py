@@ -216,6 +216,7 @@ def _build_summary(state: dict[str, Any], stop_reason: str) -> dict[str, Any]:
     final_artifact_id = session.final_result_id or _find_latest_edit_output_id(state) or _latest_image_artifact_id(state)
     return {
         "run_id": state.get("run_id"),
+        "output_dir": state.get("output_dir"),
         "run_log_uri": state.get("run_log_uri"),
         "message_log_uri": state.get("message_log_uri"),
         "stop_reason": stop_reason,
@@ -236,6 +237,7 @@ def format_final_summary(summary: dict[str, Any]) -> str:
         "",
         "运行摘要",
         f"- Run ID: {summary.get('run_id') or '未知'}",
+        f"- 输出目录: {summary.get('output_dir') or '未创建'}",
         f"- 日志文件: {summary.get('run_log_uri') or '未写入'}",
         f"- 停止原因: {_stop_reason_label(summary.get('stop_reason'))}",
         f"- 最终阶段: {summary.get('session_phase') or '未知'}",

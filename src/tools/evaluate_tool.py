@@ -18,7 +18,7 @@ from schema import (
 )
 
 from .base import BaseTool, ToolExecutionResult
-from .utils import next_artifact_id
+from .utils import next_artifact_id, tool_artifact_dir
 
 
 REFERENCE_BOARD_MAX_SIDE = 2048
@@ -102,8 +102,7 @@ class EvaluateTool(BaseTool):
                 Image.Resampling.LANCZOS,
             )
 
-        output_dir = Path("generated") / "evaluate"
-        output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = tool_artifact_dir(state, self.name)
         board_path = output_dir / f"{task_id}_{loop_index:03d}_reference_board.png"
         board.save(board_path)
         return str(board_path), [str(board_path)]

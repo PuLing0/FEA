@@ -377,8 +377,10 @@ def test_crop_tool_uses_unique_output_paths_within_same_loop(tmp_path) -> None:
     mask_path = tmp_path / "mask.png"
     Image.new("RGBA", (10, 10), color=(255, 0, 0, 255)).save(image_path)
     Image.new("L", (10, 10), color=255).save(mask_path)
+    output_dir = tmp_path / "agent_run"
 
     state = {
+        "output_dir": str(output_dir),
         "tasks": {
             "task_001": Task(
                 id="task_001",
@@ -435,6 +437,12 @@ def test_crop_tool_uses_unique_output_paths_within_same_loop(tmp_path) -> None:
     assert second.artifacts[0].id in second_uri
     assert Path(first_uri).is_file()
     assert Path(second_uri).is_file()
+    assert Path(first_uri).parent == output_dir / "artifacts" / "crop"
+    assert Path(second_uri).parent == output_dir / "artifacts" / "crop"
+    assert Path(first.invocation.raw_output_uri).parent == output_dir / "tool_results" / "task_001"
+    assert Path(second.invocation.raw_output_uri).parent == output_dir / "tool_results" / "task_001"
+    assert Path(first.invocation.raw_output_uri).is_file()
+    assert Path(second.invocation.raw_output_uri).is_file()
 
 
 def test_segment_tool_uses_grounding_and_writes_mask_file(tmp_path, mocker) -> None:

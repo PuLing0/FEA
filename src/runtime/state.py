@@ -40,6 +40,7 @@ class RuntimeState(TypedDict, total=False):
     max_evaluator_checkpoints: int
     max_tool_failures: int
     run_id: str
+    output_dir: str | None
     run_log_uri: str | None
     message_log_uri: str | None
     run_logger: Any

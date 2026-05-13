@@ -34,6 +34,7 @@ from .run_logger import (
     summarize_task,
     summarize_task_state,
 )
+from .output_paths import build_tool_result_path, write_json
 from .message_query import (
     find_latest_evaluation,
     find_tool_results,
@@ -87,6 +88,7 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
         "max_evaluator_checkpoints": max_evaluator_checkpoints,
         "max_tool_failures": max_tool_failures,
         "run_id": logger.run_id,
+        "output_dir": logger.output_uri,
         "run_log_uri": logger.uri,
         "message_log_uri": None,
         "run_logger": logger,
@@ -96,6 +98,7 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
         state,
         "run_start",
         log_uri=logger.uri,
+        output_dir=logger.output_uri,
         message_log_uri=state.get("message_log_uri"),
         image_uris=list(runtime_input["image_uris"]),
         use_llm=runtime_input.get("use_llm", False),
@@ -166,6 +169,36 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
                 "question": BOOTSTRAP_UNDERSTAND_QUESTION_TEMPLATE.format(index=index),
             }
             tool_call_id = next_tool_call_id(state, ToolName.UNDERSTAND)
+            raw_output_path = build_tool_result_path(
+                state,
+                tool_name=ToolName.UNDERSTAND,
+                task_id="bootstrap",
+                loop_index=0,
+                tool_call_id=tool_call_id,
+            )
+            raw_output_uri = (
+                str(raw_output_path)
+                if raw_output_path is not None
+                else f"runs/bootstrap/{ToolName.UNDERSTAND.value}.json"
+            )
+            if raw_output_path is not None:
+                write_json(
+                    raw_output_path,
+                    {
+                        "tool_call_id": tool_call_id,
+                        "tool_name": ToolName.UNDERSTAND.value,
+                        "task_id": "bootstrap",
+                        "loop_index": 0,
+                        "status": "succeeded",
+                        "args": tool_args,
+                        "artifact_ids": [understanding.id],
+                        "result_payload": {
+                            "image_ref": image.id,
+                            "summary": understanding.payload["summary"],
+                            "understanding_ref": understanding.id,
+                        },
+                    },
+                )
             append_tool_call_message(
                 state,
                 tool_call_id=tool_call_id,
@@ -186,7 +219,7 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
                     "summary": understanding.payload["summary"],
                     "understanding_ref": understanding.id,
                 },
-                raw_output_uri=f"runs/bootstrap/{ToolName.UNDERSTAND.value}.json",
+                raw_output_uri=raw_output_uri,
                 summary=understanding.payload["summary"],
                 task_id="bootstrap",
                 loop_index=0,
