@@ -234,7 +234,15 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
                 tool_name=ToolName.UNDERSTAND.value,
                 status="succeeded",
                 args=tool_args,
+                output_refs=[understanding.id],
                 artifact_ids=[understanding.id],
+                result_payload={
+                    "image_ref": image.id,
+                    "summary": understanding.payload["summary"],
+                    "understanding_ref": understanding.id,
+                },
+                raw_output_uri=raw_output_uri,
+                summary=understanding.payload["summary"],
             )
             log_event(state, "artifact_created", **summarize_artifact(understanding))
             continue
@@ -257,7 +265,9 @@ def register_and_understand(state: RuntimeState) -> RuntimeState:
             tool_name=ToolName.UNDERSTAND.value,
             status=understand_execution.status,
             args=understand_execution.args,
+            output_refs=understand_execution.output_refs,
             artifact_ids=understand_execution.output_refs,
+            result_payload=understand_execution.result_payload,
             error=understand_execution.error,
             raw_output_uri=understand_execution.raw_output_uri,
         )

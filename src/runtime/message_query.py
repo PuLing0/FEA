@@ -164,7 +164,9 @@ def summarize_tool_result(result: ToolResultBlock) -> dict[str, Any]:
         "act_index": result.act_index,
         "status": result.status,
         "args": dict(result.args),
+        "output_refs": list(result.artifact_ids),
         "artifact_ids": list(result.artifact_ids),
+        "result_payload": dict(result.result_payload) if isinstance(result.result_payload, dict) else None,
         "error": result.error,
         "raw_output_uri": result.raw_output_uri,
     }

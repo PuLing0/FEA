@@ -248,6 +248,114 @@ def test_runtime_run_logger_formats_failed_tool_event_for_humans() -> None:
     assert "RuntimeError: backend unavailable" in line
 
 
+def test_runtime_run_logger_formats_understand_tool_result_with_summary() -> None:
+    from runtime.message_query import summarize_tool_result
+    from runtime.run_logger import _format_console_line
+    from schema.messages import ToolResultBlock
+
+    payload = summarize_tool_result(
+        ToolResultBlock(
+            tool_call_id="call_understand_001",
+            tool_name=ToolName.UNDERSTAND,
+            task_id="bootstrap",
+            loop_index=0,
+            status="succeeded",
+            args={"image_ref": "art_img_input_002"},
+            artifact_ids=["art_understanding_002"],
+            result_payload={
+                "image_ref": "art_img_input_002",
+                "summary": "图片里是一件黑色上衣。",
+                "understanding_ref": "art_understanding_002",
+            },
+        )
+    )
+    record = {
+        "timestamp": "2026-05-07T01:02:03.000+00:00",
+        "run_id": "run123",
+        "session_id": "sess",
+        "event": "operation_succeeded",
+        "phase": "understanding",
+        "current_plan_id": None,
+        "current_task_id": None,
+        "payload": payload,
+    }
+
+    line = _format_console_line(record)
+
+    assert payload["output_refs"] == ["art_understanding_002"]
+    assert payload["result_payload"]["summary"] == "图片里是一件黑色上衣。"
+    assert "工具完成：理解图片 art_img_input_002 -> art_understanding_002" in line
+    assert "理解=图片里是一件黑色上衣。" in line
+
+
+def test_runtime_run_logger_uses_artifact_ids_fallback_for_tool_outputs() -> None:
+    from runtime.run_logger import _format_console_line
+
+    record = {
+        "timestamp": "2026-05-07T01:02:03.000+00:00",
+        "run_id": "run123",
+        "session_id": "sess",
+        "event": "operation_succeeded",
+        "phase": "understanding",
+        "current_plan_id": None,
+        "current_task_id": None,
+        "payload": {
+            "tool_call_id": "call_understand_001",
+            "tool_name": "understand",
+            "status": "succeeded",
+            "args": {"image_ref": "art_img_input_002"},
+            "artifact_ids": ["art_understanding_002"],
+            "summary": "图片里是一件黑色上衣。",
+        },
+    }
+
+    line = _format_console_line(record)
+
+    assert "-> art_understanding_002" in line
+    assert "理解=图片里是一件黑色上衣。" in line
+
+
+def test_runtime_run_logger_formats_evaluate_tool_result_with_verdict() -> None:
+    from runtime.message_query import summarize_tool_result
+    from runtime.run_logger import _format_console_line
+    from schema.messages import ToolResultBlock
+
+    payload = summarize_tool_result(
+        ToolResultBlock(
+            tool_call_id="call_evaluate_001",
+            tool_name=ToolName.EVALUATE,
+            task_id="task_001",
+            loop_index=1,
+            status="succeeded",
+            args={"candidate_ref": "art_image_007"},
+            artifact_ids=["art_evaluation_001"],
+            result_payload={
+                "candidate_ref": "art_image_007",
+                "verdict": "needs_revision",
+                "reason": "Restore full head-to-toe framing.",
+            },
+        )
+    )
+    record = {
+        "timestamp": "2026-05-07T01:02:03.000+00:00",
+        "run_id": "run123",
+        "session_id": "sess",
+        "event": "operation_succeeded",
+        "phase": "evaluating",
+        "current_plan_id": "plan_001",
+        "current_task_id": "task_001",
+        "payload": payload,
+    }
+
+    line = _format_console_line(record)
+
+    assert payload["output_refs"] == ["art_evaluation_001"]
+    assert payload["result_payload"]["verdict"] == "needs_revision"
+    assert "工具完成：评估候选图 art_image_007" in line
+    assert "结论=needs_revision" in line
+    assert "原因=Restore full head-to-toe framing." in line
+
+
 def test_summarize_task_state_includes_active_instruction_fields() -> None:
     state = _make_instruction_resolution_state(
         artifacts={

@@ -575,9 +575,9 @@ def _format_operation(payload: dict[str, Any], *, failed: bool) -> str:
 
     args = _as_dict(payload.get("args"))
     result_payload = _as_dict(payload.get("result_payload"))
-    output_refs = payload.get("output_refs")
+    output_refs = payload.get("output_refs") or payload.get("artifact_ids")
     if tool_name == "understand":
-        summary = _short_text(result_payload.get("summary"))
+        summary = _short_text(result_payload.get("summary") or payload.get("summary"))
         return (
             f"工具完成：理解图片 {result_payload.get('image_ref') or args.get('image_ref')} "
             f"-> {_format_refs(output_refs)}，理解={summary or '暂无摘要'}"
