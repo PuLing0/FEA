@@ -62,6 +62,23 @@ def test_invoke_structured_llm_uses_structured_output(mocker) -> None:
     fake_agent.run_sync.assert_called_once_with("return structured")
 
 
+def test_invoke_structured_llm_wraps_request_errors(mocker) -> None:
+    class OutputSchema(BaseModel):
+        answer: str
+
+    fake_agent = mocker.Mock()
+    fake_agent.run_sync.side_effect = RuntimeError("upstream 503")
+    mocker.patch("llm.client.Agent", return_value=fake_agent)
+
+    with pytest.raises(LLMRequestError, match="LLM request failed while sending structured request"):
+        invoke_structured_llm(
+            user_prompt="return structured",
+            system_prompt="system",
+            output_schema=OutputSchema,
+            model="openai:gpt-5.4",
+        )
+
+
 def test_encode_image_path_to_data_url_reads_local_file(tmp_path) -> None:
     image_path = tmp_path / "tiny.png"
     image_path.write_bytes(

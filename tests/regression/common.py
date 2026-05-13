@@ -11,6 +11,7 @@ from pydantic import BaseModel, ValidationError
 from agent import agent, create_agent, main as agent_main
 from agents import EvaluatorAgent, ExecuteAgent, PlanAgent
 from llm import (
+    LLMRequestError,
     encode_image_path_to_data_url,
     invoke_llm,
     invoke_multimodal_llm,

@@ -20,6 +20,10 @@ from pydantic import Field
 from schema import StrictModel
 
 
+class LLMRequestError(RuntimeError):
+    """Raised when an outbound LLM request fails before a usable response is returned."""
+
+
 class LLMConfig(StrictModel):
     """Environment-driven LLM configuration."""
 
@@ -68,6 +72,44 @@ def make_pydantic_ai_model(config: LLMConfig | None = None) -> OpenAIChatModel:
             openai_supports_strict_tool_definition=False,
         ),
     )
+
+
+def _describe_llm_target(
+    *,
+    model: Any | None = None,
+    config: LLMConfig | None = None,
+) -> tuple[str, str]:
+    resolved_config = config
+    if resolved_config is None and model is None:
+        try:
+            resolved_config = load_llm_config()
+        except Exception:
+            resolved_config = None
+
+    model_name = (
+        getattr(resolved_config, "model_name", None)
+        or getattr(model, "model_name", None)
+        or getattr(model, "model", None)
+        or (model if isinstance(model, str) else None)
+        or "unknown"
+    )
+    base_url = getattr(resolved_config, "base_url", None) or "unknown"
+    return str(model_name), str(base_url)
+
+
+def _raise_request_error(
+    *,
+    request_kind: str,
+    model: Any | None,
+    config: LLMConfig | None,
+    error: Exception,
+) -> None:
+    model_name, base_url = _describe_llm_target(model=model, config=config)
+    detail = str(error).strip() or error.__class__.__name__
+    raise LLMRequestError(
+        f"LLM request failed while sending {request_kind} request "
+        f"(model={model_name}, base_url={base_url}): {detail}"
+    ) from error
 
 
 def _build_messages(system_prompt: str | None, user_prompt: str) -> list[BaseMessage]:
@@ -144,7 +186,15 @@ def invoke_llm(
     """Send a standard chat request and return the raw AI message."""
 
     chat_model = model or make_chat_model(config)
-    response = chat_model.invoke(_build_messages(system_prompt, user_prompt))
+    try:
+        response = chat_model.invoke(_build_messages(system_prompt, user_prompt))
+    except Exception as exc:
+        _raise_request_error(
+            request_kind="chat",
+            model=model,
+            config=config,
+            error=exc,
+        )
     if not isinstance(response, AIMessage) and not hasattr(response, "content"):
         raise TypeError("Expected AIMessage response from chat model")
     return response
@@ -164,13 +214,21 @@ def invoke_multimodal_llm(
         raise ValueError("image_paths must be non-empty for multimodal calls")
 
     chat_model = model or make_chat_model(config)
-    response = chat_model.invoke(
-        _build_multimodal_messages(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            image_paths=image_paths,
+    try:
+        response = chat_model.invoke(
+            _build_multimodal_messages(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                image_paths=image_paths,
+            )
         )
-    )
+    except Exception as exc:
+        _raise_request_error(
+            request_kind="multimodal chat",
+            model=model,
+            config=config,
+            error=exc,
+        )
     if not isinstance(response, AIMessage) and not hasattr(response, "content"):
         raise TypeError("Expected AIMessage response from chat model")
     return response
@@ -196,7 +254,15 @@ def invoke_structured_llm(
         instructions=system_prompt or "",
         output_type=output_schema,
     )
-    return agent.run_sync(user_prompt).output
+    try:
+        return agent.run_sync(user_prompt).output
+    except Exception as exc:
+        _raise_request_error(
+            request_kind="structured",
+            model=model,
+            config=config,
+            error=exc,
+        )
 
 
 def invoke_structured_multimodal_llm(
@@ -215,10 +281,18 @@ def invoke_structured_multimodal_llm(
 
     chat_model = model or make_chat_model(config)
     structured_model = chat_model.with_structured_output(output_schema)
-    return structured_model.invoke(
-        _build_multimodal_messages(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            image_paths=image_paths,
+    try:
+        return structured_model.invoke(
+            _build_multimodal_messages(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                image_paths=image_paths,
+            )
         )
-    )
+    except Exception as exc:
+        _raise_request_error(
+            request_kind="structured multimodal",
+            model=model,
+            config=config,
+            error=exc,
+        )

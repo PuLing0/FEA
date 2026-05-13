@@ -2,6 +2,7 @@
 
 from .client import (
     LLMConfig,
+    LLMRequestError,
     encode_image_path_to_data_url,
     invoke_llm,
     invoke_multimodal_llm,
@@ -13,6 +14,7 @@ from .client import (
 
 __all__ = [
     "LLMConfig",
+    "LLMRequestError",
     "encode_image_path_to_data_url",
     "invoke_llm",
     "invoke_multimodal_llm",
