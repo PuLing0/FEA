@@ -445,6 +445,67 @@ def test_crop_tool_uses_unique_output_paths_within_same_loop(tmp_path) -> None:
     assert Path(second.invocation.raw_output_uri).is_file()
 
 
+def test_tool_runner_allocates_pytest_scoped_output_dir_when_missing(tmp_path, monkeypatch) -> None:
+    from PIL import Image
+    from tools.crop_tool import CropTool
+
+    monkeypatch.delenv("AGENT_OUTPUT_DIR", raising=False)
+    monkeypatch.setenv("AGENT_TEST_OUTPUT_DIR", str(tmp_path))
+
+    image_path = tmp_path / "source.png"
+    mask_path = tmp_path / "mask.png"
+    Image.new("RGBA", (10, 10), color=(255, 0, 0, 255)).save(image_path)
+    Image.new("L", (10, 10), color=255).save(mask_path)
+
+    state = {
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="local_edit",
+                instruction="裁剪前景",
+            )
+        },
+        "session": SessionState(
+            session_id="sess_crop_scoped",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={"task_001": TaskState(task_id="task_001", status=TaskStatus.RUNNING)},
+            artifact_index=ArtifactIndex(by_type={}),
+        ),
+        "artifacts": {
+            "art_img_001": ImageArtifact(
+                id="art_img_001",
+                uri=str(image_path),
+                payload={"role": "input"},
+            ),
+            "art_mask_001": MaskArtifact(
+                id="art_mask_001",
+                uri=str(mask_path),
+                payload={"image_ref": "art_img_001"},
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+    }
+
+    result = _run_tool(
+        CropTool(),
+        state,
+        task_id="task_001",
+        loop_index=1,
+        args=CropArgs(image_ref="art_img_001", mask_ref="art_mask_001"),
+    )
+
+    output_dir = Path(state["output_dir"])
+    assert output_dir.is_dir()
+    assert str(output_dir).startswith(str(tmp_path / "pytest"))
+    assert Path(state["message_log_uri"]).parent == output_dir / "logs"
+    assert Path(result.artifacts[0].uri).parent == output_dir / "artifacts" / "crop"
+    assert Path(result.invocation.raw_output_uri).parent == output_dir / "tool_results" / "task_001"
+
+
 def test_segment_tool_uses_grounding_and_writes_mask_file(tmp_path, mocker) -> None:
     from PIL import Image
     from tools.segment_tool import SegmentTool

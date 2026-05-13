@@ -114,14 +114,15 @@ fast because it is intended to verify the real LLM path.
 
 ## Agent run outputs
 
-Agent graph runs create one run-scoped output directory and mirror concise progress to the console by default. The default root is `generated/agent_runs/`, which is ignored by git. Each run directory contains `logs/run.jsonl`, `logs/messages.jsonl`, generated artifacts under `artifacts/<tool>/`, and per-tool JSON snapshots under `tool_results/<task_id>/`.
+Agent graph runs create one run-scoped output directory and mirror concise progress to the console by default. User-facing runs default to `generated/runs/`, pytest-generated outputs default to `generated/tests/pytest/`, and backend service fallback files default to `generated/services/`. Each run directory contains `logs/run.jsonl`, `logs/messages.jsonl`, generated artifacts under `artifacts/<tool>/`, and per-tool JSON snapshots under `tool_results/<task_id>/`.
 
 Useful switches:
 
 - `AGENT_LOG_ENABLED=false` disables JSONL file output.
 - `AGENT_LOG_CONSOLE=false` disables console mirroring.
-- `AGENT_OUTPUT_DIR=generated/agent_runs` changes the run output root.
-- `AGENT_LOG_DIR=generated/agent_logs` is still accepted as a compatibility fallback when `AGENT_OUTPUT_DIR` is unset.
+- `AGENT_OUTPUT_DIR=generated/runs` changes the root for user-facing runtime runs.
+- `AGENT_TEST_OUTPUT_DIR=generated/tests` changes where pytest-created run-scoped outputs are written.
+- `AGENT_SERVICE_OUTPUT_DIR=generated/services` changes where backend service fallback outputs are written.
 - `AGENT_LOG_LEVEL=debug` is reserved for verbose/debug filtering.
 
 The smoke summary prints `run_id`, `output_dir`, and `run_log_uri`. Each JSONL record includes the session phase, current plan/task, event name, and structured payload for operations, artifacts, checkpoints, and decisions. Secrets such as `LLM_API_KEY` are not logged.

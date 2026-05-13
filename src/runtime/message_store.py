@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from runtime.output_paths import run_logs_dir, safe_slug
+from runtime.output_paths import run_logs_dir
 from schema import (
     ArtifactRefBlock,
     ContentBlock,
@@ -28,10 +27,6 @@ from schema import (
     ToolResultBlock,
 )
 
-
-DEFAULT_MESSAGE_LOG_DIR = "generated/agent_messages"
-
-
 def _timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
@@ -45,11 +40,6 @@ def _json_default(value: Any) -> Any:
         return str(value)
     return str(value)
 
-
-def _safe_slug(value: str) -> str:
-    return safe_slug(value)
-
-
 def init_message_store(state: dict[str, Any]) -> None:
     """Ensure message memory and transcript path are initialized."""
 
@@ -60,15 +50,9 @@ def init_message_store(state: dict[str, Any]) -> None:
         state["run_id"] = run_id
     if state.get("message_log_uri"):
         return
-    session = state.get("session")
-    session_id = getattr(session, "session_id", None) or state.get("input", {}).get("session_id", "session")
     run_log_dir = run_logs_dir(state)
-    if run_log_dir is not None:
-        state["message_log_uri"] = str(run_log_dir / "messages.jsonl")
-        return
-    log_dir = Path(os.getenv("AGENT_MESSAGE_LOG_DIR", DEFAULT_MESSAGE_LOG_DIR))
-    log_dir.mkdir(parents=True, exist_ok=True)
-    state["message_log_uri"] = str(log_dir / f"{_safe_slug(str(session_id))}_{run_id}.jsonl")
+    assert run_log_dir is not None
+    state["message_log_uri"] = str(run_log_dir / "messages.jsonl")
 
 
 def append_message(

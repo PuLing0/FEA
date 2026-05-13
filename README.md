@@ -63,7 +63,7 @@ SEGMENT_BACKEND=local \
 FIRERED_CUDA_VISIBLE_DEVICES=5,6,3,4 \
 AGENT_LOG_ENABLED=true \
 AGENT_LOG_CONSOLE=true \
-AGENT_OUTPUT_DIR=generated/agent_runs \
+AGENT_OUTPUT_DIR=generated/runs \
 ./.venv/bin/python src/agent.py \
   --images examples/fig1.jpg examples/fig2.jpg examples/fig3.jpg examples/fig4.jpg \
   --instruction "Generate a photo of this person wearing the provided top and skirt in the provided background."
@@ -180,7 +180,7 @@ cd /mnt/sda/sijuzheng/project/FEA
 VISION_BACKEND_TIMEOUT_SECONDS=900 \
 AGENT_LOG_ENABLED=true \
 AGENT_LOG_CONSOLE=true \
-AGENT_OUTPUT_DIR=generated/agent_runs \
+AGENT_OUTPUT_DIR=generated/runs \
 ./.venv/bin/python src/agent.py \
   --images examples/fig1.jpg examples/fig2.jpg examples/fig3.jpg examples/fig4.jpg \
   --instruction "Generate a photo of this person wearing the provided top and skirt in the provided background."
@@ -230,14 +230,17 @@ VISION_BACKEND_TIMEOUT_SECONDS=900 \
 
 ## Logs and Outputs
 
-Each agent run creates one run-scoped directory under `generated/agent_runs/` by default:
+Each user-facing agent run creates one run-scoped directory under `generated/runs/` by default:
 
 - `logs/run.jsonl` — structured agent events.
 - `logs/messages.jsonl` — full runtime message transcript.
 - `artifacts/edit/`, `artifacts/segment/`, `artifacts/crop/`, `artifacts/collage/`, `artifacts/evaluate/` — generated image, mask, board, and reference outputs.
+- `artifacts/evaluate/*_reference_board.png` — compact input/reference boards uploaded alongside the candidate output during evaluation.
 - `tool_results/<task_id>/` — per-tool JSON result snapshots.
 
-Set `AGENT_OUTPUT_DIR` to change the run output root. `AGENT_LOG_DIR` is still accepted as a compatibility fallback, but new configuration should prefer `AGENT_OUTPUT_DIR`.
+Pytest-created runtime outputs are grouped under `generated/tests/pytest/`, and backend service fallback outputs are grouped under `generated/services/`.
+
+Set `AGENT_OUTPUT_DIR` to change the root for user-facing agent runs. `AGENT_TEST_OUTPUT_DIR` changes where pytest run-scoped outputs are written, and `AGENT_SERVICE_OUTPUT_DIR` changes where backend service fallback outputs are written.
 
 The CLI prints human-readable progress and a final summary with the run id, output directory, log path, final image, evaluator decision, and tool timeline.
 

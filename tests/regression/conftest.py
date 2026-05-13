@@ -18,6 +18,7 @@ REAL_TOOL_TESTS = {
     "test_collage_tool_returns_image_artifact",
     "test_crop_tool_uses_mask_cutout_branch",
     "test_crop_tool_uses_unique_output_paths_within_same_loop",
+    "test_tool_runner_allocates_pytest_scoped_output_dir_when_missing",
     "test_segment_tool_uses_grounding_and_writes_mask_file",
     "test_crop_tool_uses_grounding_preview_branch",
     "test_crop_tool_rejects_mismatched_mask_source",

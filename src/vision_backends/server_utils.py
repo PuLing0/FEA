@@ -11,6 +11,8 @@ from typing import Any, Callable
 
 from PIL import Image
 
+from runtime.output_paths import default_service_output_root
+
 
 class VisionBackendRequestError(ValueError):
     """Raised for client-side request validation errors."""
@@ -32,7 +34,7 @@ def read_image(path_value: Any) -> Image.Image:
 
 
 def default_output_path(kind: str, suffix: str) -> str:
-    output_dir = Path("generated") / "vision_backend" / kind
+    output_dir = default_service_output_root() / "vision_backend" / kind
     output_dir.mkdir(parents=True, exist_ok=True)
     existing_count = len(list(output_dir.glob(f"*.{suffix}")))
     return str(output_dir / f"remote_{existing_count + 1:06d}.{suffix}")

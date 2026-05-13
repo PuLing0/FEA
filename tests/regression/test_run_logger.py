@@ -59,6 +59,33 @@ def test_runtime_run_logger_writes_jsonl(tmp_path, monkeypatch, capsys) -> None:
     assert all(record["run_id"] == result["run_id"] for record in records)
 
 
+def test_runtime_run_logger_uses_pytest_output_root_by_default(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("AGENT_OUTPUT_DIR", raising=False)
+    monkeypatch.setenv("AGENT_TEST_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setenv("AGENT_LOG_ENABLED", "true")
+    monkeypatch.setenv("AGENT_LOG_CONSOLE", "false")
+
+    graph = build_runtime_graph(stop_after_plan=True)
+    result = graph.invoke(
+        {
+            "input": {
+                "session_id": "log-smoke",
+                "image_uri": "examples/fig1.jpg",
+                "image_uris": ["examples/fig1.jpg"],
+                "instruction_text": "记录一次日志",
+                "desired_decision_route": "pass",
+                "use_llm": False,
+            }
+        }
+    )
+
+    output_dir = Path(result["output_dir"])
+    assert output_dir.is_dir()
+    assert str(output_dir).startswith(str(tmp_path / "pytest"))
+    assert Path(result["run_log_uri"]).is_file()
+    assert Path(result["message_log_uri"]).is_file()
+
+
 def test_runtime_run_logger_formats_structured_events_for_humans() -> None:
     from runtime.run_logger import _format_console_line
 
