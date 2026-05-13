@@ -10,6 +10,20 @@ INSTRUCTION_ROLE_PRIORITY = (
     "task_instruction",
     "session_root_instruction",
 )
+TASK_SCOPED_INSTRUCTION_ROLES = {"rewritten_instruction", "task_instruction"}
+
+
+def instruction_artifact_belongs_to_task(
+    artifact: InstructionArtifact,
+    task_id: str,
+) -> bool:
+    """Return whether a task-scoped instruction artifact belongs to task_id."""
+
+    payload_task_id = artifact.payload.get("task_id") if isinstance(artifact.payload, dict) else None
+    if isinstance(payload_task_id, str) and payload_task_id.strip():
+        return payload_task_id.strip() == task_id
+    return artifact.id.startswith(f"art_instruction_{task_id}_")
+
 
 def resolve_active_instruction_artifact(
     state: RuntimeState,
@@ -31,6 +45,11 @@ def resolve_active_instruction_artifact(
         if not isinstance(artifact, InstructionArtifact):
             continue
         if not artifact.get_instruction_text():
+            continue
+        if (
+            artifact.role in TASK_SCOPED_INSTRUCTION_ROLES
+            and not instruction_artifact_belongs_to_task(artifact, task_id)
+        ):
             continue
         if artifact.role not in INSTRUCTION_ROLE_PRIORITY:
             latest_unclassified = artifact

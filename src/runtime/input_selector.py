@@ -13,6 +13,8 @@ from runtime.artifact_context import (
     working_set_artifact_ids,
 )
 from runtime.instruction_resolver import (
+    TASK_SCOPED_INSTRUCTION_ROLES,
+    instruction_artifact_belongs_to_task,
     resolve_active_instruction_artifact,
     resolve_active_instruction_text,
 )
@@ -91,7 +93,12 @@ def prepare_task_inputs(state: RuntimeState, task_id: str) -> TaskInputSelection
 
     task_state = state["session"].task_states[task_id]
     if task_state.task_working_set:
-        capped = _cap_working_set_image_count(state, list(task_state.task_working_set))
+        capped = _normalize_task_working_set_entries(
+            state,
+            task_id,
+            list(task_state.task_working_set),
+            include_dependency_outputs=True,
+        )
         replace_task_working_set(state, task_id, capped)
         return TaskInputSelectionOutput(
             selected_artifact_ids=working_set_artifact_ids(capped),
@@ -119,6 +126,34 @@ def prepare_task_inputs(state: RuntimeState, task_id: str) -> TaskInputSelection
     if task_state.retry_context_text:
         return rebuild_task_working_set_for_continue_execute(state, task_id)
 
+    if task_state.resolved_input_artifact_ids:
+        entries = [
+            make_working_set_entry(
+                artifact_id,
+                usage="previously resolved task input",
+                selection_reason="reused because task inputs were already resolved",
+            )
+            for artifact_id in task_state.resolved_input_artifact_ids
+        ]
+        entries = _normalize_task_working_set_entries(
+            state,
+            task_id,
+            entries,
+            include_dependency_outputs=True,
+        )
+        replace_task_working_set(state, task_id, entries)
+        task_state.resolved_input_artifact_ids = [
+            artifact_id
+            for artifact_id in working_set_artifact_ids(entries)
+            if _is_image_artifact(state, artifact_id)
+        ]
+        task_state.input_selection_reasoning = "reused previously resolved task inputs"
+        task_state.input_validation_summary = "using existing resolved input context"
+        return TaskInputSelectionOutput(
+            selected_artifact_ids=working_set_artifact_ids(entries),
+            working_set_entries=list(entries),
+        )
+
     return initialize_task_working_set_from_session(state, task_id)
 
 
@@ -129,22 +164,18 @@ def initialize_task_working_set_from_session(
     """Select initial task inputs from the session working set."""
 
     task_state = state["session"].task_states[task_id]
-    task = state["tasks"][task_id]
     instruction_artifact_id = _find_latest_instruction_artifact_id(state, task_id)
     candidates_text = build_session_working_set_catalog(state)
     thinking = build_input_thinking(state, task_id, candidates_text)
     selection = select_initial_task_artifacts(state, task_id, candidates_text, thinking)
     validation_summary = validate_selected_inputs(state, task_id, selection, candidates_text)
-    entries = list(selection.working_set_entries)
-    if instruction_artifact_id is not None:
-        entries.insert(
-            0,
-            make_working_set_entry(
-                instruction_artifact_id,
-                usage="current task instruction",
-                selection_reason="required to keep the active task instruction visible at task start",
-            ),
-        )
+    entries = _normalize_task_working_set_entries(
+        state,
+        task_id,
+        list(selection.working_set_entries),
+        current_instruction_id=instruction_artifact_id,
+        include_dependency_outputs=True,
+    )
     for artifact_id in working_set_artifact_ids(entries):
         if artifact_id not in task_state.task_artifact_ids:
             task_state.task_artifact_ids.append(artifact_id)
@@ -174,17 +205,20 @@ def rebuild_task_working_set_for_continue_execute(
     active_instruction = _resolve_active_instruction_text(state, task_id)
     pool_catalog = build_task_pool_catalog(state, task_id)
     if _use_llm(state):
-        selection = invoke_structured_llm(
-            system_prompt=TASK_WORKING_SET_SELECTOR_SYSTEM_PROMPT,
-            user_prompt=build_task_working_set_selector_user_prompt(
-                task=task,
-                active_instruction=active_instruction,
-                retry_context=task_state.retry_context_text,
-                latest_candidate_refs=list(task_state.latest_artifact_ids),
-                task_pool_catalog=pool_catalog,
-            ),
-            output_schema=TaskInputSelectionOutput,
-        )
+        try:
+            selection = invoke_structured_llm(
+                system_prompt=TASK_WORKING_SET_SELECTOR_SYSTEM_PROMPT,
+                user_prompt=build_task_working_set_selector_user_prompt(
+                    task=task,
+                    active_instruction=active_instruction,
+                    retry_context=task_state.retry_context_text,
+                    latest_candidate_refs=list(task_state.latest_artifact_ids),
+                    task_pool_catalog=pool_catalog,
+                ),
+                output_schema=TaskInputSelectionOutput,
+            )
+        except Exception:
+            selection = _fallback_continue_execute_selection(state, task_id)
     else:
         selection = _fallback_continue_execute_selection(state, task_id)
     entries = list(selection.working_set_entries)
@@ -221,6 +255,13 @@ def rebuild_task_working_set_for_continue_execute(
                 selection_reason="required to preserve the latest candidate while continuing the same task",
             ),
         )
+    entries = _normalize_task_working_set_entries(
+        state,
+        task_id,
+        entries,
+        current_instruction_id=latest_instruction_id,
+        include_dependency_outputs=False,
+    )
     replace_task_working_set(state, task_id, entries)
     task_state.input_selection_reasoning = (
         "reselected from task pool after continue_execute"
@@ -254,18 +295,21 @@ def select_initial_task_artifacts(
 
     task = state["tasks"][task_id]
     if _use_llm(state):
-        selection = invoke_structured_llm(
-            system_prompt=INPUT_SELECTOR_SYSTEM_PROMPT,
-            user_prompt=build_input_selector_user_prompt(
-                task=task,
-                thinking=thinking,
-                candidates_text=candidates_text,
-            ),
-            output_schema=TaskInputSelectionOutput,
-        )
-        validated = _validate_selection_budget(state, selection)
-        if validated is not None:
-            return validated
+        try:
+            selection = invoke_structured_llm(
+                system_prompt=INPUT_SELECTOR_SYSTEM_PROMPT,
+                user_prompt=build_input_selector_user_prompt(
+                    task=task,
+                    thinking=thinking,
+                    candidates_text=candidates_text,
+                ),
+                output_schema=TaskInputSelectionOutput,
+            )
+            validated = _validate_selection_budget(state, selection)
+            if validated is not None:
+                return validated
+        except Exception:
+            pass
     return _fallback_initial_selection(state, task_id)
 
 
@@ -544,6 +588,77 @@ def _validate_selection_budget(
         selected_artifact_ids=selected_ids,
         working_set_entries=selected_entries,
     )
+
+
+def _normalize_task_working_set_entries(
+    state: RuntimeState,
+    task_id: str,
+    entries: list[WorkingSetEntry],
+    *,
+    current_instruction_id: str | None = None,
+    include_dependency_outputs: bool,
+) -> list[WorkingSetEntry]:
+    """Keep task-local instructions clean and prioritize dependency outputs."""
+
+    current_instruction_id = current_instruction_id or _find_latest_instruction_artifact_id(state, task_id)
+    selected: list[WorkingSetEntry] = []
+    selected_ids: set[str] = set()
+
+    def append_entry(entry: WorkingSetEntry) -> None:
+        if entry.artifact_id in selected_ids:
+            return
+        artifact = state["artifacts"].get(entry.artifact_id)
+        if artifact is None:
+            return
+        if artifact.kind == ArtifactKind.INSTRUCTION and not _keep_instruction_for_task(
+            artifact,
+            task_id,
+            current_instruction_id,
+        ):
+            return
+        selected.append(entry)
+        selected_ids.add(entry.artifact_id)
+
+    if current_instruction_id is not None:
+        append_entry(
+            make_working_set_entry(
+                current_instruction_id,
+                usage="current task instruction",
+                selection_reason="required to keep the active task instruction visible",
+            )
+        )
+
+    if include_dependency_outputs:
+        for dep_id in state["tasks"][task_id].depends_on:
+            dep_state = state["session"].task_states.get(dep_id)
+            dep_final = dep_state.final_artifact_id if dep_state is not None else None
+            if dep_final and _is_image_artifact(state, dep_final):
+                append_entry(
+                    make_working_set_entry(
+                        dep_final,
+                        usage="dependency output image",
+                        selection_reason="required because the current task depends on this passed task result",
+                    )
+                )
+
+    for entry in entries:
+        append_entry(entry)
+
+    return _cap_working_set_image_count(state, selected)
+
+
+def _keep_instruction_for_task(
+    artifact,
+    task_id: str,
+    current_instruction_id: str | None,
+) -> bool:
+    if artifact.id == current_instruction_id:
+        return True
+    if artifact.role == "session_root_instruction":
+        return True
+    if artifact.role in TASK_SCOPED_INSTRUCTION_ROLES:
+        return instruction_artifact_belongs_to_task(artifact, task_id)
+    return False
 
 
 def _cap_working_set_image_count(

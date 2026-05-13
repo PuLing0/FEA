@@ -289,6 +289,130 @@ def test_prepare_task_inputs_fallback_prioritizes_static_task_inputs() -> None:
     ]
 
 
+def test_prepare_task_inputs_filters_old_task_instruction_and_prioritizes_dependency_output(mocker) -> None:
+    from runtime.input_selector import prepare_task_inputs
+
+    state = {
+        "input": {"use_llm": True},
+        "session": SessionState(
+            session_id="sess_dependency_inputs",
+            phase=SessionPhase.EXECUTING,
+            current_plan_id="plan_001",
+            current_task_id="task_002",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.PASSED,
+                    final_artifact_id="art_image_base_001",
+                ),
+                "task_002": TaskState(
+                    task_id="task_002",
+                    status=TaskStatus.RUNNING,
+                    task_artifact_ids=["art_instruction_task_002_001"],
+                ),
+            },
+            session_working_set=[
+                WorkingSetEntry(artifact_id="art_instruction_session_root_001", usage="root"),
+                WorkingSetEntry(artifact_id="art_instruction_task_001_001", usage="old task instruction"),
+                WorkingSetEntry(artifact_id="art_img_input_001", usage="person"),
+                WorkingSetEntry(artifact_id="art_img_input_002", usage="garment"),
+                WorkingSetEntry(artifact_id="art_img_input_003", usage="extra"),
+            ],
+            artifact_index=ArtifactIndex(
+                by_type={
+                    ArtifactKind.IMAGE: [
+                        "art_image_base_001",
+                        "art_img_input_001",
+                        "art_img_input_002",
+                        "art_img_input_003",
+                    ]
+                }
+            ),
+        ),
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="edit",
+                instruction="生成基础合成图",
+            ),
+            "task_002": Task(
+                id="task_002",
+                plan_id="plan_001",
+                type="edit",
+                instruction="在基础合成图上继续编辑",
+                depends_on=["task_001"],
+            ),
+        },
+        "artifacts": {
+            "art_instruction_session_root_001": InstructionArtifact(
+                id="art_instruction_session_root_001",
+                payload={"instruction_text": "root"},
+                role="session_root_instruction",
+            ),
+            "art_instruction_task_001_001": InstructionArtifact(
+                id="art_instruction_task_001_001",
+                payload={"instruction_text": "旧任务指令", "task_id": "task_001"},
+                role="task_instruction",
+            ),
+            "art_instruction_task_002_001": InstructionArtifact(
+                id="art_instruction_task_002_001",
+                payload={"instruction_text": "当前任务指令", "task_id": "task_002"},
+                role="task_instruction",
+            ),
+            "art_image_base_001": ImageArtifact(
+                id="art_image_base_001",
+                uri="store://generated/task_001/base.png",
+                payload={"role": "candidate_image"},
+            ),
+            **{
+                f"art_img_input_{index:03d}": ImageArtifact(
+                    id=f"art_img_input_{index:03d}",
+                    uri=f"store://images/{index}.png",
+                    payload={"role": "input"},
+                    scope="session",
+                )
+                for index in range(1, 4)
+            },
+        },
+        "operations": [],
+    }
+
+    mocker.patch("runtime.input_selector.load_llm_config", return_value=mocker.Mock(api_key="k", base_url="u", model_name="m"))
+    mocker.patch(
+        "runtime.input_selector.invoke_structured_llm",
+        return_value=TaskInputSelectionOutput(
+            selected_artifact_ids=[
+                "art_instruction_task_001_001",
+                "art_img_input_001",
+                "art_img_input_002",
+                "art_img_input_003",
+            ],
+            working_set_entries=[
+                WorkingSetEntry(artifact_id="art_instruction_task_001_001", usage="old task instruction"),
+                WorkingSetEntry(artifact_id="art_img_input_001", usage="person"),
+                WorkingSetEntry(artifact_id="art_img_input_002", usage="garment"),
+                WorkingSetEntry(artifact_id="art_img_input_003", usage="extra"),
+            ],
+        ),
+    )
+
+    result = prepare_task_inputs(state, "task_002")
+
+    assert result.selected_artifact_ids == [
+        "art_instruction_task_002_001",
+        "art_image_base_001",
+        "art_img_input_001",
+        "art_img_input_002",
+    ]
+    assert "art_instruction_task_001_001" not in result.selected_artifact_ids
+    assert state["session"].task_states["task_002"].resolved_input_artifact_ids == [
+        "art_image_base_001",
+        "art_img_input_001",
+        "art_img_input_002",
+    ]
+
+
 def test_prepare_task_inputs_caps_existing_working_set_image_count() -> None:
     from runtime.input_selector import prepare_task_inputs
 

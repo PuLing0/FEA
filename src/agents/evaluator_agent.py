@@ -201,11 +201,13 @@ class EvaluatorAgent:
                 artifact = state["artifacts"].get(entry.artifact_id)
                 if artifact is None or artifact.kind != ArtifactKind.INSTRUCTION:
                     continue
+                if artifact.role != "session_root_instruction":
+                    continue
                 add_to_session_working_set(
                     state,
                     artifact.id,
-                    usage="passed task instruction context",
-                    selection_reason="promoted because it may help initialize later tasks",
+                    usage="session root instruction context",
+                    selection_reason="retained as the stable user-level instruction for later tasks",
                 )
             next_task_id = select_next_runnable_task(state)
             if next_task_id is None:
@@ -375,13 +377,54 @@ class EvaluatorAgent:
         task_id: str,
     ) -> DecisionRoute:
         verdict = evaluation_payload.get("verdict")
-        if verdict in {"pass", "pass_with_issues"}:
+        if verdict == "pass":
+            return DecisionRoute.PASS
+        if verdict == "pass_with_issues":
+            if self._pass_issue_requires_revision(evaluation_payload):
+                return self._revision_or_replan_route(state, task_id)
             return DecisionRoute.PASS
         if verdict == "needs_revision":
             return DecisionRoute.CONTINUE_EXECUTE
         if verdict == "replan":
             return DecisionRoute.REPLAN
         return self._fallback_route(state, task_id)
+
+    def _pass_issue_requires_revision(self, evaluation_payload: dict) -> bool:
+        reason = str(evaluation_payload.get("reason", "")).lower()
+        if not reason:
+            return False
+        severe_markers = (
+            "wrong base",
+            "wrong reference",
+            "wrong scene",
+            "incorrect base",
+            "stays in the original",
+            "indoor selfie",
+            "phone ui",
+            "ui overlay",
+            "watermark",
+            "cropped off",
+            "crops off",
+            "cropped full-body",
+            "lower legs",
+            "feet",
+            "misplaced",
+            "upper torso",
+            "bib",
+            "pasted over",
+            "not fitted",
+            "warped anatomy",
+            "missing garment",
+            "not properly added",
+        )
+        return any(marker in reason for marker in severe_markers)
+
+    def _revision_or_replan_route(self, state: RuntimeState, task_id: str) -> DecisionRoute:
+        max_evaluator_checkpoints = state.get("max_evaluator_checkpoints", 3)
+        task_state = state["session"].task_states[task_id]
+        if task_state.evaluator_checkpoint_count >= max_evaluator_checkpoints:
+            return DecisionRoute.REPLAN
+        return DecisionRoute.CONTINUE_EXECUTE
 
     def _fallback_route(self, state: RuntimeState, task_id: str) -> DecisionRoute:
         max_evaluator_checkpoints = state.get("max_evaluator_checkpoints", 3)

@@ -224,7 +224,7 @@ class PlanAgent:
         instruction_artifact = InstructionArtifact(
             id=f"art_instruction_{task.id}_001",
             summary=task.instruction,
-            payload={"instruction_text": task.instruction},
+            payload={"instruction_text": task.instruction, "task_id": task.id},
             source_ids=list(task.input_artifact_ids),
             created_by="plan_agent",
             role="task_instruction",

@@ -42,7 +42,7 @@ def test_instruction_resolver_prefers_latest_rewritten_instruction_across_roles(
         artifacts={
             "art_instruction_rewrite_001": InstructionArtifact(
                 id="art_instruction_rewrite_001",
-                payload={"instruction_text": "旧改写指令"},
+                payload={"instruction_text": "旧改写指令", "task_id": "task_001"},
                 role="rewritten_instruction",
                 scope="task",
             ),
@@ -60,7 +60,7 @@ def test_instruction_resolver_prefers_latest_rewritten_instruction_across_roles(
             ),
             "art_instruction_rewrite_002": InstructionArtifact(
                 id="art_instruction_rewrite_002",
-                payload={"instruction_text": "最新改写指令"},
+                payload={"instruction_text": "最新改写指令", "task_id": "task_001"},
                 role="rewritten_instruction",
                 scope="task",
             ),
@@ -78,6 +78,35 @@ def test_instruction_resolver_prefers_latest_rewritten_instruction_across_roles(
     assert artifact is not None
     assert artifact.id == "art_instruction_rewrite_002"
     assert resolve_active_instruction_text(state, "task_001") == "最新改写指令"
+
+
+def test_instruction_resolver_ignores_other_task_instruction_artifacts() -> None:
+    state = _make_instruction_resolution_state(
+        artifacts={
+            "art_instruction_task_001_001": InstructionArtifact(
+                id="art_instruction_task_001_001",
+                payload={"instruction_text": "当前任务指令", "task_id": "task_001"},
+                role="task_instruction",
+                scope="task",
+            ),
+            "art_instruction_task_002_001": InstructionArtifact(
+                id="art_instruction_task_002_001",
+                payload={"instruction_text": "其他任务指令", "task_id": "task_002"},
+                role="task_instruction",
+                scope="task",
+            ),
+        },
+        task_artifact_ids=[
+            "art_instruction_task_001_001",
+            "art_instruction_task_002_001",
+        ],
+    )
+
+    artifact = resolve_active_instruction_artifact(state, "task_001")
+
+    assert artifact is not None
+    assert artifact.id == "art_instruction_task_001_001"
+    assert resolve_active_instruction_text(state, "task_001") == "当前任务指令"
 
 
 def test_instruction_resolver_ignores_unknown_roles_and_falls_back_to_task_instruction() -> None:

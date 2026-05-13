@@ -37,12 +37,122 @@ def test_evaluator_agent_uses_structured_evaluation_verdict() -> None:
 
 def test_evaluator_agent_routes_pass_with_issues_as_pass() -> None:
     route = EvaluatorAgent()._route_from_evaluation_payload(
-        evaluation_payload={"verdict": "pass_with_issues"},
+        evaluation_payload={
+            "verdict": "pass_with_issues",
+            "reason": "Minor texture softness remains but the edit is otherwise coherent.",
+        },
         state={"input": {"desired_decision_route": "replan"}},
         task_id="task_001",
     )
 
     assert route == DecisionRoute.PASS
+
+
+def test_evaluator_agent_routes_severe_pass_with_issues_to_revision() -> None:
+    route = EvaluatorAgent()._route_from_evaluation_payload(
+        evaluation_payload={
+            "verdict": "pass_with_issues",
+            "reason": "The result retains phone UI overlay and crops off the lower legs.",
+        },
+        state={
+            "input": {"desired_decision_route": "pass"},
+            "session": SessionState(
+                session_id="sess_eval_route",
+                phase=SessionPhase.EVALUATING,
+                task_states={
+                    "task_001": TaskState(
+                        task_id="task_001",
+                        status=TaskStatus.WAITING_EVALUATION,
+                        evaluator_checkpoint_count=1,
+                    )
+                },
+            ),
+            "max_evaluator_checkpoints": 3,
+        },
+        task_id="task_001",
+    )
+
+    assert route == DecisionRoute.CONTINUE_EXECUTE
+
+
+def test_evaluator_agent_does_not_promote_task_instruction_to_session() -> None:
+    state = {
+        "input": {
+            "instruction_text": "把人物放到背景里",
+            "desired_decision_route": "pass",
+            "use_llm": False,
+        },
+        "tasks": {
+            "task_001": Task(
+                id="task_001",
+                plan_id="plan_001",
+                type="reference_edit",
+                instruction="把人物放到背景里",
+                acceptance_criteria=["subject appears in background"],
+            )
+        },
+        "plans": {
+            "plan_001": Plan(
+                id="plan_001",
+                instruction="把人物放到背景里",
+                task_ids=["task_001"],
+            )
+        },
+        "session": SessionState(
+            session_id="sess_eval_promote_instruction",
+            phase=SessionPhase.EVALUATING,
+            current_plan_id="plan_001",
+            current_task_id="task_001",
+            task_states={
+                "task_001": TaskState(
+                    task_id="task_001",
+                    status=TaskStatus.WAITING_EVALUATION,
+                    latest_artifact_ids=["art_image_candidate_001"],
+                    latest_execution_outcome=ExecutionOutcome.SUCCESS,
+                    latest_execute_checkpoint="passed",
+                    task_artifact_ids=[
+                        "art_instruction_session_root_001",
+                        "art_instruction_task_001_001",
+                        "art_image_candidate_001",
+                    ],
+                    task_working_set=[
+                        WorkingSetEntry(artifact_id="art_instruction_session_root_001", usage="root"),
+                        WorkingSetEntry(artifact_id="art_instruction_task_001_001", usage="task instruction"),
+                    ],
+                )
+            },
+            artifact_index=ArtifactIndex(by_type={ArtifactKind.IMAGE: ["art_image_candidate_001"]}),
+        ),
+        "artifacts": {
+            "art_instruction_session_root_001": InstructionArtifact(
+                id="art_instruction_session_root_001",
+                payload={"instruction_text": "root"},
+                role="session_root_instruction",
+            ),
+            "art_instruction_task_001_001": InstructionArtifact(
+                id="art_instruction_task_001_001",
+                payload={"instruction_text": "任务局部指令", "task_id": "task_001"},
+                role="task_instruction",
+            ),
+            "art_image_candidate_001": ImageArtifact(
+                id="art_image_candidate_001",
+                uri="store://generated/task_001/candidate.png",
+                payload={"role": "candidate_image"},
+            ),
+        },
+        "operations": [],
+        "task_act_records": [],
+    }
+
+    result = EvaluatorAgent().run(state)
+
+    session_ids = [
+        entry.artifact_id
+        for entry in result["session"].session_working_set
+    ]
+    assert "art_image_candidate_001" in session_ids
+    assert "art_instruction_session_root_001" in session_ids
+    assert "art_instruction_task_001_001" not in session_ids
 
 
 def test_evaluator_agent_failed_candidate_can_continue_same_task() -> None:
